@@ -65,10 +65,10 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       # ---- Packaging: one step per OS ----------------------------------------
-      # macOS gets a signed + notarized drag-to-Applications DMG. Windows and
-      # Linux are unsigned archives of the self-contained binary
-      # (fonts are embedded via include_bytes!; the Windows icon is compiled in
-      # via build.rs).
+      # macOS gets a signed + notarized drag-to-Applications DMG. Windows gets
+      # an Inno Setup installer plus a portable zip; Linux a tarball — both
+      # unsigned, of the self-contained binary (fonts are embedded via
+      # include_bytes!; the Windows icon is compiled in via build.rs).
       - name: Bundle macOS DMG
         if: matrix.os == 'macos'
         working-directory: tty7
@@ -89,7 +89,7 @@ jobs:
         working-directory: tty7
         run: bash .github/scripts/bundle-linux.sh "${{ matrix.target }}" "${{ matrix.arch }}"
 
-      - name: Package Windows zip
+      - name: Package Windows installer + zip
         if: matrix.os == 'windows'
         working-directory: tty7
         shell: pwsh
@@ -103,3 +103,4 @@ jobs:
             tty7/dist/*.dmg
             tty7/dist/*.tar.gz
             tty7/dist/*.zip
+            tty7/dist/*-setup.exe

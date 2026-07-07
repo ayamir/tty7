@@ -93,7 +93,9 @@ Grab the build for your platform from [**Releases**](https://github.com/l0ng-ai/
 
 - **macOS** — `tty7-<version>-macos-arm64.dmg` (Apple Silicon) or `…-x86_64.dmg`
   (Intel); open it and drag `tty7.app` into Applications.
-- **Windows** — `…-windows-x86_64.zip`; unzip and run `tty7.exe`.
+- **Windows** — `…-windows-x86_64-setup.exe` (installer: Start Menu shortcut +
+  uninstall entry), or `…-windows-x86_64.zip` (portable: unzip and run
+  `tty7.exe`).
 - **Linux** — `…-linux-x86_64.tar.gz`; extract and run `./tty7` (needs the usual
   x11/wayland runtime libraries).
 

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Windows releases now ship an Inno Setup installer
+  (`tty7-<version>-windows-x86_64-setup.exe`) alongside the portable zip. It
+  installs per-user by default (no admin prompt, with an all-users option),
+  adds a Start Menu shortcut and an "Apps" uninstall entry, and offers an
+  optional desktop icon. Still unsigned, so SmartScreen warns on first launch.
 - Startup update check: tty7 asks GitHub once, in the background, whether a
   newer release has shipped. If so, it pops a one-time "Update available" dialog
   (once per version — remembered in `update.json`, so it never nags twice for
@@ -31,6 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Maximize / restore pane moved from ⌘⏎ to ⌘⇧⏎ (Ghostty's `toggle_split_zoom`
   default), making room for fullscreen on the bare chord. An existing
   `ToggleMaximizePane` override in `keybindings` still wins.
+
+### Fixed
+
+- Windows: launching tty7 no longer opens a stray console window behind the
+  app. Release builds are now linked with the `windows` subsystem; debug
+  builds keep the console so `println!` output stays visible. (#10)
 
 ## [0.3.0] - 2026-07-07
 
