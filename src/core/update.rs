@@ -277,8 +277,7 @@ async fn fetch_latest_version() -> Result<String> {
         .await
         .context("reading response body")?;
 
-    let release: LatestRelease =
-        serde_json::from_slice(&body).context("parsing release JSON")?;
+    let release: LatestRelease = serde_json::from_slice(&body).context("parsing release JSON")?;
     Ok(release.tag_name)
 }
 
