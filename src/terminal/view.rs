@@ -11,8 +11,9 @@ use gpui::{
     KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, Pixels, ScrollDelta, ScrollWheelEvent,
     Window, actions, div, prelude::*, px,
 };
+use gpui_component::kbd::Kbd;
 use gpui_component::menu::ContextMenuExt;
-use gpui_component::{ActiveTheme as _, Icon, IconName, Size};
+use gpui_component::{ActiveTheme as _, Icon, IconName, Size, h_flex};
 
 use super::TermSize;
 use super::cmd_editor::CmdEditor;
@@ -910,12 +911,7 @@ impl TerminalView {
             "a" => {
                 // At the prompt, ⌘A selects the whole edited line; otherwise it
                 // selects the whole terminal buffer (scrollback included).
-                if self.input_active() {
-                    self.cmd.select_all();
-                    cx.notify();
-                } else {
-                    self.select_all(cx);
-                }
+                self.select_all_contextual(cx);
                 CmdKey::Consumed
             }
             // The following are editor-only (macOS line editing); they're swallowed
@@ -1302,7 +1298,7 @@ impl TerminalView {
     }
 
     /// Select the entire buffer — from the top of scrollback to the last cell —
-    /// so Cmd+A then Cmd+C copies everything. Also used by the right-click menu.
+    /// so Cmd+A then Cmd+C copies everything.
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
         let mut term = self.terminal.term.lock();
         let grid = term.grid();
@@ -1313,6 +1309,19 @@ impl TerminalView {
         term.selection = Some(sel);
         drop(term);
         cx.notify();
+    }
+
+    /// "Select All" as the user means it in context: at the prompt, select the
+    /// edited command line; otherwise select the whole terminal buffer. Shared by
+    /// the ⌘A shortcut and the right-click "Select All" item so the two never
+    /// drift apart.
+    pub fn select_all_contextual(&mut self, cx: &mut Context<Self>) {
+        if self.input_active() {
+            self.cmd.select_all();
+            cx.notify();
+        } else {
+            self.select_all(cx);
+        }
     }
 
     /// Paste clipboard text. While idle at the prompt it goes into the local
@@ -2894,7 +2903,7 @@ impl Render for TerminalView {
             // same menu fall through to `Tty7App`.
             .on_action(cx.listener(|this, _: &CopyText, _w, cx| this.copy_selection(cx)))
             .on_action(cx.listener(|this, _: &PasteText, _w, cx| this.paste_from_clipboard(cx)))
-            .on_action(cx.listener(|this, _: &SelectAll, _w, cx| this.select_all(cx)))
+            .on_action(cx.listener(|this, _: &SelectAll, _w, cx| this.select_all_contextual(cx)))
             .on_action(
                 cx.listener(|this, _: &FindInTerminal, window, cx| this.open_search(window, cx)),
             )
@@ -2932,14 +2941,33 @@ impl Render for TerminalView {
                 // Small size = tighter 20px rows; the default 26px felt too airy.
                 // A fixed min-width keeps the menu a consistent, intentional size
                 // instead of hugging the longest label (which reads ragged).
+                // Copy/Paste/Select All/Find are dispatched inline (see
+                // `handle_cmd_shortcut`) with no registered `KeyBinding`, so the menu
+                // can't auto-derive their hints the way it does for the items below.
+                // We render the hint ourselves via `menu_row_with_hint` to keep the
+                // whole menu consistent, rather than register real bindings (which
+                // would risk the Ctrl+C SIGINT fall-through on Windows/Linux).
                 menu.with_size(Size::Small)
                     .min_w(px(220.))
                     .action_context(menu_focus.clone())
-                    .menu_with_disabled("Copy", Box::new(CopyText), !has_selection)
-                    .menu("Paste", Box::new(PasteText))
-                    .menu("Select All", Box::new(SelectAll))
+                    .menu_element_with_disabled(
+                        Box::new(CopyText),
+                        !has_selection,
+                        menu_row_with_hint("Copy", Some("secondary-c")),
+                    )
+                    .menu_element(
+                        Box::new(PasteText),
+                        menu_row_with_hint("Paste", Some("secondary-v")),
+                    )
+                    .menu_element(
+                        Box::new(SelectAll),
+                        menu_row_with_hint("Select All", mac_only("secondary-a")),
+                    )
                     .separator()
-                    .menu("Find…", Box::new(FindInTerminal))
+                    .menu_element(
+                        Box::new(FindInTerminal),
+                        menu_row_with_hint("Find…", mac_only("secondary-f")),
+                    )
                     .menu("Clear", Box::new(ClearScrollback))
                     .separator()
                     .menu("Split Right", Box::new(SplitRight))
@@ -2950,6 +2978,48 @@ impl Render for TerminalView {
                     .menu("Close Pane", Box::new(CloseActiveTab))
             })
     }
+}
+
+/// Build a context-menu row that shows its shortcut right-aligned, matching the
+/// hint gpui-component auto-renders for items whose action has a registered
+/// keybinding. `key` is `None` when the action has no shortcut on this platform,
+/// leaving the row hint-less like a plain item.
+fn menu_row_with_hint(
+    label: &'static str,
+    key: Option<&'static str>,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyElement {
+    move |_window, _cx| {
+        let hint = key.map(|k| {
+            // Strip Kbd's keycap box (filled bg + border) so it reads as the same
+            // quiet muted-foreground hint the auto-rendered items show — see
+            // gpui-component's `PopupMenu::render_key_binding`.
+            Kbd::new(gpui::Keystroke::parse(k).expect("valid static keystroke"))
+                .p_0()
+                .flex_nowrap()
+                .border_0()
+                .bg(gpui::transparent_white())
+        });
+        h_flex()
+            .w_full()
+            .gap_3()
+            .items_center()
+            .justify_between()
+            .child(label)
+            .children(hint)
+            .into_any_element()
+    }
+}
+
+/// `Some(key)` on macOS, `None` elsewhere. ⌘A (Select All) and ⌘F (Find) are
+/// wired only on macOS; on Windows/Linux those chords keep their readline meaning
+/// (line-start / forward-char), so the menu must not advertise them there.
+#[cfg(target_os = "macos")]
+fn mac_only(key: &'static str) -> Option<&'static str> {
+    Some(key)
+}
+#[cfg(not(target_os = "macos"))]
+fn mac_only(_key: &'static str) -> Option<&'static str> {
+    None
 }
 
 /// Approximate terminal display width of a char in cells: 2 for East-Asian
