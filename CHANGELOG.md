@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-07
+
 ### Added
 
 - Windows releases now ship an Inno Setup installer
@@ -30,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   View menu and command palette), matching the Ghostty/iTerm2 default. It
   previously toggled pane maximize — which silently did nothing in a
   single-pane tab, so the chord felt dead.
+- The right-click menu now shows each item's keyboard shortcut. Copy, Paste,
+  Select All, and Find previously showed nothing (they're dispatched inline,
+  with no bound key for the menu to read a hint from) while the other items
+  did, so the menu looked half-labelled. ⌘A / ⌘F stay hint-less on
+  Windows/Linux, where those chords keep their readline meaning.
 
 ### Changed
 
@@ -42,6 +49,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows: launching tty7 no longer opens a stray console window behind the
   app. Release builds are now linked with the `windows` subsystem; debug
   builds keep the console so `println!` output stays visible. (#10)
+- The right-click "Select All" now matches the ⌘A shortcut: at the prompt it
+  selects the edited command line, otherwise the whole terminal buffer. It
+  previously always selected the whole buffer, so click and keystroke behaved
+  differently at the prompt.
+- Ctrl+R reverse-search now accepts plain ASCII keystrokes. The query only
+  took text from the IME commit path, so a non-CJK input source on macOS — and
+  all typing on Linux — was swallowed: the search box opened but ate every key.
+  Reported on V2EX.
 
 ## [0.3.0] - 2026-07-07
 
@@ -139,7 +154,10 @@ Initial release.
 - zsh shell integration (OSC 7 cwd + OSC 133 prompt marks) via a throwaway `ZDOTDIR`.
 - Native macOS light/dark themes that follow the system appearance.
 
-[Unreleased]: https://github.com/l0ng-ai/tty7/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/l0ng-ai/tty7/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/l0ng-ai/tty7/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/l0ng-ai/tty7/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/l0ng-ai/tty7/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/l0ng-ai/tty7/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/l0ng-ai/tty7/releases/tag/v0.1.0
 [gpui]: https://github.com/zed-industries/zed
