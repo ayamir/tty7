@@ -77,7 +77,7 @@ Windows icon embedding is handled separately by `build.rs` via `winresource` whe
 
 ## Security-sensitive areas
 
-`SECURITY.md` highlights a terminal emulator's unusual input surface: untrusted escape sequences can come from `cat`, `ssh`, remote programs, and paste. Be extra careful with:
+A terminal emulator has an unusual input surface: untrusted escape sequences can come from `cat`, `ssh`, remote programs, and paste. Be extra careful with:
 
 - VT/CSI/OSC parsing and scanner recovery,
 - clipboard store/load and paste handling,

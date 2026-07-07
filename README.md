@@ -13,6 +13,7 @@
 [![CI](https://github.com/l0ng-ai/tty7/actions/workflows/ci.yml/badge.svg)](https://github.com/l0ng-ai/tty7/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/github/v/tag/l0ng-ai/tty7?label=version&color=ff8a5c)](https://github.com/l0ng-ai/tty7/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Discord](https://img.shields.io/badge/Discord-join%20chat-5865F2?logo=discord&logoColor=white)](https://discord.gg/s3dethqz2V)
 
 [**Install**](#-install) · [**Benchmarks**](#-benchmarks) · [**Shortcuts**](#️-shortcuts) · [**Contributing**](#-contributing)
 
@@ -128,8 +129,8 @@ The full list — and any overrides — lives in **Settings → Keybindings**.
 
 ## 🤝 Contributing
 
-Bug reports and PRs are welcome. Security issues go through
-[SECURITY.md](SECURITY.md); notable changes land in the
+Bug reports and PRs are welcome. Questions, ideas, or just want to say hi? Come
+hang out on [Discord](https://discord.gg/s3dethqz2V). Notable changes land in the
 [CHANGELOG](CHANGELOG.md).
 
 ## 📝 License
