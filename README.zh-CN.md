@@ -19,10 +19,6 @@
 
 <sub>[English](README.md) · 简体中文</sub>
 
-<br />
-
-<img src="docs/screenshot.jpg" alt="tty7" width="820" />
-
 </div>
 
 ## 为什么是 tty7
