@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- When shell integration never engages in a pane, pressing Ctrl+R now explains
+  why the history menu can't appear (once per pane, dismissed by the next
+  keystroke) instead of failing silently — naming the wrapper when a
+  figterm-style PTY shim (`kiro-cli-term`, `figterm`, `qterm`) is intercepting
+  the shell's OSC 133 reports. The chord still reaches the shell, so its own
+  reverse-i-search keeps working. (#46)
+
 ## [0.9.0] - 2026-07-10
 
 ### Changed

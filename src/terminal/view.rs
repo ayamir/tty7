@@ -224,6 +224,19 @@ pub struct TerminalView {
     /// selection into the line, Cmd+Enter runs it outright, and Escape/Ctrl+G
     /// cancels.
     reverse_search: Option<ReverseSearch>,
+    /// One-shot "shell integration didn't engage" notice (#46). Set when Ctrl+R
+    /// is pressed in a pane whose shell never reported OSC 133 — the history
+    /// menu the user is reaching for can't appear, and without this the feature
+    /// just looks broken. A figterm-style PTY shim (kiro-cli-term, qterm) that
+    /// swallowed the reports is the usual culprit, so the message names the
+    /// wrapper when the daemon's foreground query recognizes one. Cleared on
+    /// the next keystroke, after a timeout, or if integration engages late.
+    integration_notice: Option<String>,
+    /// Latch so the notice shows at most once per pane — a diagnostic, not a nag.
+    integration_notice_shown: bool,
+    /// When this view was created. Ctrl+R inside the startup grace window stays
+    /// silent: slow rc files mean integration legitimately hasn't reported yet.
+    created_at: std::time::Instant,
     /// True while a left-drag that began on the command-editor line is in progress,
     /// so mouse-move extends the editor selection rather than the terminal's.
     editor_selecting: bool,
@@ -299,6 +312,43 @@ const LONG_COMMAND: std::time::Duration = std::time::Duration::from_secs(10);
 /// that typing into a program that reads stdin right after launch feels
 /// instant once the window lapses.
 const HOLD_WINDOW: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// How long after pane creation Ctrl+R stays silent about missing shell
+/// integration: slow rc files can take several seconds to reach the first
+/// prompt report, and calling integration broken while the shell is still
+/// starting up would be a false alarm.
+const INTEGRATION_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// How long the integration notice stays up when no keystroke dismisses it.
+const INTEGRATION_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Fig-descended PTY shims known to exec over the shell we spawned and re-host
+/// it on a nested PTY without forwarding OSC 133 — which starves shell
+/// integration and silently kills the whole command-editor overlay (#46).
+/// Matched against the foreground process name the daemon reports; `contains`
+/// because the shim may present as e.g. `zsh (kiro-cli-term)`.
+fn known_pty_shim(fg: &str) -> Option<&'static str> {
+    ["kiro-cli-term", "figterm", "qterm", "cwterm"]
+        .into_iter()
+        .find(|shim| fg.contains(shim))
+}
+
+/// The integration-notice text. Naming the shim matters: "install shell
+/// integration" advice would mislead — the hooks *are* installed, something
+/// between the shell and tty7 is eating their reports.
+fn integration_notice_message(wrapper: Option<&str>) -> String {
+    match wrapper {
+        Some(w) => format!(
+            "tty7 shell integration is blocked in this pane — \u{201c}{w}\u{201d} is intercepting \
+             shell reports, so inline completion and the Ctrl+R menu are unavailable. \
+             The shell's own history search still works."
+        ),
+        None => "tty7 shell integration hasn't engaged in this pane, so inline completion and \
+                 the Ctrl+R menu are unavailable. A PTY wrapper (figterm-style) or an \
+                 unsupported shell setup can cause this."
+            .to_string(),
+    }
+}
 
 /// Post a desktop notification that a command finished. Best-effort and
 /// non-blocking: routed through [`super::remote::notify_desktop`] (the single
@@ -703,6 +753,9 @@ impl TerminalView {
             pending_history: None,
             completion: None,
             reverse_search: None,
+            integration_notice: None,
+            integration_notice_shown: false,
+            created_at: std::time::Instant::now(),
             editor_selecting: false,
             editor_select_gesture: false,
             hovered_link: None,
@@ -839,6 +892,12 @@ impl TerminalView {
         if self.terminal.exited {
             return;
         }
+        // Any keystroke dismisses a visible integration notice — it has been
+        // read. The Ctrl+R that raises it runs later in this same dispatch, so
+        // the raising chord never clears its own notice.
+        if self.integration_notice.take().is_some() {
+            cx.notify();
+        }
         // macOS Option-key policy (see `input::reshape_option_keystroke`):
         // reshape the chord once, up front, so every consumer below — the ⌘
         // dispatcher, the prompt editor, the raw PTY encoder — sees the same
@@ -929,6 +988,16 @@ impl TerminalView {
             self.handle_editor_key(ks, cx);
             cx.stop_propagation();
             return;
+        }
+
+        // Ctrl+R reaching this raw path means the tty7 history menu the user is
+        // probably reaching for cannot appear here. When that's because shell
+        // integration never engaged — not because a foreground command owns the
+        // PTY — say so once instead of failing silently (#46). The chord still
+        // goes to the PTY below, so the shell's own reverse-i-search keeps
+        // working as the fallback.
+        if m.control && !m.platform && !m.alt && ks.key == "r" {
+            self.note_integration_gap(cx);
         }
 
         let kitty = self.kitty_flags();
@@ -1816,6 +1885,15 @@ impl TerminalView {
             self.rerank_history(Some(&cwd));
         }
 
+        // Shell integration engaging late (a slow rc file finally reported)
+        // makes a visible integration notice wrong — retract it. The
+        // once-per-pane latch stays set: the overlay works now, there is
+        // nothing left to explain.
+        if self.integration_notice.is_some() && self.terminal.shell_active() {
+            self.integration_notice = None;
+            cx.notify();
+        }
+
         // Redraw when the prompt/running state flips, so the line editor shows or
         // hides promptly even when the shell produced no output to trigger a
         // repaint (e.g. a command that prints nothing). Without this the editor's
@@ -2238,6 +2316,63 @@ impl TerminalView {
             .iter()
             .find(|h| h.len() > line.len() && h.starts_with(&line))
             .cloned()
+    }
+
+    /// Raise the one-shot integration notice if this Ctrl+R fell through to the
+    /// raw PTY path because shell integration never engaged (#46). Silent when
+    /// the raw path is expected instead: integration did engage and a foreground
+    /// command merely owns the PTY, a full-screen TUI owns the pane, or the
+    /// shell is still inside its startup grace window (slow rc files haven't
+    /// reached the first prompt report yet).
+    ///
+    /// Shows a generic message immediately, then refines it off-thread: the
+    /// daemon's foreground query sees the process actually holding the PTY, and
+    /// when that is a known shim (it exec'd over the shell we spawned), naming
+    /// it turns "the feature looks broken" into "here is the culprit".
+    fn note_integration_gap(&mut self, cx: &mut Context<Self>) {
+        if self.integration_notice_shown
+            || self.terminal.shell_active()
+            || self.on_alt_screen()
+            || self.created_at.elapsed() < INTEGRATION_GRACE
+        {
+            return;
+        }
+        self.integration_notice_shown = true;
+        self.integration_notice = Some(integration_notice_message(None));
+        cx.notify();
+
+        let pane_id = self.pane_id;
+        cx.spawn(async move |this, cx| {
+            // Best-effort: no daemon / unknown pane / unreadable process just
+            // leaves the generic message standing.
+            let fg = cx
+                .background_executor()
+                .spawn(async move {
+                    RemoteTerminal::list_panes()
+                        .into_iter()
+                        .find(|p| p.pane_id == pane_id)
+                        .map(|p| p.title)
+                })
+                .await;
+            if let Some(shim) = fg.as_deref().and_then(known_pty_shim) {
+                let _ = this.update(cx, |view, cx| {
+                    if view.integration_notice.is_some() {
+                        view.integration_notice = Some(integration_notice_message(Some(shim)));
+                        cx.notify();
+                    }
+                });
+            }
+            // Reading time is over either way; a keystroke usually beat us here.
+            cx.background_executor()
+                .timer(INTEGRATION_NOTICE_TIMEOUT)
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.integration_notice.take().is_some() {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Begin a Ctrl+R history search (no-op if one is already active). Opens
@@ -3347,6 +3482,34 @@ impl TerminalView {
         )
     }
 
+    /// The one-shot "shell integration didn't engage" notice (#46): a single
+    /// floating line, bottom-right so it reads as a status aside rather than
+    /// part of the prompt. Rendered whenever set — unlike the editor overlays
+    /// it exists precisely because `input_active()` is false.
+    fn render_integration_notice(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        let text = self.integration_notice.clone()?;
+        let theme = cx.theme();
+        Some(
+            div()
+                .absolute()
+                .bottom(px(8.))
+                .right(px(16.))
+                .max_w(px(560.))
+                .px_3()
+                .py_1()
+                .bg(theme.popover)
+                .border_1()
+                .border_color(theme.border)
+                .rounded(px(6.))
+                .text_size(px(12.))
+                .text_color(theme.muted_foreground)
+                .child(text),
+        )
+    }
+
     /// Map a highlighter token kind to a theme color.
     fn kind_color(&self, kind: TokenKind, cx: &App) -> gpui::Hsla {
         let theme = cx.theme();
@@ -3413,6 +3576,9 @@ impl Render for TerminalView {
             .input_active()
             .then(|| self.render_reverse_search_menu(cx))
             .flatten();
+        // Not gated on `input_active()`: the notice explains why the editor
+        // overlays are absent, so it renders exactly when they can't.
+        let integration_notice = self.render_integration_notice(cx);
 
         // Captured for the right-click menu: the focus handle routes dispatched
         // actions to this terminal (and lets tab/split ones bubble to the root),
@@ -3494,6 +3660,7 @@ impl Render for TerminalView {
             .children(input_bar)
             .children(completion_menu)
             .children(reverse_search_menu)
+            .children(integration_notice)
             // Right-click context menu (gpui-component PopupMenu).
             .context_menu(move |menu, _window, _cx| {
                 // Small size = tighter 20px rows; the default 26px felt too airy.
@@ -4604,6 +4771,91 @@ mod gpui_tests {
 
     fn key(spec: &str) -> gpui::Keystroke {
         gpui::Keystroke::parse(spec).expect("valid keystroke spec")
+    }
+
+    /// The notice names only known fig-style shims — an ordinary foreground
+    /// command (`ssh`) must not be blamed for intercepting anything, and the
+    /// generic message must not claim interception it can't prove.
+    #[test]
+    fn shim_detection_names_known_wrappers_only() {
+        assert_eq!(known_pty_shim("zsh (kiro-cli-term)"), Some("kiro-cli-term"));
+        assert_eq!(known_pty_shim("figterm"), Some("figterm"));
+        assert_eq!(known_pty_shim("qterm"), Some("qterm"));
+        assert_eq!(known_pty_shim("ssh"), None);
+        assert_eq!(known_pty_shim("wezterm"), None);
+        assert_eq!(known_pty_shim(""), None);
+        assert!(integration_notice_message(Some("kiro-cli-term")).contains("kiro-cli-term"));
+        assert!(!integration_notice_message(None).contains("intercepting"));
+    }
+
+    /// The Ctrl+R integration notice (#46), through the real key dispatcher:
+    /// silent inside the startup grace window, raised once integration has had
+    /// time to engage and never did, dismissed by the next keystroke, and
+    /// one-shot per pane. The chord itself still reaches the PTY throughout
+    /// (the shell's own reverse-i-search is the fallback).
+    #[gpui::test]
+    fn ctrl_r_without_integration_raises_the_notice_once(cx: &mut TestAppContext) {
+        // `note_integration_gap` queries the daemon for the pane's foreground
+        // process; pin the config dir to a scratch so the control connection
+        // fails cleanly instead of reaching a real user daemon.
+        let dir = std::env::temp_dir().join(format!("tty7-noticetest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        crate::core::config::set_config_dir(dir);
+
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, window, cx| {
+                let ctrl_r = KeyDownEvent {
+                    keystroke: key("ctrl-r"),
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                // Fresh pane: the shell may legitimately not have reported yet.
+                view.on_key_down(&ctrl_r, window, cx);
+                assert!(
+                    view.integration_notice.is_none(),
+                    "the grace window stays silent"
+                );
+
+                // Past the grace window with no OSC 133 ever seen → notice.
+                view.created_at = std::time::Instant::now() - INTEGRATION_GRACE * 2;
+                view.on_key_down(&ctrl_r, window, cx);
+                assert!(
+                    view.integration_notice.is_some(),
+                    "Ctrl+R raises the notice"
+                );
+                cx.notify();
+            })
+            .unwrap();
+
+        // Let the notified frame actually draw — a panic in the notice layout
+        // fails the test here.
+        cx.run_until_parked();
+        window
+            .update(cx, |view, window, cx| {
+                assert!(
+                    view.integration_notice.is_some(),
+                    "the notice survives a real render pass"
+                );
+
+                // The next keystroke dismisses it; the latch keeps it one-shot.
+                let ctrl_r = KeyDownEvent {
+                    keystroke: key("ctrl-r"),
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                view.on_key_down(&ctrl_r, window, cx);
+                assert!(
+                    view.integration_notice.is_none(),
+                    "a keystroke dismisses the notice"
+                );
+                view.on_key_down(&ctrl_r, window, cx);
+                assert!(
+                    view.integration_notice.is_none(),
+                    "the notice is one-shot per pane"
+                );
+            })
+            .unwrap();
     }
 
     /// The Ctrl+R flow end-to-end at the editor dispatcher: Ctrl+R opens the
