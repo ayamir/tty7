@@ -44,14 +44,7 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) {
         let m = &ev.modifiers;
-        let command_down = m.platform;
-        if let Some(tab) = self.tabs.get(self.active) {
-            for leaf in tab.pane.leaves() {
-                leaf.update(cx, |view, cx| {
-                    view.refresh_link_hover(command_down, cx);
-                });
-            }
-        }
+        self.set_link_modifier(m.platform, cx);
 
         // Mirror `on_key_down`'s chord test: reject the other platform-ish key
         // (⌃ on macOS, Win/Super elsewhere), Alt, and Shift, so only the bare
@@ -84,6 +77,22 @@ impl Tty7App {
             });
         })
         .detach();
+    }
+
+    /// Push the platform-modifier state down to every pane's link tracking.
+    /// Every tab, not just the active one: `on_modifiers_changed` only fires on
+    /// the frontmost window state, so a background tab that saw "⌘ down" but
+    /// never the matching release would keep a stale `true` — and a stale
+    /// `true` makes a plain, unmodified click open links (see
+    /// `TerminalView::link_modifier_down`).
+    pub(crate) fn set_link_modifier(&mut self, down: bool, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            for leaf in tab.pane.leaves() {
+                leaf.update(cx, |view, cx| {
+                    view.refresh_link_hover(down, cx);
+                });
+            }
+        }
     }
 
     /// Hide the badges and invalidate any pending reveal. Called on every real

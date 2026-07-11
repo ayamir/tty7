@@ -328,14 +328,16 @@ impl TerminalView {
     }
 }
 
-/// Detect a bare URL spanning column `col` within a line's text. Splits on
-/// whitespace and accepts tokens starting with a known scheme (or `www.`),
-/// trimming trailing punctuation that's usually not part of the link.
+/// Test-only convenience over [`url_span_at`]: just the resolved address.
 #[cfg(test)]
 pub(super) fn url_at(text: &str, col: usize) -> Option<String> {
     url_span_at(text, col).map(|(_, _, url)| url)
 }
 
+/// Detect a link spanning column `col` within a line's text: a bare URL
+/// always (see [`url_span_at`]), plus an existing file path when
+/// `include_files` — URL detection wins when both would match. `cwd` anchors
+/// relative paths and `~` expansion.
 pub(super) fn link_at(
     text: &str,
     col: usize,
@@ -354,9 +356,11 @@ pub(super) fn link_at(
         .flatten()
 }
 
-/// Like [`url_at`] but also reports the inclusive column span `[start, end]` the
-/// URL token occupies in `text`. Used to underline the link on hover, where we
-/// need the exact cells to highlight, not just the resolved address.
+/// Detect a bare URL spanning column `col` within a line's text. Splits on
+/// whitespace and accepts tokens starting with a known scheme (or `www.`),
+/// trimming trailing punctuation that's usually not part of the link. Also
+/// reports the inclusive column span `[start, end]` the URL token occupies in
+/// `text`, used to underline the exact cells on hover.
 pub(super) fn url_span_at(text: &str, col: usize) -> Option<(usize, usize, String)> {
     let chars: Vec<char> = text.chars().collect();
     if col >= chars.len() {

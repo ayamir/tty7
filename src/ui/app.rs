@@ -194,6 +194,11 @@ impl Tty7App {
         // in a window the user already left.
         let activation_watch = cx.observe_window_activation(window, |this, _window, cx| {
             this.dismiss_mod_hint(cx);
+            // The panes' link-modifier tracking loses the release the same
+            // way, and a stale "⌘ held" is worse than missing badges: a
+            // plain unmodified click would open links. Treat the flip as a
+            // release; holding ⌘ again re-arms it via `on_modifiers_changed`.
+            this.set_link_modifier(false, cx);
         });
         // Paint the configured color theme (defaults to a light one) and build
         // the menu bar.
