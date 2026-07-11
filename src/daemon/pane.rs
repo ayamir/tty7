@@ -423,7 +423,8 @@ impl DaemonPane {
         // client didn't pass an explicit cwd (tab-inherit / session restore still
         // win). Inherit → `forced` is `None`, so we keep the fallback as before.
         let forced = crate::core::config::working_directory_base();
-        if let Some(dir) = cwd.or(forced).or(fallback) {
+        let initial_cwd = cwd.or(forced).or(fallback);
+        if let Some(dir) = &initial_cwd {
             cmd.cwd(dir);
         }
         // Advertise a widely-available terminfo + truecolor.
@@ -457,7 +458,7 @@ impl DaemonPane {
             ring: VecDeque::new(),
             subscriber: None,
             subscriber_epoch: 0,
-            cwd: None,
+            cwd: initial_cwd,
             shell: ShellState::default(),
             size,
             alive: true,
@@ -1925,6 +1926,21 @@ mod tests {
         );
         // A live pane replays no exit; the reader thread reports that live.
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn attach_replays_initial_cwd_even_before_shell_reports_osc7() {
+        let mut st = test_state(true);
+        st.cwd = Some(PathBuf::from("/Users/alice/clone/tty7"));
+
+        let (tx, rx) = mpsc::channel();
+        attach_subscriber(&mut st, tx);
+
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(_))));
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(_))));
+        assert!(
+            matches!(rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p == PathBuf::from("/Users/alice/clone/tty7"))
+        );
     }
 
     /// Regression: attaching to a pane whose child already exited must replay

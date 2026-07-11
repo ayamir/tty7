@@ -3,6 +3,8 @@
 //! the match list, step between matches) and the search-bar UI. Also hosts
 //! `url_at`, the cursor-to-URL probe used for Cmd+click link opening.
 
+use std::path::{Path, PathBuf};
+
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::term::search::{Match, RegexSearch};
@@ -17,6 +19,23 @@ use super::view::TerminalView;
 /// query (e.g. one character) against a large scrollback from producing an
 /// unbounded list and stalling the recompute.
 const MAX_MATCHES: usize = 10_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum LinkTarget {
+    Url(String),
+    File {
+        path: PathBuf,
+        line: Option<u32>,
+        column: Option<u32>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct LinkMatch {
+    pub start: usize,
+    pub end: usize,
+    pub target: LinkTarget,
+}
 
 /// State backing the Cmd+F search bar. The query text, caret, selection, IME
 /// composition and in-field editing keys are all owned by `input` (a
@@ -312,8 +331,27 @@ impl TerminalView {
 /// Detect a bare URL spanning column `col` within a line's text. Splits on
 /// whitespace and accepts tokens starting with a known scheme (or `www.`),
 /// trimming trailing punctuation that's usually not part of the link.
+#[cfg(test)]
 pub(super) fn url_at(text: &str, col: usize) -> Option<String> {
     url_span_at(text, col).map(|(_, _, url)| url)
+}
+
+pub(super) fn link_at(
+    text: &str,
+    col: usize,
+    cwd: Option<&Path>,
+    include_files: bool,
+) -> Option<LinkMatch> {
+    if let Some((start, end, url)) = url_span_at(text, col) {
+        return Some(LinkMatch {
+            start,
+            end,
+            target: LinkTarget::Url(url),
+        });
+    }
+    include_files
+        .then(|| file_span_at(text, col, cwd))
+        .flatten()
 }
 
 /// Like [`url_at`] but also reports the inclusive column span `[start, end]` the
@@ -397,6 +435,184 @@ pub(super) fn url_span_at(text: &str, col: usize) -> Option<(usize, usize, Strin
     } else {
         None
     }
+}
+
+fn file_span_at(text: &str, col: usize, cwd: Option<&Path>) -> Option<LinkMatch> {
+    let (start, end, token) = non_ws_token_at(text, col)?;
+    let (start, mut end, mut token) = trim_file_token(start, end, token);
+    if token.is_empty() {
+        return None;
+    }
+
+    let mut location = split_file_location(&token);
+    if location.line.is_none() && token.ends_with(':') {
+        token.pop();
+        end = end.saturating_sub(1);
+        location = split_file_location(&token);
+    }
+
+    let path = resolve_existing_file(&location.path, cwd)?;
+    (start..=end).contains(&col).then_some(LinkMatch {
+        start,
+        end,
+        target: LinkTarget::File {
+            path,
+            line: location.line,
+            column: location.column,
+        },
+    })
+}
+
+fn non_ws_token_at(text: &str, col: usize) -> Option<(usize, usize, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    if col >= chars.len() || chars[col].is_whitespace() {
+        return None;
+    }
+
+    let mut start = col;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < chars.len() && !chars[end + 1].is_whitespace() {
+        end += 1;
+    }
+    Some((start, end, chars[start..=end].iter().collect()))
+}
+
+fn trim_file_token(mut start: usize, mut end: usize, mut token: String) -> (usize, usize, String) {
+    while token
+        .chars()
+        .next()
+        .is_some_and(|c| matches!(c, '(' | '[' | '<' | '\'' | '"' | '{' | '`'))
+    {
+        token.remove(0);
+        start += 1;
+    }
+    while token
+        .chars()
+        .next_back()
+        .is_some_and(is_file_trailing_punct)
+    {
+        token.pop();
+        end = end.saturating_sub(1);
+    }
+    (start, end, token)
+}
+
+fn is_file_trailing_punct(c: char) -> bool {
+    matches!(
+        c,
+        ')' | ']'
+            | '}'
+            | '.'
+            | ','
+            | ';'
+            | '\''
+            | '"'
+            | '>'
+            | '`'
+            | '）'
+            | '］'
+            | '】'
+            | '》'
+            | '」'
+            | '。'
+            | '，'
+            | '；'
+    )
+}
+
+struct FileLocation {
+    path: String,
+    line: Option<u32>,
+    column: Option<u32>,
+}
+
+fn split_file_location(token: &str) -> FileLocation {
+    let Some((prefix, last)) = strip_numeric_suffix(token) else {
+        return FileLocation {
+            path: token.to_string(),
+            line: None,
+            column: None,
+        };
+    };
+    if let Some((path, line)) = strip_numeric_suffix(prefix) {
+        FileLocation {
+            path: path.to_string(),
+            line: Some(line),
+            column: Some(last),
+        }
+    } else {
+        FileLocation {
+            path: prefix.to_string(),
+            line: Some(last),
+            column: None,
+        }
+    }
+}
+
+fn strip_numeric_suffix(token: &str) -> Option<(&str, u32)> {
+    let (prefix, suffix) = token.rsplit_once(':')?;
+    if prefix.is_empty() || suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let value = suffix.parse().ok()?;
+    Some((prefix, value))
+}
+
+fn resolve_existing_file(path: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    if path.is_empty() {
+        return None;
+    }
+    let path = expand_home(path, cwd)?;
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        cwd?.join(path)
+    };
+    candidate.is_file().then_some(candidate)
+}
+
+fn expand_home(path: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    if path == "~" {
+        return home_dir(cwd);
+    }
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        return home_dir(cwd).map(|home| home.join(rest));
+    }
+    Some(PathBuf::from(path))
+}
+
+fn home_dir(cwd: Option<&Path>) -> Option<PathBuf> {
+    if let Some(home) = cwd.and_then(home_from_cwd) {
+        return Some(home);
+    }
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(unix)]
+fn home_from_cwd(cwd: &Path) -> Option<PathBuf> {
+    let mut components = cwd.components();
+    let root = components.next()?;
+    let base = components.next()?;
+    let user = components.next()?;
+    let base = base.as_os_str().to_str()?;
+    matches!(base, "Users" | "home").then(|| {
+        let mut home = PathBuf::new();
+        home.push(root.as_os_str());
+        home.push(base);
+        home.push(user.as_os_str());
+        home
+    })
+}
+
+#[cfg(not(unix))]
+fn home_from_cwd(_cwd: &Path) -> Option<PathBuf> {
+    None
 }
 
 /// Trim trailing punctuation a URL gets glued to in prose — `.,;:'"` and `>` plus
@@ -713,5 +929,121 @@ mod tests {
         assert_eq!(url_at("...", 1), None);
         // A plain word starting like a scheme but not one.
         assert_eq!(url_at("httpsomething", 3), None);
+    }
+
+    fn temp_file(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tty7-link-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temporary link-test dir");
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create temporary parent dir");
+        }
+        std::fs::write(&path, b"").expect("create temporary file");
+        path
+    }
+
+    fn assert_file_link(
+        line: &str,
+        col: usize,
+        cwd: &Path,
+        expected_path: &Path,
+        expected_line: Option<u32>,
+        expected_column: Option<u32>,
+    ) {
+        let link = link_at(line, col, Some(cwd), true).expect("file link under cursor");
+        match link.target {
+            LinkTarget::File { path, line, column } => {
+                assert_eq!(path, expected_path);
+                assert_eq!(line, expected_line);
+                assert_eq!(column, expected_column);
+            }
+            LinkTarget::Url(url) => panic!("expected file link, got URL {url}"),
+        }
+    }
+
+    #[test]
+    fn link_at_detects_relative_file_paths_from_cwd() {
+        let path = temp_file("src/main.rs");
+        let cwd = path.parent().and_then(Path::parent).unwrap();
+
+        assert_file_link(
+            "error src/main.rs:10:2 failed",
+            8,
+            cwd,
+            &path,
+            Some(10),
+            Some(2),
+        );
+
+        let link = link_at("error src/main.rs:10:2 failed", 8, Some(cwd), true)
+            .expect("file link under cursor");
+        assert_eq!((link.start, link.end), (6, 21));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tilde_expansion_prefers_home_inferred_from_the_pane_cwd() {
+        let cwd = Path::new("/Users/alice/clone/tty7");
+        assert_eq!(
+            expand_home("~/clone/tty7/src/main.rs", Some(cwd)),
+            Some(PathBuf::from("/Users/alice/clone/tty7/src/main.rs"))
+        );
+    }
+
+    #[test]
+    fn link_at_detects_absolute_file_paths_and_single_line_suffix() {
+        let path = temp_file("absolute.log");
+        let line = format!("open {}:42 now", path.display());
+        let col = line.chars().position(|c| c == '/').unwrap_or(5);
+
+        assert_file_link(&line, col, Path::new("/"), &path, Some(42), None);
+    }
+
+    #[test]
+    fn link_at_trims_wrappers_and_trailing_punctuation_around_file_paths() {
+        let path = temp_file("wrapped/src/lib.rs");
+        let cwd = path.parent().and_then(Path::parent).unwrap();
+        let line = "see (src/lib.rs:7), now";
+
+        let link = link_at(line, 7, Some(cwd), true).expect("wrapped file link");
+        assert_eq!((link.start, link.end), (5, 16));
+        match link.target {
+            LinkTarget::File {
+                path: got,
+                line,
+                column,
+            } => {
+                assert_eq!(got, path);
+                assert_eq!(line, Some(7));
+                assert_eq!(column, None);
+            }
+            LinkTarget::Url(url) => panic!("expected file link, got URL {url}"),
+        }
+    }
+
+    #[test]
+    fn link_at_rejects_missing_files_and_file_detection_can_be_disabled() {
+        let cwd = std::env::temp_dir();
+
+        assert_eq!(link_at("missing src/nope.rs:1", 9, Some(&cwd), true), None);
+        assert_eq!(link_at("missing src/nope.rs:1", 9, Some(&cwd), false), None);
+
+        let path = temp_file("disabled.rs");
+        let line = format!("open {}", path.display());
+        assert!(link_at(&line, 6, Some(&cwd), false).is_none());
+    }
+
+    #[test]
+    fn link_at_keeps_url_detection_ahead_of_file_detection() {
+        let url = "https://example.com/src/main.rs";
+        let link = link_at(url, 10, Some(Path::new("/")), true).expect("URL link");
+        assert_eq!(
+            link,
+            LinkMatch {
+                start: 0,
+                end: url.len() - 1,
+                target: LinkTarget::Url(url.to_string()),
+            }
+        );
     }
 }

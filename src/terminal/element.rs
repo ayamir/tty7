@@ -1177,7 +1177,8 @@ impl TerminalElement {
             let clicks = ev.click_count;
             view.update(cx, |v, cx| {
                 // Cmd+click opens a URL under the cursor.
-                if mods.platform && button == MouseButton::Left && v.open_link_at(col, row, cx) {
+                let link_modifier = mods.platform || v.link_modifier_down();
+                if link_modifier && button == MouseButton::Left && v.open_link_at(col, row, cx) {
                     return;
                 }
                 // Report to the app when in mouse-tracking mode (Shift forces
@@ -1227,7 +1228,8 @@ impl TerminalElement {
                         if !mods.shift {
                             v.mouse_motion(col, row, &mods);
                         }
-                        v.hover_link_at(col, row, cx);
+                        let include_files = mods.platform || v.link_modifier_down();
+                        v.hover_link_at(col, row, include_files, cx);
                     } else {
                         v.clear_hovered_link(cx);
                     }

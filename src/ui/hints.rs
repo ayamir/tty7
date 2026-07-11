@@ -44,6 +44,15 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) {
         let m = &ev.modifiers;
+        let command_down = m.platform;
+        if let Some(tab) = self.tabs.get(self.active) {
+            for leaf in tab.pane.leaves() {
+                leaf.update(cx, |view, cx| {
+                    view.refresh_link_hover(command_down, cx);
+                });
+            }
+        }
+
         // Mirror `on_key_down`'s chord test: reject the other platform-ish key
         // (⌃ on macOS, Win/Super elsewhere), Alt, and Shift, so only the bare
         // secondary hold shows the badges.

@@ -23,7 +23,7 @@ use super::highlight::{self, TokenKind};
 use super::hold::{GapHold, Verdict};
 use super::remote::RemoteTerminal;
 use super::reverse_search::{self, ReverseSearch};
-use super::search::SearchState;
+use super::search::{LinkTarget, SearchState};
 use super::typeahead::{RawInput, Typeahead};
 use crate::core::actions::{
     CloseActiveTab, NewTab, SendBackTab, SendTab, SplitDown, SplitRight, ToggleMaximizePane,
@@ -114,6 +114,15 @@ pub struct TerminalView {
     /// Last cell reported to the PTY in mouse-tracking mode, used to suppress
     /// duplicate motion reports while dragging within a single cell.
     last_mouse_cell: Option<(usize, usize)>,
+    /// Last cell the pointer hovered over locally. Kept separate from
+    /// `last_mouse_cell`, which belongs to terminal mouse-reporting protocol
+    /// state and must not be disturbed by local link affordances.
+    last_hover_cell: Option<(usize, usize)>,
+    /// Whether the platform modifier (⌘ on macOS) is currently held, as reported
+    /// by the window-level modifier listener. Mouse events can lag or omit this
+    /// state while a mouse-tracking TUI is foreground, so link hover must not
+    /// depend solely on each move event's modifier snapshot.
+    link_modifier_down: bool,
     /// Fractional line debt carried between wheel events on the quantized
     /// paths (mouse-tracking reports, alternate-scroll arrow keys), where the
     /// app consumes whole lines. Trackpads report pixel deltas well under a
@@ -728,6 +737,8 @@ impl TerminalView {
             title: "tty7".to_string(),
             marked_text: String::new(),
             last_mouse_cell: None,
+            last_hover_cell: None,
+            link_modifier_down: false,
             scroll_debt: 0.,
             scroll_frac: 0.,
             search: None,
@@ -2859,8 +2870,8 @@ impl TerminalView {
         }
     }
 
-    /// Open the URL under the given cell, if any (OSC 8 hyperlink or a plain URL
-    /// detected in the row text). Returns true if a URL was opened.
+    /// Open the link under the given cell, if any (OSC 8 hyperlink, plain URL or
+    /// existing file path detected in the row text). Returns true if one opened.
     pub fn open_link_at(&self, col: usize, row: usize, cx: &mut Context<Self>) -> bool {
         if !cx.global::<Config>().link_url {
             return false;
@@ -2882,31 +2893,43 @@ impl TerminalView {
             return true;
         }
 
-        // 2) Fall back to detecting a bare URL in the row's text.
+        // 2) Fall back to detecting a bare URL or file path in the row's text.
         let mut text = String::with_capacity(cols);
         for c in 0..cols {
             text.push(term.grid()[line][Column(c)].c);
         }
         drop(term);
-        if let Some(url) = super::search::url_at(&text, col) {
-            cx.open_url(&url);
-            return true;
+        let cwd = self.cwd();
+        if let Some(link) = super::search::link_at(&text, col, cwd.as_deref(), true) {
+            match link.target {
+                LinkTarget::Url(url) => cx.open_url(&url),
+                LinkTarget::File { path, .. } => open_file_path(&path),
+            }
+            true
+        } else {
+            false
         }
-        false
     }
 
     /// Update the remembered hovered link for the screen cell `(col, row)` and
     /// repaint if it changed. Returns whether a link sits under the cursor, so the
     /// element can switch to a pointing-hand cursor. Cheap on the common case: any
     /// non-URL cell resolves to `None` and bails.
-    pub fn hover_link_at(&mut self, col: usize, row: usize, cx: &mut Context<Self>) -> bool {
+    pub fn hover_link_at(
+        &mut self,
+        col: usize,
+        row: usize,
+        include_files: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.last_hover_cell = Some((col, row));
         // URL detection off → never underline or switch to the pointing hand,
         // and drop any underline a prior hover left behind.
         if !cx.global::<Config>().link_url {
             self.clear_hovered_link(cx);
             return false;
         }
-        let next = self.link_span_at(col, row);
+        let next = self.link_span_at(col, row, include_files);
         if next != self.hovered_link {
             self.hovered_link = next;
             cx.notify();
@@ -2914,19 +2937,32 @@ impl TerminalView {
         self.hovered_link.is_some()
     }
 
+    pub fn refresh_link_hover(&mut self, include_files: bool, cx: &mut Context<Self>) -> bool {
+        self.link_modifier_down = include_files;
+        let Some((col, row)) = self.last_hover_cell else {
+            return false;
+        };
+        self.hover_link_at(col, row, include_files, cx)
+    }
+
+    pub fn link_modifier_down(&self) -> bool {
+        self.link_modifier_down
+    }
+
     /// Forget any hovered link (mouse left the grid, or moved onto plain text),
     /// repainting to drop the underline.
     pub fn clear_hovered_link(&mut self, cx: &mut Context<Self>) {
+        self.last_hover_cell = None;
         if self.hovered_link.take().is_some() {
             cx.notify();
         }
     }
 
     /// Resolve the link span at screen cell `(col, row)`: an OSC 8 hyperlink (the
-    /// contiguous run of cells sharing the same target) or a bare URL token in the
-    /// row text. Mirrors [`open_link_at`](Self::open_link_at)'s detection so the
-    /// underline always covers exactly what a Cmd+click would open.
-    fn link_span_at(&self, col: usize, row: usize) -> Option<HoveredLink> {
+    /// contiguous run of cells sharing the same target), a bare URL token, or an
+    /// existing file path in the row text. Mirrors [`open_link_at`](Self::open_link_at)'s
+    /// detection so the underline covers exactly what a Cmd+click would open.
+    fn link_span_at(&self, col: usize, row: usize, include_files: bool) -> Option<HoveredLink> {
         let term = self.terminal.term.lock();
         let display_offset = term.grid().display_offset() as i32;
         let line = Line(row as i32 - display_offset);
@@ -2959,17 +2995,18 @@ impl TerminalView {
             });
         }
 
-        // 2) Bare URL detected in the row's text.
+        // 2) Bare URL or file path detected in the row's text.
         let mut text = String::with_capacity(cols);
         for c in 0..cols {
             text.push(term.grid()[line][Column(c)].c);
         }
         drop(term);
-        let (start, end, _url) = super::search::url_span_at(&text, col)?;
+        let cwd = self.cwd();
+        let link = super::search::link_at(&text, col, cwd.as_deref(), include_files)?;
         Some(HoveredLink {
             line: line.0,
-            start,
-            end,
+            start: link.start,
+            end: link.end,
         })
     }
 
@@ -3827,6 +3864,19 @@ fn select_end_copy(enabled: bool, grid: bool, editor: bool) -> SelectEndCopy {
         (true, true, _) => SelectEndCopy::Grid,
         (true, false, true) => SelectEndCopy::Editor,
         (true, false, false) => SelectEndCopy::None,
+    }
+}
+
+fn open_file_path(path: &std::path::Path) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    if let Err(e) = std::process::Command::new(opener).arg(path).spawn() {
+        log::warn!("failed to open {}: {e}", path.display());
     }
 }
 
