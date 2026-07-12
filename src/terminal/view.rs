@@ -13,7 +13,7 @@ use gpui::{
 };
 use gpui_component::kbd::Kbd;
 use gpui_component::menu::ContextMenuExt;
-use gpui_component::{ActiveTheme as _, Icon, IconName, Size, h_flex};
+use gpui_component::{ActiveTheme as _, Icon, IconName, h_flex};
 
 use super::TermSize;
 use super::cmd_editor::CmdEditor;
@@ -30,6 +30,15 @@ use crate::core::actions::{
 };
 use crate::core::config::{Config, NotifyMode};
 use crate::daemon::protocol::ShellSpec;
+
+/// Inset (px) between the terminal-surface edge and the cell grid. The prompt
+/// editor and the floating completion / history menus are absolutely positioned
+/// over the grid, so they must offset their grid-aligned origin by the same
+/// amount the surface padding insets the grid. Keep these in sync with the
+/// `.px()/.py()` on the surface container in `TerminalView::render` — they are
+/// the single source of truth for that inset.
+const GRID_PAD_X: f32 = 8.;
+const GRID_PAD_Y: f32 = 4.;
 
 // Terminal-scoped actions dispatched by the right-click context menu. They route
 // to this view via `.on_action` handlers on the terminal surface; tab/split
@@ -261,6 +270,10 @@ pub struct TerminalView {
     /// that the ended gesture selected in the editor, so copy-on-select copies
     /// the editor's selection rather than the terminal's.
     editor_select_gesture: bool,
+    /// When a drag-extend is armed by a double-click, the word range the
+    /// double-click selected, so the drag can grow the selection by whole words
+    /// (keeping the anchor word intact). `None` for a plain char-granular drag.
+    editor_drag_word: Option<(usize, usize)>,
     /// The URL currently under the mouse (an OSC 8 hyperlink or a bare URL found
     /// in the row text), if any. Drives the hover underline and the pointing-hand
     /// cursor that mark a link as clickable. Stored in scroll-stable grid
@@ -776,6 +789,7 @@ impl TerminalView {
             created_at: std::time::Instant::now(),
             editor_selecting: false,
             editor_select_gesture: false,
+            editor_drag_word: None,
             hovered_link: None,
             _focus_subs: focus_subs,
         }
@@ -1180,6 +1194,18 @@ impl TerminalView {
                 }
                 CmdKey::Consumed
             }
+            "delete" => {
+                // ⌘⌫ deletes to line start; ⌘⌦ is its mirror — delete to line end.
+                if self.input_active() {
+                    if !self.cmd.delete_selection() {
+                        self.cmd.delete_to_end();
+                    }
+                    self.close_completion();
+                    self.cursor_visible = true;
+                    cx.notify();
+                }
+                CmdKey::Consumed
+            }
             _ => CmdKey::Bubble,
         }
     }
@@ -1259,6 +1285,41 @@ impl TerminalView {
         // scannable. Every Ctrl chord is swallowed at the prompt (recognized or
         // not), so this always notifies and returns.
         if m.control && !m.platform && !m.alt {
+            // Off macOS, word navigation and deletion live on Ctrl (the Windows /
+            // Linux convention): Ctrl+←/→ move by word (Shift extends the
+            // selection), Ctrl+⌫/⌦ delete a word. macOS keeps these on Alt (handled
+            // below) — its Ctrl+arrows are OS-level Space switches, and Ctrl+letters
+            // stay readline — so claim the arrow / delete keys only off macOS.
+            if cfg!(not(target_os = "macos")) {
+                match key {
+                    "left" => {
+                        self.editor_move_h(false, m.shift, true);
+                        cx.notify();
+                        return;
+                    }
+                    "right" => {
+                        self.editor_move_h(true, m.shift, true);
+                        cx.notify();
+                        return;
+                    }
+                    "backspace" => {
+                        if !self.cmd.delete_selection() {
+                            self.cmd.delete_word_left();
+                        }
+                        self.history_nav = None;
+                        cx.notify();
+                        return;
+                    }
+                    "delete" => {
+                        if !self.cmd.delete_selection() {
+                            self.cmd.delete_word_right();
+                        }
+                        cx.notify();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             // Off macOS, Ctrl is the primary modifier, so Ctrl+A is expected to
             // select the whole edited line (text-editor / Windows convention) —
             // there is no reachable Cmd key to carry the macOS `Cmd+A`. macOS keeps
@@ -2010,19 +2071,39 @@ impl TerminalView {
         col: usize,
         row: usize,
         clicks: usize,
+        shift: bool,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(idx) = self.editor_char_index(col, row, false) else {
             return false;
         };
         match clicks {
+            // Shift+click extends the selection from the current caret to the
+            // click (anchoring one at the old caret if none is active), matching
+            // shift-arrow selection; a plain click collapses to the caret.
+            1 if shift => {
+                self.cmd.extend_to(idx);
+                self.editor_selecting = true; // a drag from here keeps extending
+                self.editor_drag_word = None;
+            }
             1 => {
                 self.cmd.set_cursor(idx);
                 self.cmd.clear_selection();
                 self.editor_selecting = true; // a drag from here extends selection
+                self.editor_drag_word = None;
             }
-            2 => self.cmd.select_word_at(idx),
-            _ => self.cmd.select_all(),
+            2 => {
+                self.cmd.select_word_at(idx);
+                // Drag now grows the selection by whole words around this one.
+                self.editor_selecting = true;
+                self.editor_drag_word = self.cmd.selection();
+            }
+            _ => {
+                self.cmd.select_all();
+                // The whole line is selected; a drag has nothing left to extend.
+                self.editor_selecting = false;
+                self.editor_drag_word = None;
+            }
         }
         self.editor_select_gesture = true;
         self.close_completion();
@@ -2040,7 +2121,12 @@ impl TerminalView {
         let Some(idx) = self.editor_char_index(col, row, true) else {
             return false;
         };
-        self.cmd.extend_to(idx);
+        // A drag begun on a double-click extends by whole words; otherwise by char.
+        if let Some((s, e)) = self.editor_drag_word {
+            self.cmd.extend_word_to(s, e, idx);
+        } else {
+            self.cmd.extend_to(idx);
+        }
         self.cursor_visible = true;
         cx.notify();
         true
@@ -2914,6 +3000,7 @@ impl TerminalView {
         self.selecting = false;
         self.editor_selecting = false;
         self.editor_select_gesture = false;
+        self.editor_drag_word = None;
         self.drag_scroll = None;
         match copy {
             SelectEndCopy::None => {}
@@ -3128,8 +3215,8 @@ impl TerminalView {
     /// as the single cursor.
     fn render_input_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let (crow, ccol) = self.cursor_cell().unwrap_or((0, 0));
-        let cx_left = px(16.) + self.cell_width * (ccol as f32);
-        let cy_top = px(8.) + self.line_height * (crow as f32);
+        let cx_left = px(GRID_PAD_X) + self.cell_width * (ccol as f32);
+        let cy_top = px(GRID_PAD_Y) + self.line_height * (crow as f32);
 
         // Reverse-search mode replaces the line with a `(reverse-i-search)` prompt
         // showing the query and the selected match; the ranked candidates float
@@ -3315,7 +3402,7 @@ impl TerminalView {
 
         div()
             .absolute()
-            .left(px(16.))
+            .left(px(GRID_PAD_X))
             .top(cy_top)
             .right_4()
             .min_h(lh)
@@ -3435,11 +3522,11 @@ impl TerminalView {
         // particular, when flipped above it clears the caret instead of covering it.
         let gap = px(6.);
         // Anchor at the command start (the cursor cell), where the line begins.
-        let x = px(16.) + self.cell_width * (scol as f32);
+        let x = px(GRID_PAD_X) + self.cell_width * (scol as f32);
         let y = if place_above {
-            px(8.) + self.line_height * (srow as f32) - menu_h - gap
+            px(GRID_PAD_Y) + self.line_height * (srow as f32) - menu_h - gap
         } else {
-            px(8.) + self.line_height * ((srow + 1) as f32) + gap
+            px(GRID_PAD_Y) + self.line_height * ((srow + 1) as f32) + gap
         };
 
         Some(
@@ -3600,15 +3687,15 @@ impl TerminalView {
         let grid_w = self.cell_width * (total_cols as f32);
         let menu_w = if grid_w < px(720.) { grid_w } else { px(720.) };
         let y = if place_above {
-            px(8.) + lh * (srow as f32) - menu_h - gap
+            px(GRID_PAD_Y) + lh * (srow as f32) - menu_h - gap
         } else {
-            px(8.) + lh * ((srow + 1) as f32) + gap
+            px(GRID_PAD_Y) + lh * ((srow + 1) as f32) + gap
         };
 
         Some(
             div()
                 .absolute()
-                .left(px(16.))
+                .left(px(GRID_PAD_X))
                 .top(y)
                 .flex()
                 .flex_col()
@@ -3641,8 +3728,8 @@ impl TerminalView {
         Some(
             div()
                 .absolute()
-                .bottom(px(8.))
-                .right(px(16.))
+                .bottom(px(GRID_PAD_Y))
+                .right(px(GRID_PAD_X))
                 .max_w(px(560.))
                 .px_3()
                 .py_1()
@@ -3739,8 +3826,8 @@ impl Render for TerminalView {
             .size_full()
             .relative()
             .overflow_hidden()
-            .px_4()
-            .py_2()
+            .px(px(GRID_PAD_X))
+            .py(px(GRID_PAD_Y))
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .on_key_down(cx.listener(Self::on_key_down))
@@ -3809,17 +3896,18 @@ impl Render for TerminalView {
             .children(integration_notice)
             // Right-click context menu (gpui-component PopupMenu).
             .context_menu(move |menu, _window, _cx| {
-                // Small size = tighter 20px rows; the default 26px felt too airy.
-                // A fixed min-width keeps the menu a consistent, intentional size
-                // instead of hugging the longest label (which reads ragged).
+                // Default (26px) rows: with the flat full-bleed highlight (no
+                // floating pill, no inter-row gap) they read dense, not airy, and
+                // match the command palette's row height. A fixed min-width keeps
+                // the menu a consistent, intentional size instead of hugging the
+                // longest label (which reads ragged).
                 // Copy/Paste/Select All/Find are dispatched inline (see
                 // `handle_cmd_shortcut`) with no registered `KeyBinding`, so the menu
                 // can't auto-derive their hints the way it does for the items below.
                 // We render the hint ourselves via `menu_row_with_hint` to keep the
                 // whole menu consistent, rather than register real bindings (which
                 // would risk the Ctrl+C SIGINT fall-through on Windows/Linux).
-                menu.with_size(Size::Small)
-                    .min_w(px(220.))
+                menu.min_w(px(220.))
                     .action_context(menu_focus.clone())
                     .menu_element_with_disabled(
                         Box::new(CopyText),

@@ -116,7 +116,7 @@ impl Command {
             Command::new("Change Theme…", OpenThemePicker),
             Command::new("Open Settings", OpenSettings),
             Command::new("Reset Font Size", ResetFontSize),
-            Command::new("Restart Background Service…", RestartDaemon),
+            Command::new("Restart Daemon…", RestartDaemon),
         ]
     }
 
@@ -125,15 +125,15 @@ impl Command {
     /// preset. The active theme is marked with a check so the list doubles as a
     /// "which theme am I on?" indicator.
     pub fn theme_commands(cx: &App) -> Vec<Command> {
-        let active = cx.global::<Config>().theme_preset.as_str();
-        crate::ui::presets::all()
-            .iter()
+        let active = cx.global::<Config>().theme_preset.clone();
+        crate::ui::presets::all(cx)
+            .into_iter()
             .enumerate()
             .map(|(i, p)| {
                 let title = if p.id == active {
                     format!("{}  ✓", p.name)
                 } else {
-                    p.name.to_string()
+                    p.name.clone()
                 };
                 Command::new(title, CommandKind::SetTheme(i))
             })
@@ -404,7 +404,12 @@ impl Render for PaletteView {
             .rounded_lg()
             .shadow_lg()
             .overflow_hidden()
-            .child(List::new(&self.list).p_1().max_h(px(440.)));
+            // `py_1` (not `p_1`): the row padding is vertical only, so the
+            // selected row's fill runs edge to edge — the same flat, full-bleed
+            // highlight the context menu, new-tab dropdown and completion popup
+            // use. The 4px top/bottom inset keeps the first/last row clear of the
+            // card's rounded corners.
+            .child(List::new(&self.list).py_1().max_h(px(440.)));
 
         // Full-window scrim; clicking the empty area dismisses the palette (the
         // card itself is occluded so its clicks don't bubble here).
