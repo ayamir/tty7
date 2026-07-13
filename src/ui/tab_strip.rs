@@ -13,6 +13,7 @@ use gpui_component::input::Input;
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex};
 
+use crate::core::actions::{OpenSettings, TogglePalette};
 use crate::core::config::Config;
 use crate::daemon::protocol::ShellSpec;
 use crate::ui::app::{Tab, Tty7App};
@@ -173,17 +174,26 @@ impl Tty7App {
         // first nine chips swaps its close affordance for a ⌘N badge — same
         // slot, so nothing shifts when the hints appear.
         let show_badges = self.mod_hint_badges;
-        // The titlebar lays out on its main axis by content width, so the strip
-        // never inherits a window-bounded width to shrink within — `flex_shrink`
-        // on the chips would never fire. Derive an explicit cap from the live
-        // viewport instead: total width minus the traffic-light pad (80), the
-        // strip's own left margin (8), and a small right buffer. Capped this way,
-        // a crowded strip becomes a bounded flex container and the chips shrink.
-        let avail = (window.viewport_size().width - px(100.)).max(px(120.));
-        // The "+" button (30px) plus a gap lives *outside* the clipped chip row,
-        // so it never gets scrolled off when the tabs fill the strip — reserve
-        // its footprint here and cap the chip row at the remainder.
-        let chips_avail = (avail - px(40.)).max(px(80.));
+        // Explicit viewport-derived strip width, NOT `w_full`: the title bar sizes
+        // its content by intrinsic width, so `w_full` doesn't track the window and
+        // the strip's right edge (where the "⋯" is pinned) lags behind the
+        // shrinking window — the button drifts right into the corner. Deriving the
+        // width from the live viewport makes the right edge track the window at
+        // every size. macOS reserves 80px on the *left* for the traffic lights, so
+        // `viewport - 80` reaches the true right edge and the strip's own `pr`
+        // sets the "⋯" inset; other platforms put the window controls on the
+        // *right*, so keep the strip narrower to clear them.
+        let strip_w = if cfg!(target_os = "macos") {
+            (window.viewport_size().width - px(80.)).max(px(160.))
+        } else {
+            (window.viewport_size().width - px(100.)).max(px(140.))
+        };
+        // The "+" and the right-edge overflow "⋯" (30px each), their surrounding
+        // gaps, and the strip's own left/right padding all live *outside* the
+        // clipped chip row — reserve that whole footprint here so the fixed chrome
+        // never overflows the strip box (which would eat the "⋯"'s right inset and
+        // shove it into the window corner) and cap the chip row at the remainder.
+        let chips_avail = (strip_w - px(100.)).max(px(80.));
         // Only the chip row clips; a crowded row shrinks its chips (down to their
         // `min_w`) and truncates their labels rather than pushing the "+" away.
         let mut chips = h_flex()
@@ -458,16 +468,70 @@ impl Tty7App {
                     }),
             );
 
-        // Outer strip: the clipping chip row plus the always-visible "+". Only
-        // `chips` is width-capped and `overflow_hidden`, so the "+" is never
+        // Right-edge overflow menu: the low-frequency *global* entries (command
+        // palette, settings) that until now had no on-screen affordance at all —
+        // only keyboard shortcuts. Same ghost 30px tile as the "+", but anchored
+        // to the title bar's otherwise-empty right edge and opening from its
+        // top-right corner so the popup never spills off-screen.
+        //
+        // `.menu(label, Action)` dispatches the real action, so a click and the
+        // shortcut travel one path and the row auto-renders the shortcut hint; it
+        // needs an `action_context` inside the app's element tree to land on the
+        // root `on_action` handlers, so we hand it the focused pane (falling back
+        // to the home page's handle when no tab is open).
+        //
+        // Hidden while the settings tab is active: both entries are redundant
+        // there (you're already in settings, and the palette's own value is
+        // reaching *other* views), so the chrome stays quiet.
+        let on_settings = self.tabs.get(active).is_some_and(Tab::is_settings);
+        let action_ctx = self
+            .tabs
+            .get(active)
+            .and_then(|t| t.pane.focused_or_first(window, cx))
+            .map(|leaf| leaf.read(cx).focus_handle.clone())
+            .unwrap_or_else(|| self.home_focus.clone());
+        let menu_button = div().occlude().flex_shrink_0().child(
+            Button::new("titlebar-menu")
+                .icon(Icon::new(IconName::Ellipsis).size(px(15.)))
+                .ghost()
+                .xsmall()
+                .w(px(30.))
+                .h(px(30.))
+                .rounded_lg()
+                .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _window, _cx| {
+                    menu.min_w(px(220.))
+                        .action_context(action_ctx.clone())
+                        .menu("Command Palette", Box::new(TogglePalette))
+                        .menu("Settings…", Box::new(OpenSettings))
+                }),
+        );
+
+        // Outer strip: the clipping chip row and the always-visible "+" anchored
+        // left, the overflow "⋯" pushed to the right edge by a flexible spacer.
+        // Only `chips` is width-capped and `overflow_hidden`, so neither button is
         // pushed off-screen no matter how many tabs are open.
         h_flex()
             .items_center()
             .gap_1p5()
-            .ml_2()
+            // Viewport-derived width (see `strip_w`) so the right edge — and the
+            // "⋯" pinned to it — tracks the window instead of drifting.
+            .w(strip_w)
+            // Padding, not margin: taffy is border-box, so a horizontal *margin*
+            // would push the strip past its box and clip the "⋯"; padding stays
+            // inside the width. `pr_2` (8px) sets the "⋯"'s gap from the right edge
+            // — the original tight inset, which now holds steady on resize since
+            // `strip_w` keeps the right edge tracking the window.
+            .pl_2()
+            .pr_2()
+            // On Windows/Linux the window controls (─ ▢ ✕) sit on the right, right
+            // where the "⋯" lands; give it extra right breathing room there so it
+            // reads as a menu affordance, not a fourth window control.
+            .when(!cfg!(target_os = "macos"), |this| this.pr_3())
             .min_w_0()
             .child(chips)
             .child(add_button)
+            .child(div().flex_1())
+            .when(!on_settings, |this| this.child(menu_button))
     }
 }
 
