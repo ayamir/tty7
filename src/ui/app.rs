@@ -1,10 +1,7 @@
 //! The window shell: a transparent unified title bar carrying the tab strip,
 //! with the active terminal filling the rest. Owns all tabs (each its own PTY).
 
-use gpui::{
-    App, Axis, ClipboardItem, Context, Entity, PromptLevel, Subscription, Window, div, prelude::*,
-    px,
-};
+use gpui::{App, Axis, Context, Entity, PromptLevel, Subscription, Window, div, prelude::*, px};
 use gpui_component::color_picker::{ColorPickerEvent, ColorPickerState};
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::select::{SearchableVec, SelectEvent, SelectState};
@@ -17,7 +14,10 @@ use crate::core::config::{Config, NewTabPosition, ShellConfig};
 use crate::core::session::{Session, SessionAxis, SessionPane, SessionTab};
 use crate::core::shells::DetectedShell;
 use crate::core::ssh_config;
-use crate::daemon::protocol::{ShellSpec, SshSpec};
+use crate::daemon::protocol::{
+    LoopbackForwardId, LoopbackForwardInfo, RemoteContext, ShellSpec, SshSpec,
+    ssh_option_takes_value,
+};
 use crate::terminal::view::{ChildExited, TerminalView};
 use crate::ui::palette::{Command, CommandKind, PaletteEvent, PaletteView};
 use crate::ui::pane::{CloseOutcome, Dir, Pane};
@@ -119,6 +119,14 @@ pub(crate) struct Renaming {
     _subs: Vec<Subscription>,
 }
 
+pub(crate) struct LoopbackForwardPanelState {
+    pub(crate) open_pane_id: Option<u64>,
+    pub(crate) forwards: Vec<LoopbackForwardInfo>,
+    pub(crate) host_input: Entity<InputState>,
+    pub(crate) port_input: Entity<InputState>,
+    pub(crate) editing: Option<LoopbackForwardId>,
+}
+
 pub struct Tty7App {
     /// The open tabs; each owns a split-pane tree and an optional name.
     pub(crate) tabs: Vec<Tab>,
@@ -188,6 +196,10 @@ pub struct Tty7App {
     /// the "+" dropdown. Probed once at startup off the UI thread — empty until
     /// that lands, when the dropdown offers just the default entry.
     pub(crate) detected_shells: Vec<DetectedShell>,
+    /// Pane-contextual SSH loopback forward UI state. The controls render only
+    /// over the active SSH pane, but the input/editing state is app-owned so it
+    /// is not tied to the Settings tab.
+    pub(crate) loopback_panel: LoopbackForwardPanelState,
 }
 
 impl Tty7App {
@@ -213,6 +225,13 @@ impl Tty7App {
         let font_family_bold = cx.global::<Config>().font_family_bold.clone();
         let font_family_italic = cx.global::<Config>().font_family_italic.clone();
         let font_features = cx.global::<Config>().font_features.clone();
+        let loopback_host_input =
+            cx.new(|cx| InputState::new(window, cx).default_value("localhost"));
+        let loopback_port_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("3000")
+                .default_value("")
+        });
         // Live-apply hot-reloaded config: the watcher in `main.rs` swaps the
         // `Config` global on every `config.json` change, which fires this. Theme
         // and colors are handled separately by `apply_theme`; here we cover the
@@ -279,6 +298,13 @@ impl Tty7App {
             record_gen: 0,
             home_focus: cx.focus_handle(),
             detected_shells: Vec::new(),
+            loopback_panel: LoopbackForwardPanelState {
+                open_pane_id: None,
+                forwards: crate::terminal::RemoteTerminal::list_loopback_forwards(),
+                host_input: loopback_host_input,
+                port_input: loopback_port_input,
+                editing: None,
+            },
         };
         // Discover this machine's shells for the "+" dropdown off the UI thread
         // (the WSL probe on Windows spawns a process, and /etc/shells hits the
@@ -788,77 +814,70 @@ impl Tty7App {
     }
 
     pub(crate) fn refresh_loopback_forwards(&mut self, cx: &mut Context<Self>) {
-        let forwards = crate::terminal::RemoteTerminal::list_loopback_forwards();
-        if let Some(settings) = self
-            .tabs
-            .get_mut(self.active)
-            .and_then(|tab| tab.settings.as_mut())
-        {
-            settings.loopback_forwards = forwards;
+        self.loopback_panel.forwards = crate::terminal::RemoteTerminal::list_loopback_forwards();
+        cx.notify();
+    }
+
+    pub(crate) fn close_loopback_forward(&mut self, id: LoopbackForwardId, cx: &mut Context<Self>) {
+        self.loopback_panel.forwards = crate::terminal::RemoteTerminal::close_loopback_forward(id);
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_loopback_forward_panel(&mut self, pane_id: u64, cx: &mut Context<Self>) {
+        let should_open = self.loopback_panel.open_pane_id != Some(pane_id);
+        if should_open {
+            self.loopback_panel.open_pane_id = Some(pane_id);
+            if self
+                .loopback_panel
+                .editing
+                .as_ref()
+                .is_some_and(|id| id.pane_id != pane_id)
+            {
+                self.loopback_panel.editing = None;
+            }
+            self.refresh_loopback_forwards(cx);
+        } else {
+            self.loopback_panel.open_pane_id = None;
+            self.loopback_panel.editing = None;
         }
         cx.notify();
     }
 
-    pub(crate) fn close_loopback_forward(
-        &mut self,
-        id: crate::daemon::protocol::LoopbackForwardId,
-        cx: &mut Context<Self>,
-    ) {
-        let forwards = crate::terminal::RemoteTerminal::close_loopback_forward(id);
-        if let Some(settings) = self
-            .tabs
-            .get_mut(self.active)
-            .and_then(|tab| tab.settings.as_mut())
-        {
-            settings.loopback_forwards = forwards;
-        }
+    pub(crate) fn close_loopback_forward_panel(&mut self, cx: &mut Context<Self>) {
+        self.loopback_panel.open_pane_id = None;
+        self.loopback_panel.editing = None;
         cx.notify();
-    }
-
-    pub(crate) fn copy_loopback_forward_address(
-        &mut self,
-        address: String,
-        cx: &mut Context<Self>,
-    ) {
-        cx.write_to_clipboard(ClipboardItem::new_string(address));
     }
 
     pub(crate) fn save_loopback_forward_form(
         &mut self,
+        pane_id: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((pane_id, host, port, editing)) = self
-            .tabs
-            .get(self.active)
-            .and_then(|tab| tab.settings.as_ref())
-            .and_then(|settings| {
-                let host = settings
-                    .loopback_host_input
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .to_string();
-                let port = settings
-                    .loopback_port_input
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .parse::<u16>()
-                    .ok()?;
-                let pane_id = settings
-                    .loopback_editing
-                    .as_ref()
-                    .map(|id| id.pane_id)
-                    .or(settings.loopback_default_pane_id)?;
-                Some((pane_id, host, port, settings.loopback_editing.clone()))
-            })
+        let host = self
+            .loopback_panel
+            .host_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let Some(port) = self
+            .loopback_panel
+            .port_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u16>()
+            .ok()
         else {
             return;
         };
         if host.is_empty() {
             return;
         }
+        let editing = self.loopback_panel.editing.clone();
+        let pane_id = editing.as_ref().map(|id| id.pane_id).unwrap_or(pane_id);
 
         if crate::terminal::RemoteTerminal::ensure_loopback_forward(pane_id, &host, port).is_ok() {
             if let Some(old) = editing {
@@ -866,44 +885,33 @@ impl Tty7App {
                     let _ = crate::terminal::RemoteTerminal::close_loopback_forward(old);
                 }
             }
-            let forwards = crate::terminal::RemoteTerminal::list_loopback_forwards();
-            if let Some(settings) = self
-                .tabs
-                .get_mut(self.active)
-                .and_then(|tab| tab.settings.as_mut())
-            {
-                settings.loopback_forwards = forwards;
-                settings.loopback_editing = None;
-                settings.loopback_host_input.update(cx, |input, cx| {
-                    input.set_value("localhost", window, cx);
-                });
-                settings.loopback_port_input.update(cx, |input, cx| {
-                    input.set_value("", window, cx);
-                });
-            }
+            self.loopback_panel.forwards =
+                crate::terminal::RemoteTerminal::list_loopback_forwards();
+            self.loopback_panel.editing = None;
+            self.loopback_panel.host_input.update(cx, |input, cx| {
+                input.set_value("localhost", window, cx);
+            });
+            self.loopback_panel.port_input.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+            });
             cx.notify();
         }
     }
 
     pub(crate) fn edit_loopback_forward(
         &mut self,
-        id: crate::daemon::protocol::LoopbackForwardId,
+        id: LoopbackForwardId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(settings) = self
-            .tabs
-            .get_mut(self.active)
-            .and_then(|tab| tab.settings.as_mut())
-        {
-            settings.loopback_editing = Some(id.clone());
-            settings.loopback_host_input.update(cx, |input, cx| {
-                input.set_value(id.remote_host, window, cx);
-            });
-            settings.loopback_port_input.update(cx, |input, cx| {
-                input.set_value(id.remote_port.to_string(), window, cx);
-            });
-        }
+        self.loopback_panel.open_pane_id = Some(id.pane_id);
+        self.loopback_panel.editing = Some(id.clone());
+        self.loopback_panel.host_input.update(cx, |input, cx| {
+            input.set_value(id.remote_host, window, cx);
+        });
+        self.loopback_panel.port_input.update(cx, |input, cx| {
+            input.set_value(id.remote_port.to_string(), window, cx);
+        });
         cx.notify();
     }
 
@@ -912,49 +920,14 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(settings) = self
-            .tabs
-            .get_mut(self.active)
-            .and_then(|tab| tab.settings.as_mut())
-        {
-            settings.loopback_editing = None;
-            settings.loopback_host_input.update(cx, |input, cx| {
-                input.set_value("localhost", window, cx);
-            });
-            settings.loopback_port_input.update(cx, |input, cx| {
-                input.set_value("", window, cx);
-            });
-        }
+        self.loopback_panel.editing = None;
+        self.loopback_panel.host_input.update(cx, |input, cx| {
+            input.set_value("localhost", window, cx);
+        });
+        self.loopback_panel.port_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
         cx.notify();
-    }
-
-    pub(crate) fn open_managed_ssh_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((target, options)) = self
-            .tabs
-            .get(self.active)
-            .and_then(|tab| tab.settings.as_ref())
-            .map(|settings| {
-                (
-                    settings
-                        .ssh_target_input
-                        .read(cx)
-                        .value()
-                        .trim()
-                        .to_string(),
-                    settings.ssh_options_input.read(cx).value().to_string(),
-                )
-            })
-        else {
-            return;
-        };
-        if target.is_empty() {
-            return;
-        }
-        let Ok(args) = parse_ssh_option_words(&options) else {
-            return;
-        };
-        let ssh = SshSpec { target, args };
-        self.open_managed_ssh_spec(ssh, window, cx);
     }
 
     fn open_managed_ssh_spec(&mut self, ssh: SshSpec, window: &mut Window, cx: &mut Context<Self>) {
@@ -1621,9 +1594,14 @@ impl Tty7App {
                     cx,
                 );
             }
+            OpenSshConnect(input) => {
+                if let Ok(ssh) = parse_ssh_connect_input(&input) {
+                    self.open_managed_ssh_spec(ssh, window, cx);
+                }
+            }
             // Handled inside `PaletteView` (opens a sub-list); these never emit a
             // `Confirm` for this variant, so they never reach here.
-            OpenThemePicker | OpenSshProfilePicker(_) => {}
+            OpenThemePicker | OpenSshConnectInput | OpenSshProfilePicker(_) => {}
             ActivateTab(i) => self.activate(i, window, cx),
         }
     }
@@ -1641,14 +1619,6 @@ impl Tty7App {
     /// focus it.
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.settings_tab_index() {
-            let loopback_default_pane_id = self
-                .tabs
-                .get(self.active)
-                .and_then(|tab| tab.pane.focused_or_first(window, cx))
-                .map(|pane| pane.read(cx).pane_id);
-            if let Some(settings) = self.tabs[index].settings.as_mut() {
-                settings.loopback_default_pane_id = loopback_default_pane_id;
-            }
             self.activate(index, window, cx);
             return;
         }
@@ -1669,33 +1639,6 @@ impl Tty7App {
                 }
             }),
         );
-        let loopback_default_pane_id = self
-            .tabs
-            .get(self.active)
-            .and_then(|tab| tab.pane.focused_or_first(window, cx))
-            .map(|pane| pane.read(cx).pane_id);
-        let loopback_host_input =
-            cx.new(|cx| InputState::new(window, cx).default_value("localhost"));
-        let loopback_port_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("3000")
-                .default_value("")
-        });
-        let ssh_target_input = cx.new(|cx| InputState::new(window, cx).placeholder("user@host"));
-        let ssh_options_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("-p 2222 -J jump")
-                .default_value("")
-        });
-        for input in [&ssh_target_input, &ssh_options_input] {
-            subs.push(cx.subscribe_in(input, window, |_this, _i, ev, _w, cx| {
-                if matches!(ev, InputEvent::Change) {
-                    cx.notify();
-                }
-            }));
-        }
-        let loopback_forwards = crate::terminal::RemoteTerminal::list_loopback_forwards();
-
         self.maximized = None;
         self.tabs.push(Tab {
             pane: Pane::Empty,
@@ -1713,13 +1656,6 @@ impl Tty7App {
                 theme_editor: None,
                 theme_panel_open: false,
                 theme_search,
-                loopback_forwards,
-                ssh_target_input,
-                ssh_options_input,
-                loopback_default_pane_id,
-                loopback_host_input,
-                loopback_port_input,
-                loopback_editing: None,
                 recording: None,
                 rebinding_note: None,
                 _subs: subs,
@@ -2145,6 +2081,16 @@ impl Tty7App {
             .and_then(|t| t.settings.as_mut())
     }
 
+    fn active_ssh_pane(&self, window: &Window, cx: &App) -> Option<(u64, RemoteContext)> {
+        let pane = self
+            .tabs
+            .get(self.active)?
+            .pane
+            .focused_or_first(window, cx)?;
+        let pane = pane.read(cx);
+        Some((pane.pane_id, pane.remote_context()?))
+    }
+
     /// Select a sidebar section in the active settings tab (no-op elsewhere).
     pub(crate) fn select_settings_section(
         &mut self,
@@ -2416,6 +2362,7 @@ impl Tty7App {
 impl Render for Tty7App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strip = self.tab_strip(window, cx);
+        let active_ssh_pane = self.active_ssh_pane(window, cx);
         // Render the active tab's pane tree; show focus rings only when split.
         let body = match self.tabs.get(self.active) {
             // Zero tabs: the window's own face — the home page (see `ui::home`).
@@ -2582,7 +2529,16 @@ impl Render for Tty7App {
                     // edge clear (before the traffic lights' mirror gap on macOS).
                     .child(strip),
             )
-            .child(div().flex_1().relative().overflow_hidden().child(body))
+            .child(
+                div()
+                    .flex_1()
+                    .relative()
+                    .overflow_hidden()
+                    .child(body)
+                    .when_some(active_ssh_pane, |this, (pane_id, remote)| {
+                        this.child(self.render_loopback_forward_overlay(pane_id, &remote, cx))
+                    }),
+            )
             // Command palette overlay, layered above everything when open.
             .when_some(self.palette.clone(), |this, palette| this.child(palette))
     }
@@ -2761,9 +2717,64 @@ pub(crate) fn parse_ssh_option_words(input: &str) -> Result<Vec<String>, ()> {
     Ok(words)
 }
 
+pub(crate) fn parse_ssh_connect_input(input: &str) -> Result<SshSpec, ()> {
+    let mut words = parse_ssh_option_words(input)?;
+    if words.first().is_some_and(|word| word == "ssh") {
+        words.remove(0);
+    }
+    let Some(target_ix) = ssh_connect_target_ix(&words) else {
+        return Err(());
+    };
+    let target = words.remove(target_ix);
+    if target.trim().is_empty() {
+        return Err(());
+    }
+    let ssh = SshSpec {
+        target,
+        args: words,
+    };
+    ssh.validate().map_err(|_| ())?;
+    Ok(ssh)
+}
+
+fn ssh_connect_target_ix(words: &[String]) -> Option<usize> {
+    let mut i = 0;
+    while i < words.len() {
+        let word = &words[i];
+        if word == "--" {
+            return None;
+        }
+        if !word.starts_with('-') {
+            return Some(i);
+        }
+        if ssh_short_option_value_flag(word).is_some() {
+            i += 1;
+            if i >= words.len() {
+                return None;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn ssh_short_option_value_flag(word: &str) -> Option<char> {
+    let short = word.strip_prefix('-')?;
+    if short.is_empty() || short.starts_with('-') {
+        return None;
+    }
+    let mut chars = short.chars();
+    let flag = chars.next()?;
+    if ssh_option_takes_value(flag) && chars.as_str().is_empty() {
+        Some(flag)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_ssh_option_words;
+    use super::{parse_ssh_connect_input, parse_ssh_option_words};
 
     #[test]
     fn parses_ssh_option_words_with_quotes() {
@@ -2776,6 +2787,44 @@ mod tests {
     #[test]
     fn rejects_unclosed_ssh_option_quote() {
         assert!(parse_ssh_option_words("-J 'jump").is_err());
+    }
+
+    #[test]
+    fn parses_ssh_connect_input_with_optional_ssh_prefix() {
+        assert_eq!(
+            parse_ssh_connect_input("ssh dev -p 2222 -J 'jump host'")
+                .unwrap()
+                .target,
+            "dev"
+        );
+        let parsed = parse_ssh_connect_input("dev -p 2222").unwrap();
+        assert_eq!(parsed.target, "dev");
+        assert_eq!(parsed.args, vec!["-p", "2222"]);
+    }
+
+    #[test]
+    fn parses_ssh_connect_input_with_options_before_target() {
+        let parsed = parse_ssh_connect_input("ssh -p 2222 -J 'jump host' dev").unwrap();
+        assert_eq!(parsed.target, "dev");
+        assert_eq!(parsed.args, vec!["-p", "2222", "-J", "jump host"]);
+    }
+
+    #[test]
+    fn parses_ssh_connect_input_with_quoted_target() {
+        let parsed = parse_ssh_connect_input("ssh -l dev 'host name'").unwrap();
+        assert_eq!(parsed.target, "host name");
+        assert_eq!(parsed.args, vec!["-l", "dev"]);
+    }
+
+    #[test]
+    fn rejects_ssh_connect_input_without_target() {
+        assert!(parse_ssh_connect_input("ssh -p 2222").is_err());
+    }
+
+    #[test]
+    fn rejects_ssh_connect_input_with_remote_command() {
+        assert!(parse_ssh_connect_input("ssh dev uptime").is_err());
+        assert!(parse_ssh_connect_input("ssh -- dev").is_err());
     }
 }
 
