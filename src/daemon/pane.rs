@@ -25,7 +25,7 @@
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -35,7 +35,9 @@ use std::time::Duration;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::core::osc::OscTokenizer;
-use crate::daemon::protocol::{DaemonMsg, PaneInfo, ShellSpec, WinSize};
+use crate::daemon::protocol::{
+    DaemonMsg, PaneInfo, RemoteContext, RemoteKind, ShellSpec, SshSpec, WinSize,
+};
 use crate::daemon::shell_integration;
 
 /// The platform default shell command, used when the user hasn't set `shell` in
@@ -129,12 +131,210 @@ fn apply_shell_integration(
     }
 }
 
+struct SpawnConfig {
+    cmd: CommandBuilder,
+    initial_cwd: Option<PathBuf>,
+    integration_dir: Option<PathBuf>,
+    remote: Option<RemoteContext>,
+}
+
+fn build_spawn_config(
+    id: u64,
+    cwd: Option<PathBuf>,
+    shell: Option<ShellSpec>,
+) -> anyhow::Result<SpawnConfig> {
+    let initial_cwd = initial_working_directory(cwd);
+    let Some(mut shell) = shell else {
+        let (cmd, integration_dir) = build_shell_command(None, &initial_cwd)?;
+        return Ok(SpawnConfig {
+            cmd,
+            initial_cwd,
+            integration_dir,
+            remote: None,
+        });
+    };
+    let Some(ssh) = shell.ssh.take() else {
+        let (cmd, integration_dir) = build_shell_command(Some(shell), &initial_cwd)?;
+        return Ok(SpawnConfig {
+            cmd,
+            initial_cwd,
+            integration_dir,
+            remote: None,
+        });
+    };
+
+    let control_path = ssh_control_path(id)?;
+    let _ = std::fs::remove_file(&control_path);
+    let cmd = build_managed_ssh_command(&shell.program, &ssh, &control_path, &initial_cwd)?;
+    let mut argv = vec![shell.program];
+    argv.extend(ssh.args.clone());
+    argv.push(ssh.target.clone());
+    Ok(SpawnConfig {
+        cmd,
+        initial_cwd,
+        integration_dir: None,
+        remote: Some(RemoteContext {
+            kind: RemoteKind::Ssh,
+            argv,
+            target: ssh.target,
+            control_path: Some(control_path),
+        }),
+    })
+}
+
+fn build_shell_command(
+    shell: Option<ShellSpec>,
+    initial_cwd: &Option<PathBuf>,
+) -> anyhow::Result<(CommandBuilder, Option<PathBuf>)> {
+    // Build the shell command; `None` means the platform default (the login
+    // shell on Unix, PowerShell on Windows).
+    let configured = choose_shell(shell, crate::core::config::shell_command());
+    let mut cmd = match &configured {
+        Some((program, args)) => {
+            let mut c = CommandBuilder::new(program);
+            c.args(args);
+            c
+        }
+        None => default_prog(),
+    };
+    // The program tty7 is actually about to spawn, used (rather than `$SHELL`,
+    // which can disagree) to detect which shell integration applies. For a
+    // configured shell this is just its program string; for the platform default
+    // it's whatever `default_prog()` resolved (passwd/`$SHELL` on Unix,
+    // `powershell.exe` on Windows — see `default_shell_name`).
+    let resolved_program = match &configured {
+        Some((program, _)) => program.clone(),
+        None => default_shell_name(&cmd),
+    };
+
+    // Shell integration: inject OSC 7 / OSC 133 hooks (zsh/fish/bash/PowerShell
+    // — see `daemon::shell_integration`). Best effort — `None` (an unsupported
+    // shell, or a bash/PowerShell with unpreservable custom args) means we launch
+    // bare. A configured shell only counts as having "custom args" to preserve
+    // when it actually specifies any — an empty `args: []` (just picking the
+    // program) leaves nothing for bash's `--rcfile -i` to conflict with.
+    let has_custom_args = configured
+        .as_ref()
+        .is_some_and(|(_, args)| !args.is_empty());
+    let integration = shell_integration::setup(Some(&resolved_program), has_custom_args);
+    if let Some(integration) = &integration {
+        apply_shell_integration(&mut cmd, &resolved_program, integration);
+    }
+    let integration_dir = integration.as_ref().and_then(|i| i.dir.clone());
+    apply_common_command_setup(&mut cmd, initial_cwd);
+    Ok((cmd, integration_dir))
+}
+
+fn build_managed_ssh_command(
+    program: &str,
+    ssh: &SshSpec,
+    control_path: &Path,
+    initial_cwd: &Option<PathBuf>,
+) -> anyhow::Result<CommandBuilder> {
+    ssh.validate().map_err(anyhow::Error::msg)?;
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("ssh program is empty"))?;
+    if !matches!(name, "ssh" | "ssh.exe") {
+        anyhow::bail!("managed SSH tabs must launch ssh, not {program}");
+    }
+
+    let mut cmd = CommandBuilder::new(program);
+    cmd.args([
+        "-tt".to_string(),
+        "-o".to_string(),
+        "ControlMaster=yes".to_string(),
+        "-o".to_string(),
+        "ControlPersist=no".to_string(),
+        "-o".to_string(),
+        format!("ControlPath={}", control_path.display()),
+    ]);
+    cmd.args(&ssh.args);
+    cmd.args([ssh.target.clone()]);
+    apply_common_command_setup(&mut cmd, initial_cwd);
+    Ok(cmd)
+}
+
+fn ssh_control_path(id: u64) -> anyhow::Result<PathBuf> {
+    let dir = ssh_control_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join(format!("pane-{id}.sock")))
+}
+
+#[cfg(unix)]
+fn ssh_control_dir() -> anyhow::Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let config_dir = crate::core::config::config_dir_path()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve config dir for ssh control socket"))?;
+    let hash = fnv1a64(config_dir.as_os_str().as_bytes());
+    Ok(base.join(format!("tty7-ssh-{hash:016x}")))
+}
+
+#[cfg(not(unix))]
+fn ssh_control_dir() -> anyhow::Result<PathBuf> {
+    let config_dir = crate::core::config::config_dir_path()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve config dir for ssh control socket"))?;
+    Ok(config_dir.join("ssh-control"))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+fn initial_working_directory(cwd: Option<PathBuf>) -> Option<PathBuf> {
+    // Working directory for the shell: an explicit `cwd` from the client wins
+    // (new tab/split inheriting the active pane's dir, or session restore).
+    // Otherwise fall back to the daemon's own cwd — but skip a bare "/", which
+    // is what Launch Services hands a `.app` started from Finder/Dock/`open`
+    // (there's no meaningful inherited dir there). In that case default to the
+    // user's home, matching Terminal.app / iTerm. Launching from a shell
+    // (`cargo dev`) still inherits that shell's dir, since it isn't "/".
+    let fallback = std::env::current_dir()
+        .ok()
+        .filter(|d| d != std::path::Path::new("/"))
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from));
+    // A `working_directory` of Home/Custom forces a base dir, but only when the
+    // client didn't pass an explicit cwd (tab-inherit / session restore still
+    // win). Inherit -> `forced` is `None`, so we keep the fallback as before.
+    let forced = crate::core::config::working_directory_base();
+    cwd.or(forced).or(fallback)
+}
+
+fn apply_common_command_setup(cmd: &mut CommandBuilder, initial_cwd: &Option<PathBuf>) {
+    if let Some(dir) = initial_cwd {
+        cmd.cwd(dir);
+    }
+    // Advertise a widely-available terminfo + truecolor.
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    // User-configured environment variables, injected last so they can override
+    // the inherited environment (but not TERM/COLORTERM above, which reflect our
+    // emulator's real capabilities).
+    for (k, v) in crate::core::config::extra_env() {
+        if k != "TERM" && k != "COLORTERM" {
+            cmd.env(k, v);
+        }
+    }
+}
+
 /// Default cap on the replay ring: 8 MiB. Enough to reconstruct a deep screen +
 /// scrollback for a fresh attach, while bounding daemon memory per pane. When the
 /// ring is full we drop the *oldest* bytes: a terminal stream is only meaningful
 /// from some recent point onward, and a client's emulator tolerates a truncated
 /// prefix far better than a hole punched in the middle.
 const RING_CAP: usize = 8 * 1024 * 1024;
+const REMOTE_CONTEXT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Backpressure between a pane's PTY reader and its connection writer: counts
 /// the `Output` bytes sitting in the (unbounded) channel, and parks the reader
@@ -248,6 +448,8 @@ struct PaneState {
     cwd: Option<PathBuf>,
     /// Shell prompt/command state from OSC 133.
     shell: ShellState,
+    /// Trusted foreground remote context from the local process table.
+    remote: Option<RemoteContext>,
     /// Last geometry the PTY was sized to (spawn size, then each `resize`).
     /// Reported to a re-attaching client as `DaemonMsg::Size` so its replay of
     /// the ring runs at the geometry the ring was recorded under.
@@ -370,76 +572,9 @@ impl DaemonPane {
         let pty_size = pty_size(size);
 
         let pair = native_pty_system().openpty(pty_size)?;
+        let spawn = build_spawn_config(id, cwd, shell)?;
 
-        // Build the shell command; `None` means the platform default (the login
-        // shell on Unix, PowerShell on Windows).
-        let configured = choose_shell(shell, crate::core::config::shell_command());
-        let mut cmd = match &configured {
-            Some((program, args)) => {
-                let mut c = CommandBuilder::new(program);
-                c.args(args);
-                c
-            }
-            None => default_prog(),
-        };
-        // The program tty7 is actually about to spawn, used (rather than `$SHELL`,
-        // which can disagree) to detect which shell integration applies. For a
-        // configured shell this is just its program string; for the platform
-        // default it's whatever `default_prog()` resolved (passwd/`$SHELL` on
-        // Unix, `powershell.exe` on Windows — see `default_shell_name`).
-        let resolved_program = match &configured {
-            Some((program, _)) => program.clone(),
-            None => default_shell_name(&cmd),
-        };
-
-        // Shell integration: inject OSC 7 / OSC 133 hooks (zsh/fish/bash/PowerShell
-        // — see `daemon::shell_integration`). Best effort — `None` (an unsupported
-        // shell, or a bash/PowerShell with unpreservable custom args) means we
-        // launch bare. A configured shell only counts as having "custom args" to
-        // preserve when it actually specifies any — an empty `args: []` (just
-        // picking the program) leaves nothing for bash's `--rcfile -i` to
-        // conflict with.
-        let has_custom_args = configured
-            .as_ref()
-            .is_some_and(|(_, args)| !args.is_empty());
-        let integration = shell_integration::setup(Some(&resolved_program), has_custom_args);
-        if let Some(integration) = &integration {
-            apply_shell_integration(&mut cmd, &resolved_program, integration);
-        }
-        let integration_dir = integration.as_ref().and_then(|i| i.dir.clone());
-
-        // Working directory for the shell: an explicit `cwd` from the client wins
-        // (new tab/split inheriting the active pane's dir, or session restore).
-        // Otherwise fall back to the daemon's own cwd — but skip a bare "/", which
-        // is what Launch Services hands a `.app` started from Finder/Dock/`open`
-        // (there's no meaningful inherited dir there). In that case default to the
-        // user's home, matching Terminal.app / iTerm. Launching from a shell
-        // (`cargo dev`) still inherits that shell's dir, since it isn't "/".
-        let fallback = std::env::current_dir()
-            .ok()
-            .filter(|d| d != std::path::Path::new("/"))
-            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from));
-        // A `working_directory` of Home/Custom forces a base dir, but only when the
-        // client didn't pass an explicit cwd (tab-inherit / session restore still
-        // win). Inherit → `forced` is `None`, so we keep the fallback as before.
-        let forced = crate::core::config::working_directory_base();
-        let initial_cwd = cwd.or(forced).or(fallback);
-        if let Some(dir) = &initial_cwd {
-            cmd.cwd(dir);
-        }
-        // Advertise a widely-available terminfo + truecolor.
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        // User-configured environment variables, injected last so they can
-        // override the inherited environment (but not TERM/COLORTERM above, which
-        // reflect our emulator's real capabilities).
-        for (k, v) in crate::core::config::extra_env() {
-            if k != "TERM" && k != "COLORTERM" {
-                cmd.env(k, v);
-            }
-        }
-
-        let child = pair.slave.spawn_command(cmd)?;
+        let child = pair.slave.spawn_command(spawn.cmd)?;
         let shell_pid = child.process_id();
 
         // Drop the slave handle now: the child holds its own slave fds, and our
@@ -458,8 +593,9 @@ impl DaemonPane {
             ring: VecDeque::new(),
             subscriber: None,
             subscriber_epoch: 0,
-            cwd: initial_cwd,
+            cwd: spawn.initial_cwd,
             shell: ShellState::default(),
+            remote: spawn.remote.clone(),
             size,
             alive: true,
         }));
@@ -474,7 +610,7 @@ impl DaemonPane {
             writer: Mutex::new(writer),
             child: Mutex::new(child),
             shell_pid,
-            integration_dir,
+            integration_dir: spawn.integration_dir,
             shutting_down: shutting_down.clone(),
             gate: gate.clone(),
             state: state.clone(),
@@ -502,12 +638,14 @@ impl DaemonPane {
         // line editor stays disengaged for whatever is really reading the
         // keyboard — see `foreground_command_running` / issue #26.
         let fg_master = master.clone();
+        let remote_master = master.clone();
         let reader = Self::spawn_reader(
             state,
             shutting_down,
             gate,
             reader_handle,
             move || foreground_command_running(&fg_master, shell_pid),
+            move || foreground_remote_context(&remote_master),
             death,
         );
         *pane.reader.lock().unwrap() = Some(reader);
@@ -530,6 +668,7 @@ impl DaemonPane {
         // when a prompt mark arrives, to reject marks a foreground program emits —
         // see the call site and [`foreground_command_running`].
         foreground_running: impl Fn() -> bool + Send + 'static,
+        foreground_remote: impl Fn() -> Option<RemoteContext> + Send + 'static,
         death: Arc<DeathReporter>,
     ) -> JoinHandle<()> {
         std::thread::Builder::new()
@@ -551,6 +690,7 @@ impl DaemonPane {
                 let mut tr_reads: u32 = 0;
                 let mut tr_read_t = std::time::Duration::ZERO;
                 let mut tr_disp_t = std::time::Duration::ZERO;
+                let mut next_remote_check = std::time::Instant::now();
 
                 loop {
                     if trace && tr_last.elapsed() >= std::time::Duration::from_secs(1) {
@@ -607,6 +747,26 @@ impl DaemonPane {
                                 }
                             }
 
+                            // SSH-context detection is a process-table query
+                            // (sysctl/procfs). Keep it out of the state lock and
+                            // off the per-chunk hot path; half-second freshness is
+                            // enough for link hover/click state while keeping PTY
+                            // drain latency predictable.
+                            let remote = if std::time::Instant::now() >= next_remote_check {
+                                next_remote_check =
+                                    std::time::Instant::now() + REMOTE_CONTEXT_POLL_INTERVAL;
+                                let managed = {
+                                    let st = state.lock().unwrap();
+                                    st.remote
+                                        .as_ref()
+                                        .and_then(|remote| remote.control_path.as_ref())
+                                        .is_some()
+                                };
+                                (!managed).then(&foreground_remote)
+                            } else {
+                                None
+                            };
+
                             let tr1 = trace.then(std::time::Instant::now);
                             let mut st = state.lock().unwrap();
                             ring_append(&mut st.ring, bytes);
@@ -620,6 +780,9 @@ impl DaemonPane {
                                 }
                             }
                             apply_signals(&mut st, signals);
+                            if let Some(remote) = remote {
+                                apply_remote_context(&mut st, remote);
+                            }
                             if let Some(tr1) = tr1 {
                                 tr_disp_t += tr1.elapsed();
                             }
@@ -733,6 +896,11 @@ impl DaemonPane {
             title: self.foreground_title(),
             alive,
         }
+    }
+
+    pub(crate) fn remote_context(&self) -> Option<RemoteContext> {
+        let cached = self.state.lock().unwrap().remote.clone();
+        cached.or_else(|| self.foreground_remote_context())
     }
 
     /// Hang up the child now; the pane's `Drop` then reaps it. Used by the `Kill`
@@ -976,6 +1144,10 @@ impl DaemonPane {
     fn foreground_title(&self) -> String {
         String::new()
     }
+
+    fn foreground_remote_context(&self) -> Option<RemoteContext> {
+        foreground_remote_context(&self.master)
+    }
 }
 
 impl Drop for DaemonPane {
@@ -1094,6 +1266,9 @@ fn attach_subscriber(st: &mut PaneState, subscriber: Sender<DaemonMsg>) -> u64 {
             last_exit: st.shell.last_exit_code,
         });
     }
+    if st.remote.is_some() {
+        let _ = subscriber.send(DaemonMsg::RemoteContext(st.remote.clone()));
+    }
     // A dead pane's reader thread — the one that reports the child's exit — is
     // long gone, so replay its exit too: without this an attach racing the
     // child's death (it exited between the client's `List` and its `Attach`)
@@ -1127,6 +1302,16 @@ fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
             });
         }
     }
+}
+
+fn apply_remote_context(st: &mut PaneState, remote: Option<RemoteContext>) {
+    if st.remote == remote {
+        return;
+    }
+    if let Some(sub) = &st.subscriber {
+        let _ = sub.send(DaemonMsg::RemoteContext(remote.clone()));
+    }
+    st.remote = remote;
 }
 
 /// Whether a foreground command — not the shell itself — currently owns the
@@ -1170,6 +1355,18 @@ fn is_foreground_command(fg_pgid: Option<i32>, shell_pid: Option<u32>) -> bool {
         (Some(pg), Some(shell)) if pg > 0 => pg as u32 != shell,
         _ => false,
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn foreground_remote_context(master: &Mutex<Box<dyn MasterPty + Send>>) -> Option<RemoteContext> {
+    let pid = master.lock().ok().and_then(|m| m.process_group_leader())?;
+    let argv = crate::daemon::remote::foreground_argv(pid)?;
+    crate::daemon::remote::parse_ssh_invocation(&argv).map(|inv| inv.context)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn foreground_remote_context(_master: &Mutex<Box<dyn MasterPty + Send>>) -> Option<RemoteContext> {
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1387,6 +1584,7 @@ mod tests {
         let over = ShellSpec {
             program: "fish".into(),
             args: vec!["-l".into()],
+            ssh: None,
         };
         let cfg = ("zsh".to_string(), vec!["-i".to_string()]);
 
@@ -1399,6 +1597,42 @@ mod tests {
         assert_eq!(choose_shell(None, Some(cfg.clone())), Some(cfg));
         // Neither → platform default.
         assert_eq!(choose_shell(None, None), None);
+    }
+
+    #[test]
+    fn managed_ssh_command_uses_control_master_without_persisting() {
+        let ssh = SshSpec {
+            target: "dev".into(),
+            args: vec!["-p".into(), "2222".into()],
+        };
+        let cmd = build_managed_ssh_command(
+            "ssh",
+            &ssh,
+            std::path::Path::new("/tmp/tty7-ssh.sock"),
+            &None,
+        )
+        .unwrap();
+        let argv: Vec<_> = cmd
+            .get_argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv,
+            vec![
+                "ssh",
+                "-tt",
+                "-o",
+                "ControlMaster=yes",
+                "-o",
+                "ControlPersist=no",
+                "-o",
+                "ControlPath=/tmp/tty7-ssh.sock",
+                "-p",
+                "2222",
+                "dev",
+            ]
+        );
     }
 
     #[test]
@@ -1897,6 +2131,7 @@ mod tests {
             subscriber_epoch: 0,
             cwd: None,
             shell: ShellState::default(),
+            remote: None,
             size: WinSize {
                 cols: 80,
                 rows: 24,
@@ -1978,6 +2213,7 @@ mod tests {
             Arc::new(OutputGate::new()),
             Box::new(std::io::Cursor::new(b"tail".to_vec())),
             || false, // no PTY here → treat the shell as foreground
+            || None,
             Arc::new(DeathReporter::new(move || {
                 dead_flag.store(true, Ordering::SeqCst)
             })),
@@ -2011,6 +2247,7 @@ mod tests {
             Arc::new(OutputGate::new()),
             Box::new(std::io::Cursor::new(Vec::new())),
             || false,
+            || None,
             Arc::new(DeathReporter::new(move || dead_tx.send(()).unwrap())),
         );
         handle.join().unwrap();
@@ -2033,6 +2270,7 @@ mod tests {
             Arc::new(OutputGate::new()),
             Box::new(std::io::Cursor::new(Vec::new())),
             || false,
+            || None,
             Arc::new(DeathReporter::new(move || {
                 dead_flag.store(true, Ordering::SeqCst)
             })),

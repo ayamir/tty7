@@ -53,6 +53,180 @@ pub struct ShellSpec {
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// When present, this pane is a tty7-owned SSH session. The daemon injects
+    /// a ControlMaster/ControlPath at spawn time and later reuses that master for
+    /// loopback forwards; ordinary shell picks leave this empty.
+    #[serde(default)]
+    pub ssh: Option<SshSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshSpec {
+    /// The destination token (`host`, `user@host`, or ssh config alias).
+    pub target: String,
+    /// SSH client options that are safe to reuse for the master connection.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl SshSpec {
+    pub fn validate(&self) -> Result<(), String> {
+        let target = self.target.trim();
+        if target.is_empty() {
+            return Err("ssh target is empty".to_string());
+        }
+        // The target is appended as the trailing ssh argument without a `--`
+        // separator, so a value starting with `-` would be parsed as an option
+        // (e.g. `-oProxyCommand=…`, which ssh runs through a shell). ssh itself
+        // rejects such destinations; refuse them here too rather than hand ssh
+        // an option in destination position.
+        if target.starts_with('-') {
+            return Err("ssh target must not start with '-'".to_string());
+        }
+        validate_managed_ssh_args(&self.args)
+    }
+}
+
+fn validate_managed_ssh_args(args: &[String]) -> Result<(), String> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            return Err("ssh options must not include a remote command".to_string());
+        }
+        if arg == "-N" || arg == "-f" || arg == "-T" {
+            return Err(format!(
+                "ssh option {arg} is not supported for managed SSH tabs"
+            ));
+        }
+        if matches!(arg.as_str(), "-W" | "-w" | "-L" | "-R" | "-D" | "-S" | "-O") {
+            return Err(format!(
+                "ssh option {arg} conflicts with tty7-managed forwarding"
+            ));
+        }
+        if arg == "-o" {
+            i += 1;
+            let Some(value) = args.get(i) else {
+                return Err("ssh -o requires an option value".to_string());
+            };
+            let (name, _) = split_ssh_option(value);
+            if managed_ssh_option_is_blocked(name) {
+                return Err(format!(
+                    "ssh option {name} conflicts with tty7-managed forwarding"
+                ));
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("-o")
+            && !value.is_empty()
+        {
+            let value = value.strip_prefix('=').unwrap_or(value);
+            let (name, _) = split_ssh_option(value);
+            if managed_ssh_option_is_blocked(name) {
+                return Err(format!(
+                    "ssh option {name} conflicts with tty7-managed forwarding"
+                ));
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(short) = arg.strip_prefix('-')
+            && !short.starts_with('-')
+            && short.len() > 1
+        {
+            let mut chars = short.chars();
+            let Some(flag) = chars.next() else {
+                return Err("empty ssh option".to_string());
+            };
+            if matches!(
+                flag,
+                'W' | 'w' | 'L' | 'R' | 'D' | 'S' | 'O' | 'N' | 'f' | 'T'
+            ) {
+                return Err(format!(
+                    "ssh option -{flag} conflicts with tty7-managed forwarding"
+                ));
+            }
+            if ssh_option_takes_value(flag) && chars.as_str().is_empty() {
+                i += 1;
+                if i >= args.len() {
+                    return Err(format!("ssh option -{flag} requires a value"));
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if arg.starts_with("--") {
+            return Err(format!(
+                "long ssh option {arg} is not supported for managed SSH tabs"
+            ));
+        }
+        if !arg.starts_with('-') {
+            return Err("ssh target must be entered separately from ssh options".to_string());
+        }
+        if arg.len() == 2 {
+            let flag = arg.as_bytes()[1] as char;
+            if ssh_option_takes_value(flag) {
+                i += 1;
+                if i >= args.len() {
+                    return Err(format!("ssh option {arg} requires a value"));
+                }
+            }
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+fn split_ssh_option(value: &str) -> (&str, &str) {
+    value
+        .split_once('=')
+        .map(|(name, value)| (name, value))
+        .unwrap_or((value, ""))
+}
+
+fn managed_ssh_option_is_blocked(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "controlmaster"
+            | "controlpath"
+            | "controlpersist"
+            | "exitonforwardfailure"
+            | "forkafterauthentication"
+            | "localforward"
+            | "remoteforward"
+            | "dynamicforward"
+            | "permitlocalcommand"
+            | "proxycommand"
+            | "sessiontype"
+            | "requesttty"
+    )
+}
+
+fn ssh_option_takes_value(flag: char) -> bool {
+    matches!(
+        flag,
+        'B' | 'b'
+            | 'c'
+            | 'D'
+            | 'E'
+            | 'e'
+            | 'F'
+            | 'I'
+            | 'i'
+            | 'J'
+            | 'L'
+            | 'l'
+            | 'm'
+            | 'O'
+            | 'o'
+            | 'p'
+            | 'Q'
+            | 'R'
+            | 'S'
+            | 'W'
+            | 'w'
+    )
 }
 
 /// Metadata for one live pane, returned by `List` for session restore / pickers.
@@ -66,6 +240,56 @@ pub struct PaneInfo {
     /// False once the child has exited but the pane lingers (so a client can
     /// still read its final scrollback).
     pub alive: bool,
+}
+
+/// A foreground remote session the daemon can prove from the local process table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteContext {
+    pub kind: RemoteKind,
+    /// Original foreground argv. Kept so follow-up operations can preserve ssh
+    /// config flags such as `-F`, `-p`, and `-J` rather than guessing.
+    pub argv: Vec<String>,
+    /// The destination token (`host`, `user@host`, or ssh config alias).
+    pub target: String,
+    /// tty7-owned SSH master socket for this pane. Present only for managed SSH
+    /// panes created through tty7; absent for process-table-detected foreground
+    /// ssh commands typed inside a normal shell.
+    #[serde(default)]
+    pub control_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteKind {
+    Ssh,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopbackForwardRequest {
+    pub pane_id: u64,
+    pub remote_host: String,
+    pub remote_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopbackForward {
+    pub local_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopbackForwardId {
+    pub pane_id: u64,
+    pub target: String,
+    pub remote_host: String,
+    pub remote_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopbackForwardInfo {
+    pub id: LoopbackForwardId,
+    pub local_port: u16,
+    pub age_secs: u64,
+    pub idle_secs: u64,
 }
 
 /// Messages the GUI client sends to the daemon.
@@ -99,6 +323,14 @@ pub enum ClientMsg {
     /// effect, which a long-lived daemon process can't otherwise see. Ends every
     /// running session, so the caller confirms with the user first.
     Shutdown,
+    /// Ensure a local SSH port-forward exists for a loopback URL printed by a
+    /// remote session in `pane_id`. Control-connection message; daemon replies
+    /// with `LoopbackForward` or `Error`.
+    EnsureLoopbackForward(LoopbackForwardRequest),
+    /// Ask for the daemon's active SSH loopback port-forwards.
+    ListLoopbackForwards,
+    /// Close one active SSH loopback port-forward.
+    CloseLoopbackForward(LoopbackForwardId),
 }
 
 /// Messages the daemon sends back to the GUI client.
@@ -128,6 +360,12 @@ pub enum DaemonMsg {
     Exited { code: Option<i32> },
     /// Reply to `List`.
     PaneList(Vec<PaneInfo>),
+    /// The foreground remote context, or `None` when the pane is local / unknown.
+    RemoteContext(Option<RemoteContext>),
+    /// Reply to `EnsureLoopbackForward`.
+    LoopbackForward(LoopbackForward),
+    /// Reply to `ListLoopbackForwards` and `CloseLoopbackForward`.
+    LoopbackForwardList(Vec<LoopbackForwardInfo>),
     /// A request failed (e.g. `Attach` to an unknown/dead pane id).
     Error(String),
 }
@@ -144,12 +382,20 @@ mod kind {
     pub const KILL: u8 = 6;
     pub const LIST: u8 = 7;
     pub const SHUTDOWN: u8 = 8;
-    /// `Spawn` with an explicit shell override. A separate kind (rather than a
-    /// new field under `SPAWN`) so a default spawn stays byte-identical on the
-    /// wire: the GUI and the long-lived daemon can be different versions, and
-    /// an old daemon must keep serving new-GUI default spawns. Only picking a
-    /// non-default shell sends this, and only a too-old daemon rejects it.
+    /// `Spawn` with an explicit, non-managed shell override. A separate kind
+    /// (rather than a new field under `SPAWN`) so a default spawn stays
+    /// byte-identical on the wire: the GUI and the long-lived daemon can be
+    /// different versions, and an old daemon must keep serving new-GUI default
+    /// spawns.
     pub const SPAWN_SHELL: u8 = 9;
+    pub const ENSURE_LOOPBACK_FORWARD: u8 = 10;
+    pub const LIST_LOOPBACK_FORWARDS: u8 = 11;
+    pub const CLOSE_LOOPBACK_FORWARD: u8 = 12;
+    /// `Spawn` with `ShellSpec.ssh`. It must not share `SPAWN_SHELL`: a daemon
+    /// from before the `ssh` field existed would deserialize the rest of
+    /// `ShellSpec`, ignore the unknown managed-SSH field, and silently launch a
+    /// plain `ssh` tab with no ControlMaster/RemoteContext.
+    pub const SPAWN_MANAGED_SSH: u8 = 13;
 
     // Daemon -> client
     pub const SPAWNED: u8 = 1;
@@ -161,6 +407,9 @@ mod kind {
     pub const PANE_LIST: u8 = 7;
     pub const ERROR: u8 = 8;
     pub const SIZE: u8 = 9;
+    pub const REMOTE_CONTEXT: u8 = 10;
+    pub const LOOPBACK_FORWARD: u8 = 11;
+    pub const LOOPBACK_FORWARD_LIST: u8 = 12;
 }
 
 /// Write one framed message: `[u32 LE len][u8 kind][payload]`.
@@ -251,8 +500,15 @@ impl ClientMsg {
             ClientMsg::Spawn {
                 cwd,
                 size,
-                shell: shell @ Some(_),
-            } => write_frame(w, kind::SPAWN_SHELL, &to_json(&(cwd, size, shell))?),
+                shell: shell @ Some(spec),
+            } => {
+                let kind = if spec.ssh.is_some() {
+                    kind::SPAWN_MANAGED_SSH
+                } else {
+                    kind::SPAWN_SHELL
+                };
+                write_frame(w, kind, &to_json(&(cwd, size, shell))?)
+            }
             ClientMsg::Attach { pane_id, size } => {
                 write_frame(w, kind::ATTACH, &to_json(&(pane_id, size))?)
             }
@@ -262,6 +518,13 @@ impl ClientMsg {
             ClientMsg::Kill { pane_id } => write_frame(w, kind::KILL, &to_json(pane_id)?),
             ClientMsg::List => write_frame(w, kind::LIST, &[]),
             ClientMsg::Shutdown => write_frame(w, kind::SHUTDOWN, &[]),
+            ClientMsg::EnsureLoopbackForward(req) => {
+                write_frame(w, kind::ENSURE_LOOPBACK_FORWARD, &to_json(req)?)
+            }
+            ClientMsg::ListLoopbackForwards => write_frame(w, kind::LIST_LOOPBACK_FORWARDS, &[]),
+            ClientMsg::CloseLoopbackForward(id) => {
+                write_frame(w, kind::CLOSE_LOOPBACK_FORWARD, &to_json(id)?)
+            }
         }
     }
 
@@ -276,7 +539,7 @@ impl ClientMsg {
                     shell: None,
                 }
             }
-            kind::SPAWN_SHELL => {
+            kind::SPAWN_SHELL | kind::SPAWN_MANAGED_SSH => {
                 let (cwd, size, shell) = from_json(&payload)?;
                 ClientMsg::Spawn { cwd, size, shell }
             }
@@ -292,6 +555,9 @@ impl ClientMsg {
             },
             kind::LIST => ClientMsg::List,
             kind::SHUTDOWN => ClientMsg::Shutdown,
+            kind::ENSURE_LOOPBACK_FORWARD => ClientMsg::EnsureLoopbackForward(from_json(&payload)?),
+            kind::LIST_LOOPBACK_FORWARDS => ClientMsg::ListLoopbackForwards,
+            kind::CLOSE_LOOPBACK_FORWARD => ClientMsg::CloseLoopbackForward(from_json(&payload)?),
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -324,6 +590,15 @@ impl DaemonMsg {
             } => write_frame(w, kind::PROMPT, &to_json(&(active, at_prompt, last_exit))?),
             DaemonMsg::Exited { code } => write_frame(w, kind::EXITED, &to_json(code)?),
             DaemonMsg::PaneList(list) => write_frame(w, kind::PANE_LIST, &to_json(list)?),
+            DaemonMsg::RemoteContext(remote) => {
+                write_frame(w, kind::REMOTE_CONTEXT, &to_json(remote)?)
+            }
+            DaemonMsg::LoopbackForward(forward) => {
+                write_frame(w, kind::LOOPBACK_FORWARD, &to_json(forward)?)
+            }
+            DaemonMsg::LoopbackForwardList(forwards) => {
+                write_frame(w, kind::LOOPBACK_FORWARD_LIST, &to_json(forwards)?)
+            }
             DaemonMsg::Error(msg) => write_frame(w, kind::ERROR, &to_json(msg)?),
         }
     }
@@ -350,6 +625,9 @@ impl DaemonMsg {
                 code: from_json(&payload)?,
             },
             kind::PANE_LIST => DaemonMsg::PaneList(from_json(&payload)?),
+            kind::REMOTE_CONTEXT => DaemonMsg::RemoteContext(from_json(&payload)?),
+            kind::LOOPBACK_FORWARD => DaemonMsg::LoopbackForward(from_json(&payload)?),
+            kind::LOOPBACK_FORWARD_LIST => DaemonMsg::LoopbackForwardList(from_json(&payload)?),
             kind::ERROR => DaemonMsg::Error(from_json(&payload)?),
             other => {
                 return Err(io::Error::new(
@@ -471,6 +749,19 @@ mod tests {
                 shell: Some(ShellSpec {
                     program: "wsl.exe".into(),
                     args: vec!["--distribution".into(), "Ubuntu".into()],
+                    ssh: None,
+                }),
+            },
+            ClientMsg::Spawn {
+                cwd: Some(PathBuf::from("/tmp/x")),
+                size: SIZE,
+                shell: Some(ShellSpec {
+                    program: "ssh".into(),
+                    args: vec!["-p".into(), "2222".into(), "dev".into()],
+                    ssh: Some(SshSpec {
+                        target: "dev".into(),
+                        args: vec!["-p".into(), "2222".into()],
+                    }),
                 }),
             },
             ClientMsg::Attach {
@@ -483,6 +774,18 @@ mod tests {
             ClientMsg::Kill { pane_id: 7 },
             ClientMsg::List,
             ClientMsg::Shutdown,
+            ClientMsg::EnsureLoopbackForward(LoopbackForwardRequest {
+                pane_id: 7,
+                remote_host: "127.0.0.1".into(),
+                remote_port: 3000,
+            }),
+            ClientMsg::ListLoopbackForwards,
+            ClientMsg::CloseLoopbackForward(LoopbackForwardId {
+                pane_id: 7,
+                target: "dev".into(),
+                remote_host: "127.0.0.1".into(),
+                remote_port: 3000,
+            }),
         ];
         let mut buf = Vec::new();
         for m in &msgs {
@@ -492,6 +795,76 @@ mod tests {
         for m in &msgs {
             assert_eq!(*m, ClientMsg::read(&mut cursor).unwrap());
         }
+    }
+
+    #[test]
+    fn ssh_spec_allows_connection_options() {
+        SshSpec {
+            target: "dev".into(),
+            args: vec![
+                "-p".into(),
+                "2222".into(),
+                "-Jjump".into(),
+                "-i".into(),
+                "~/.ssh/id_ed25519".into(),
+                "-o".into(),
+                "UserKnownHostsFile=/tmp/known_hosts".into(),
+            ],
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn ssh_spec_rejects_forward_and_control_options() {
+        for args in [
+            vec!["-L".to_string(), "127.0.0.1:1:127.0.0.1:1".to_string()],
+            vec!["-S".to_string(), "/tmp/other.sock".to_string()],
+            vec!["-O".to_string(), "forward".to_string()],
+            vec!["-o".to_string(), "ControlPath=/tmp/other.sock".to_string()],
+            vec!["-oControlPath=/tmp/other.sock".to_string()],
+            vec![
+                "-o".to_string(),
+                "LocalForward=127.0.0.1:1 127.0.0.1:1".to_string(),
+            ],
+            vec!["dev".to_string()],
+        ] {
+            assert!(
+                SshSpec {
+                    target: "dev".into(),
+                    args: args.clone(),
+                }
+                .validate()
+                .is_err(),
+                "must reject {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_spec_rejects_option_like_target() {
+        // A target starting with `-` is appended in destination position without
+        // a `--` guard, so ssh would parse it as an option (e.g. an injected
+        // `-oProxyCommand=…`). It must be refused regardless of surrounding
+        // whitespace.
+        for target in ["-oProxyCommand=touch /tmp/pwned", "-D8080", "  -N", "-"] {
+            assert!(
+                SshSpec {
+                    target: target.into(),
+                    args: vec![],
+                }
+                .validate()
+                .is_err(),
+                "must reject option-like target {target:?}"
+            );
+        }
+        // A host that merely contains a dash elsewhere is fine.
+        SshSpec {
+            target: "my-host".into(),
+            args: vec![],
+        }
+        .validate()
+        .unwrap();
     }
 
     /// Round-trip every `DaemonMsg` variant through encode → read.
@@ -515,6 +888,25 @@ mod tests {
                 cwd: Some(PathBuf::from("/x")),
                 title: "zsh".into(),
                 alive: true,
+            }]),
+            DaemonMsg::RemoteContext(Some(RemoteContext {
+                kind: RemoteKind::Ssh,
+                argv: vec!["ssh".into(), "-p".into(), "2222".into(), "dev".into()],
+                target: "dev".into(),
+                control_path: Some(PathBuf::from("/tmp/tty7-ssh-1.sock")),
+            })),
+            DaemonMsg::RemoteContext(None),
+            DaemonMsg::LoopbackForward(LoopbackForward { local_port: 49152 }),
+            DaemonMsg::LoopbackForwardList(vec![LoopbackForwardInfo {
+                id: LoopbackForwardId {
+                    pane_id: 7,
+                    target: "dev".into(),
+                    remote_host: "127.0.0.1".into(),
+                    remote_port: 3000,
+                },
+                local_port: 49152,
+                age_secs: 12,
+                idle_secs: 3,
             }]),
             DaemonMsg::Error("nope".into()),
         ];
@@ -560,6 +952,40 @@ mod tests {
                 cwd: Some(PathBuf::from("/old")),
                 size: SIZE,
                 shell: None,
+            }
+        );
+    }
+
+    #[test]
+    fn managed_ssh_spawn_uses_non_legacy_kind() {
+        let shell = ShellSpec {
+            program: "ssh".to_string(),
+            args: vec!["dev".to_string()],
+            ssh: Some(SshSpec {
+                target: "dev".to_string(),
+                args: Vec::new(),
+            }),
+        };
+        let msg = ClientMsg::Spawn {
+            cwd: Some(PathBuf::from("/work")),
+            size: SIZE,
+            shell: Some(shell.clone()),
+        };
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).unwrap();
+        let (k, payload) = read_frame(&mut std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(
+            k,
+            kind::SPAWN_MANAGED_SSH,
+            "managed SSH must not use SPAWN_SHELL, because older daemons ignore unknown ShellSpec fields"
+        );
+        let decoded = ClientMsg::from_frame(k, payload).unwrap();
+        assert_eq!(
+            decoded,
+            ClientMsg::Spawn {
+                cwd: Some(PathBuf::from("/work")),
+                size: SIZE,
+                shell: Some(shell),
             }
         );
     }

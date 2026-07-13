@@ -2,7 +2,8 @@
 //! with the active terminal filling the rest. Owns all tabs (each its own PTY).
 
 use gpui::{
-    App, Axis, Context, Entity, PromptLevel, Subscription, Window, div, prelude::*, px,
+    App, Axis, ClipboardItem, Context, Entity, PromptLevel, Subscription, Window, div, prelude::*,
+    px,
 };
 use gpui_component::color_picker::{ColorPickerEvent, ColorPickerState};
 use gpui_component::input::{InputEvent, InputState};
@@ -15,7 +16,8 @@ use crate::core::actions::*;
 use crate::core::config::{Config, NewTabPosition, ShellConfig};
 use crate::core::session::{Session, SessionAxis, SessionPane, SessionTab};
 use crate::core::shells::DetectedShell;
-use crate::daemon::protocol::ShellSpec;
+use crate::core::ssh_config;
+use crate::daemon::protocol::{ShellSpec, SshSpec};
 use crate::terminal::view::{ChildExited, TerminalView};
 use crate::ui::palette::{Command, CommandKind, PaletteEvent, PaletteView};
 use crate::ui::pane::{CloseOutcome, Dir, Pane};
@@ -779,6 +781,197 @@ impl Tty7App {
         self.update_config(cx, |cfg| cfg.link_url = on);
     }
 
+    pub(crate) fn set_ssh_loopback_forward(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.ssh_loopback_forward = on);
+    }
+
+    pub(crate) fn refresh_loopback_forwards(&mut self, cx: &mut Context<Self>) {
+        let forwards = crate::terminal::RemoteTerminal::list_loopback_forwards();
+        if let Some(settings) = self
+            .tabs
+            .get_mut(self.active)
+            .and_then(|tab| tab.settings.as_mut())
+        {
+            settings.loopback_forwards = forwards;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn close_loopback_forward(
+        &mut self,
+        id: crate::daemon::protocol::LoopbackForwardId,
+        cx: &mut Context<Self>,
+    ) {
+        let forwards = crate::terminal::RemoteTerminal::close_loopback_forward(id);
+        if let Some(settings) = self
+            .tabs
+            .get_mut(self.active)
+            .and_then(|tab| tab.settings.as_mut())
+        {
+            settings.loopback_forwards = forwards;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn copy_loopback_forward_address(
+        &mut self,
+        address: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.write_to_clipboard(ClipboardItem::new_string(address));
+    }
+
+    pub(crate) fn save_loopback_forward_form(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((pane_id, host, port, editing)) = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.settings.as_ref())
+            .and_then(|settings| {
+                let host = settings
+                    .loopback_host_input
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_string();
+                let port = settings
+                    .loopback_port_input
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .parse::<u16>()
+                    .ok()?;
+                let pane_id = settings
+                    .loopback_editing
+                    .as_ref()
+                    .map(|id| id.pane_id)
+                    .or(settings.loopback_default_pane_id)?;
+                Some((pane_id, host, port, settings.loopback_editing.clone()))
+            })
+        else {
+            return;
+        };
+        if host.is_empty() {
+            return;
+        }
+
+        if crate::terminal::RemoteTerminal::ensure_loopback_forward(pane_id, &host, port).is_ok() {
+            if let Some(old) = editing {
+                if old.remote_host != host || old.remote_port != port {
+                    let _ = crate::terminal::RemoteTerminal::close_loopback_forward(old);
+                }
+            }
+            let forwards = crate::terminal::RemoteTerminal::list_loopback_forwards();
+            if let Some(settings) = self
+                .tabs
+                .get_mut(self.active)
+                .and_then(|tab| tab.settings.as_mut())
+            {
+                settings.loopback_forwards = forwards;
+                settings.loopback_editing = None;
+                settings.loopback_host_input.update(cx, |input, cx| {
+                    input.set_value("localhost", window, cx);
+                });
+                settings.loopback_port_input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+            }
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn edit_loopback_forward(
+        &mut self,
+        id: crate::daemon::protocol::LoopbackForwardId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(settings) = self
+            .tabs
+            .get_mut(self.active)
+            .and_then(|tab| tab.settings.as_mut())
+        {
+            settings.loopback_editing = Some(id.clone());
+            settings.loopback_host_input.update(cx, |input, cx| {
+                input.set_value(id.remote_host, window, cx);
+            });
+            settings.loopback_port_input.update(cx, |input, cx| {
+                input.set_value(id.remote_port.to_string(), window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_loopback_forward_edit(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(settings) = self
+            .tabs
+            .get_mut(self.active)
+            .and_then(|tab| tab.settings.as_mut())
+        {
+            settings.loopback_editing = None;
+            settings.loopback_host_input.update(cx, |input, cx| {
+                input.set_value("localhost", window, cx);
+            });
+            settings.loopback_port_input.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn open_managed_ssh_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((target, options)) = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.settings.as_ref())
+            .map(|settings| {
+                (
+                    settings
+                        .ssh_target_input
+                        .read(cx)
+                        .value()
+                        .trim()
+                        .to_string(),
+                    settings.ssh_options_input.read(cx).value().to_string(),
+                )
+            })
+        else {
+            return;
+        };
+        if target.is_empty() {
+            return;
+        }
+        let Ok(args) = parse_ssh_option_words(&options) else {
+            return;
+        };
+        let ssh = SshSpec { target, args };
+        self.open_managed_ssh_spec(ssh, window, cx);
+    }
+
+    fn open_managed_ssh_spec(&mut self, ssh: SshSpec, window: &mut Window, cx: &mut Context<Self>) {
+        if ssh.validate().is_err() {
+            return;
+        }
+        let mut shell_args = ssh.args.clone();
+        shell_args.push(ssh.target.clone());
+        self.new_tab_with_shell(
+            Some(ShellSpec {
+                program: "ssh".to_string(),
+                args: shell_args,
+                ssh: Some(ssh),
+            }),
+            window,
+            cx,
+        );
+    }
+
     /// Toggle the startup update check (Settings → About). Takes effect on the
     /// next launch — this only persists the preference; it doesn't run or cancel
     /// an in-flight check.
@@ -1297,6 +1490,13 @@ impl Tty7App {
     /// "Switch to Tab: …" entry per open tab (label matches the tab strip).
     fn palette_commands(&self, cx: &App) -> Vec<Command> {
         let mut commands = Command::base_commands();
+        let profiles = ssh_config::discover_profiles();
+        if !profiles.is_empty() {
+            commands.push(Command {
+                title: "SSH Profiles…".to_string(),
+                kind: CommandKind::OpenSshProfilePicker(profiles),
+            });
+        }
         for (i, tab) in self.tabs.iter().enumerate() {
             // Skip the active tab — "switch to the tab you're already on" is a
             // no-op that only pads the list.
@@ -1338,7 +1538,7 @@ impl Tty7App {
     ) {
         match ev {
             PaletteEvent::Confirm(kind) => {
-                let kind = *kind;
+                let kind = kind.clone();
                 self.close_palette(window, cx);
                 self.run_command(kind, window, cx);
             }
@@ -1409,9 +1609,19 @@ impl Tty7App {
                     self.set_preset(&id, window, cx);
                 }
             }
-            // Handled inside `PaletteView` (opens the theme sub-list); it never
-            // emits a `Confirm` for this variant, so it never reaches here.
-            OpenThemePicker => {}
+            OpenSshProfile(profile) => {
+                self.open_managed_ssh_spec(
+                    SshSpec {
+                        target: profile.alias,
+                        args: Vec::new(),
+                    },
+                    window,
+                    cx,
+                );
+            }
+            // Handled inside `PaletteView` (opens a sub-list); these never emit a
+            // `Confirm` for this variant, so they never reach here.
+            OpenThemePicker | OpenSshProfilePicker(_) => {}
             ActivateTab(i) => self.activate(i, window, cx),
         }
     }
@@ -1429,6 +1639,14 @@ impl Tty7App {
     /// focus it.
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.settings_tab_index() {
+            let loopback_default_pane_id = self
+                .tabs
+                .get(self.active)
+                .and_then(|tab| tab.pane.focused_or_first(window, cx))
+                .map(|pane| pane.read(cx).pane_id);
+            if let Some(settings) = self.tabs[index].settings.as_mut() {
+                settings.loopback_default_pane_id = loopback_default_pane_id;
+            }
             self.activate(index, window, cx);
             return;
         }
@@ -1449,6 +1667,32 @@ impl Tty7App {
                 }
             }),
         );
+        let loopback_default_pane_id = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.pane.focused_or_first(window, cx))
+            .map(|pane| pane.read(cx).pane_id);
+        let loopback_host_input =
+            cx.new(|cx| InputState::new(window, cx).default_value("localhost"));
+        let loopback_port_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("3000")
+                .default_value("")
+        });
+        let ssh_target_input = cx.new(|cx| InputState::new(window, cx).placeholder("user@host"));
+        let ssh_options_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("-p 2222 -J jump")
+                .default_value("")
+        });
+        for input in [&ssh_target_input, &ssh_options_input] {
+            subs.push(cx.subscribe_in(input, window, |_this, _i, ev, _w, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            }));
+        }
+        let loopback_forwards = crate::terminal::RemoteTerminal::list_loopback_forwards();
 
         self.maximized = None;
         self.tabs.push(Tab {
@@ -1467,6 +1711,13 @@ impl Tty7App {
                 theme_editor: None,
                 theme_panel_open: false,
                 theme_search,
+                loopback_forwards,
+                ssh_target_input,
+                ssh_options_input,
+                loopback_default_pane_id,
+                loopback_host_input,
+                loopback_port_input,
+                loopback_editing: None,
                 recording: None,
                 rebinding_note: None,
                 _subs: subs,
@@ -2450,6 +2701,56 @@ fn new_terminal(
     })
     .detach();
     view
+}
+
+pub(crate) fn parse_ssh_option_words(input: &str) -> Result<Vec<String>, ()> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), '\\') => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            (Some(_), c) => current.push(c),
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            (None, c) => current.push(c),
+        }
+    }
+    if quote.is_some() {
+        return Err(());
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Ok(words)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ssh_option_words;
+
+    #[test]
+    fn parses_ssh_option_words_with_quotes() {
+        assert_eq!(
+            parse_ssh_option_words("-p 2222 -J 'jump host' -o \"User=dev\"").unwrap(),
+            vec!["-p", "2222", "-J", "jump host", "-o", "User=dev"]
+        );
+    }
+
+    #[test]
+    fn rejects_unclosed_ssh_option_quote() {
+        assert!(parse_ssh_option_words("-J 'jump").is_err());
+    }
 }
 
 #[cfg(test)]
