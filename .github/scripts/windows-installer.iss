@@ -75,13 +75,13 @@ Filename: "{app}\tty7.exe"; Description: "{cm:LaunchProgram,tty7}"; Flags: nowai
 Filename: "{app}\tty7.exe"; Parameters: "--stop-daemon"; Flags: runhidden waituntilterminated; RunOnceId: "StopDaemon"
 
 [Code]
-{ Gracefully stop the persistent daemon before we overwrite tty7.exe. We can't
+(* Gracefully stop the persistent daemon before we overwrite tty7.exe. We can't
   run the *installed* binary here — on an upgrade from an older build it may not
   understand --stop-daemon and would launch the GUI instead — so we extract the
   *new* tty7.exe to {tmp} and run that. It connects to the running daemon, hangs
   up every shell, waits for it to exit (releasing the file lock), then returns
   without opening a window. Best effort: any failure falls through to the Restart
-  Manager backstop, and a fresh install simply has no daemon to stop. }
+  Manager backstop, and a fresh install simply has no daemon to stop. *)
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
