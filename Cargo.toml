@@ -117,6 +117,7 @@ memchr = "2"
 # only libc users left, both Unix-only — so the dep is Unix-only too.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+libgssapi = "0.11"
 
 # The Windows GUI⇄daemon transport is loopback TCP, which (unlike a Unix socket)
 # any local process can connect to — so the daemon authenticates each connection
@@ -196,6 +197,10 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"
 smallvec = "1"
 smol = "2"
+
+[patch.crates-io]
+# Temporary until upstream russh releases gssapi-with-mic client auth support.
+russh = { git = "https://github.com/ayamir/russh", branch = "gssapi-with-mic" }
 
 [workspace.lints.clippy]
 dbg_macro = "deny"

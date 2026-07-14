@@ -180,6 +180,8 @@ pub enum AuthMode {
     /// order (the default).
     #[default]
     Auto,
+    /// GSSAPI with MIC only (Kerberos-style SSO).
+    Gssapi,
     /// Password only (saved, then prompted).
     Password,
     /// Public-key only.
@@ -658,6 +660,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AuthMode::KeyboardInteractive).unwrap(),
             "\"keyboard-interactive\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AuthMode::Gssapi).unwrap(),
+            "\"gssapi\""
         );
         let m: AuthMode = serde_json::from_str("\"agent\"").unwrap();
         assert_eq!(m, AuthMode::Agent);

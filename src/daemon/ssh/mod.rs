@@ -547,4 +547,40 @@ mod tests {
             ConnectionKey::from_spec(&with_jump)
         );
     }
+
+    #[test]
+    #[ignore = "requires a live SSH server and local GSSAPI credentials"]
+    fn live_gssapi_connects_and_opens_a_channel() {
+        let host = std::env::var("TTY7_LIVE_SSH_HOST").expect("TTY7_LIVE_SSH_HOST");
+        let user = std::env::var("TTY7_LIVE_SSH_USER").expect("TTY7_LIVE_SSH_USER");
+        let port = std::env::var("TTY7_LIVE_SSH_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(22);
+
+        let mut spec = base_spec();
+        spec.host = host;
+        spec.user = user;
+        spec.port = port;
+        spec.auth_mode = SshAuthMode::Gssapi;
+        spec.connect_timeout_s = Some(10);
+        // Prove GSSAPI itself without requiring a GUI host-key prompt or mutating
+        // the user's known_hosts from this live test.
+        spec.verify_host_keys = false;
+
+        let manager = SshManager::global();
+        let broker = PromptBroker::new(Box::new(|_| true));
+        manager.runtime.block_on(async {
+            let (conn, reused) = manager
+                .open_connection(&spec, &broker)
+                .await
+                .expect("native GSSAPI connection");
+            assert!(!reused);
+            conn.open_session_channel()
+                .await
+                .expect("open session channel");
+            conn.mark_dead();
+            manager.evict_connection(conn.key());
+        });
+    }
 }

@@ -171,6 +171,7 @@ pub struct LoopbackForwardInfo {
 pub enum SshAuthMode {
     #[default]
     Auto,
+    Gssapi,
     Password,
     PublicKey,
     Agent,

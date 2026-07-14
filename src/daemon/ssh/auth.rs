@@ -9,13 +9,14 @@
 //! spec (pre-resolved from the keychain by the GUI) or, failing that, from the
 //! [`PromptBroker`]. Secrets are never logged.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use russh::client::{AuthResult, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::AgentClient;
 use russh::keys::{Algorithm, HashAlg, PrivateKeyWithHashAlg, PublicKey};
-use russh::{MethodKind, MethodSet};
+use russh::{GssapiAuthenticator, GssapiStep, MethodKind, MethodSet};
 
 use crate::daemon::protocol::{AuthPromptKind, AuthResponse, KiPrompt, NativeSshSpec, SshAuthMode};
 
@@ -53,6 +54,7 @@ pub async fn authenticate(
             continue;
         }
         let outcome = match family {
+            MethodKind::GssapiWithMic => try_gssapi(handle, spec).await,
             MethodKind::PublicKey => try_publickeys(handle, spec, broker).await,
             MethodKind::KeyboardInteractive => try_keyboard_interactive(handle, spec, broker).await,
             MethodKind::Password => try_password(handle, spec, broker).await,
@@ -89,10 +91,12 @@ pub async fn authenticate(
 fn method_order(mode: SshAuthMode) -> Vec<MethodKind> {
     match mode {
         SshAuthMode::Auto => vec![
+            MethodKind::GssapiWithMic,
             MethodKind::PublicKey,
             MethodKind::Password,
             MethodKind::KeyboardInteractive,
         ],
+        SshAuthMode::Gssapi => vec![MethodKind::GssapiWithMic],
         SshAuthMode::PublicKey | SshAuthMode::Agent => vec![MethodKind::PublicKey],
         SshAuthMode::Password => vec![MethodKind::Password],
         SshAuthMode::KeyboardInteractive => vec![MethodKind::KeyboardInteractive],
@@ -114,6 +118,301 @@ fn failed(reason: impl Into<String>) -> Outcome {
         reason: Some(reason.into()),
     }
 }
+
+const KRB5_DER_OID: &[u8] = b"\x06\x09\x2a\x86\x48\x86\xf7\x12\x01\x02\x02";
+
+#[cfg(unix)]
+struct GssapiClient {
+    ctx: libgssapi::context::ClientCtx,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+enum GssapiAuthError {
+    Send(russh::SendError),
+    Gssapi(libgssapi::error::Error),
+    Other(String),
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for GssapiAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GssapiAuthError::Send(_) => write!(f, "send error"),
+            GssapiAuthError::Gssapi(e) => write!(f, "{e}"),
+            GssapiAuthError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<russh::SendError> for GssapiAuthError {
+    fn from(value: russh::SendError) -> Self {
+        GssapiAuthError::Send(value)
+    }
+}
+
+#[cfg(unix)]
+impl From<libgssapi::error::Error> for GssapiAuthError {
+    fn from(value: libgssapi::error::Error) -> Self {
+        GssapiAuthError::Gssapi(value)
+    }
+}
+
+#[cfg(unix)]
+impl GssapiAuthenticator for GssapiClient {
+    type Error = GssapiAuthError;
+
+    async fn gssapi_step(
+        &mut self,
+        selected_mechanism: Vec<u8>,
+        input_token: Option<Vec<u8>>,
+        mic_data: Vec<u8>,
+    ) -> Result<GssapiStep, Self::Error> {
+        use libgssapi::context::SecurityContext;
+
+        if input_token.is_none() && selected_mechanism != KRB5_DER_OID {
+            return Err(GssapiAuthError::Other(
+                "server selected an unsupported gssapi mechanism".to_string(),
+            ));
+        }
+        let output = self.ctx.step(input_token.as_deref(), None)?;
+        if self.ctx.is_complete() {
+            let mic = self.ctx.get_mic(&mic_data)?;
+            Ok(GssapiStep::Complete {
+                token: output.map(|buf| buf.to_vec()),
+                mic: Some(mic.to_vec()),
+            })
+        } else {
+            let Some(token) = output else {
+                return Ok(GssapiStep::Complete {
+                    token: None,
+                    mic: None,
+                });
+            };
+            Ok(GssapiStep::Continue {
+                token: token.to_vec(),
+            })
+        }
+    }
+}
+
+async fn try_gssapi(handle: &mut Handle<ClientHandler>, spec: &NativeSshSpec) -> Outcome {
+    #[cfg(unix)]
+    {
+        use libgssapi::context::{ClientCtx, CtxFlags};
+        use libgssapi::name::Name;
+        use libgssapi::oid::{GSS_MECH_KRB5, GSS_NT_HOSTBASED_SERVICE};
+
+        let service_hosts = gssapi_service_hosts(&spec.host).await;
+        let mut tried = Vec::new();
+        let mut errors = Vec::new();
+        let mut last_remaining = None;
+        let mut saw_rejection = false;
+
+        for service_host in service_hosts {
+            let service = format!("host@{service_host}");
+            tried.push(service.clone());
+            let name = match Name::new(service.as_bytes(), Some(GSS_NT_HOSTBASED_SERVICE)) {
+                Ok(name) => name,
+                Err(e) => {
+                    errors.push(format!("{service}: target name error: {e}"));
+                    continue;
+                }
+            };
+            let mut client = GssapiClient {
+                ctx: ClientCtx::new(
+                    None,
+                    name,
+                    CtxFlags::GSS_C_MUTUAL_FLAG | CtxFlags::GSS_C_INTEG_FLAG,
+                    Some(GSS_MECH_KRB5),
+                ),
+            };
+
+            match handle
+                .authenticate_gssapi_with_mic(&spec.user, vec![KRB5_DER_OID.to_vec()], &mut client)
+                .await
+            {
+                Ok(AuthResult::Success) => return Outcome::Authenticated,
+                Ok(AuthResult::Failure {
+                    remaining_methods, ..
+                }) => {
+                    saw_rejection = true;
+                    let can_retry = remaining_methods.is_empty()
+                        || remaining_methods.contains(&MethodKind::GssapiWithMic);
+                    last_remaining = Some(remaining_methods);
+                    if !can_retry {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!("{service}: {e}"));
+                    break;
+                }
+            }
+        }
+
+        let tried = tried.join(", ");
+        if saw_rejection {
+            return Outcome::Failed {
+                remaining_methods: last_remaining,
+                reason: Some(format!("gssapi rejected (tried {tried})")),
+            };
+        }
+        if errors.is_empty() {
+            failed(format!("gssapi auth error (tried {tried})"))
+        } else {
+            failed(format!(
+                "gssapi auth error (tried {tried}): {}",
+                errors.join("; ")
+            ))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (handle, spec);
+        failed("gssapi auth is only implemented on Unix")
+    }
+}
+
+#[cfg(unix)]
+async fn gssapi_service_hosts(host: &str) -> Vec<String> {
+    let host = host.to_string();
+    let fallback = host.clone();
+    tokio::task::spawn_blocking(move || gssapi_service_hosts_blocking(&host))
+        .await
+        .unwrap_or_else(|_| vec![fallback])
+}
+
+#[cfg(unix)]
+fn gssapi_service_hosts_blocking(host: &str) -> Vec<String> {
+    gssapi_service_hosts_with_lookup(host, reverse_lookup_addr)
+}
+
+#[cfg(unix)]
+fn gssapi_service_hosts_with_lookup(
+    host: &str,
+    reverse_lookup: impl FnOnce(IpAddr) -> Option<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    out.push(host.to_string());
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && let Some(name) = reverse_lookup(ip).map(|name| name.trim_end_matches('.').to_string())
+        && !name.is_empty()
+    {
+        out.push(name);
+    }
+    out.dedup();
+    out
+}
+
+#[cfg(unix)]
+fn reverse_lookup_addr(ip: IpAddr) -> Option<String> {
+    match ip {
+        IpAddr::V4(ip) => reverse_lookup_v4(ip),
+        IpAddr::V6(ip) => reverse_lookup_v6(ip),
+    }
+}
+
+#[cfg(unix)]
+fn reverse_lookup_v4(ip: std::net::Ipv4Addr) -> Option<String> {
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    set_sockaddr_in_len(&mut addr);
+    addr.sin_family = libc::AF_INET as _;
+    addr.sin_addr = libc::in_addr {
+        s_addr: u32::from_ne_bytes(ip.octets()),
+    };
+    reverse_lookup_sockaddr(
+        &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+    )
+}
+
+#[cfg(unix)]
+fn reverse_lookup_v6(ip: std::net::Ipv6Addr) -> Option<String> {
+    let mut addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    set_sockaddr_in6_len(&mut addr);
+    addr.sin6_family = libc::AF_INET6 as _;
+    addr.sin6_addr = libc::in6_addr {
+        s6_addr: ip.octets(),
+    };
+    reverse_lookup_sockaddr(
+        &addr as *const libc::sockaddr_in6 as *const libc::sockaddr,
+        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+    )
+}
+
+#[cfg(unix)]
+fn reverse_lookup_sockaddr(addr: *const libc::sockaddr, len: libc::socklen_t) -> Option<String> {
+    const NI_MAXHOST_FALLBACK: usize = 1025;
+    let mut host = [0 as libc::c_char; NI_MAXHOST_FALLBACK];
+    let rc = unsafe {
+        libc::getnameinfo(
+            addr,
+            len,
+            host.as_mut_ptr(),
+            host.len() as libc::socklen_t,
+            std::ptr::null_mut(),
+            0,
+            libc::NI_NAMEREQD,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(host.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    (!name.is_empty()).then_some(name)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+#[cfg(unix)]
+fn set_sockaddr_in_len(addr: &mut libc::sockaddr_in) {
+    addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)))]
+#[cfg(unix)]
+fn set_sockaddr_in_len(_addr: &mut libc::sockaddr_in) {}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+#[cfg(unix)]
+fn set_sockaddr_in6_len(addr: &mut libc::sockaddr_in6) {
+    addr.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)))]
+#[cfg(unix)]
+fn set_sockaddr_in6_len(_addr: &mut libc::sockaddr_in6) {}
 
 /// Try identity files (unless mode is `Agent`) then the ssh-agent (unless mode is
 /// `PublicKey`), in that order.
@@ -518,13 +817,45 @@ mod tests {
             vec![MethodKind::KeyboardInteractive]
         );
         assert_eq!(
+            method_order(SshAuthMode::Gssapi),
+            vec![MethodKind::GssapiWithMic]
+        );
+        assert_eq!(
             method_order(SshAuthMode::Auto),
             vec![
+                MethodKind::GssapiWithMic,
                 MethodKind::PublicKey,
                 MethodKind::Password,
                 MethodKind::KeyboardInteractive
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gssapi_service_hosts_keep_original_host_before_reverse_dns() {
+        let hosts = gssapi_service_hosts_with_lookup("10.37.108.28", |_| {
+            Some("n37-108-028.byted.org.".into())
+        });
+        assert_eq!(
+            hosts,
+            vec![
+                "10.37.108.28".to_string(),
+                "n37-108-028.byted.org".to_string()
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gssapi_service_hosts_dedup_reverse_dns() {
+        let hosts = gssapi_service_hosts_with_lookup("example.com", |_| {
+            panic!("non-ip hosts should not trigger reverse lookup")
+        });
+        assert_eq!(hosts, vec!["example.com".to_string()]);
+
+        let hosts = gssapi_service_hosts_with_lookup("10.0.0.1", |_| Some("10.0.0.1".into()));
+        assert_eq!(hosts, vec!["10.0.0.1".to_string()]);
     }
 
     #[test]
