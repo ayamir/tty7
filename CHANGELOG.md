@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-14
+
+### Added
+
+- SSH connection manager: a native russh client with saved connection
+  profiles, password and public-key auth, port forwarding, and SFTP. (#74)
+- Buffer search overhaul — richer in-terminal search with rebindable,
+  cross-platform shortcuts. (#75)
+- Vertical tab sidebar, and Settings reworked into a full-window page. (#70)
+- Tab title now follows the active pane. (#73)
+- New Settings controls: bell, notify threshold, mouse reporting, and
+  session restore. (#68)
+
+### Changed
+
+- SSH saved profiles are now the single source of truth for connections. (#77)
+- Bump memchr 2.8.2 → 2.8.3. (#69)
+
+### Fixed
+
+- SSH auth-sheet polish and softer primary buttons. (#79)
+- The Cmd+F find bar now owns the top-right slot over the SSH action
+  icons. (#76, #78)
+- Windows: stop the daemon before install/uninstall so it can replace
+  `tty7.exe`. (#72)
+- Moved SSH forwards into the pane context. (#71)
+
+## [0.13.0] - 2026-07-13
+
+### Added
+
+- SSH loopback forwarding for links. (#58)
+- Editable keybindings: rebindable shortcuts, pane/tab actions, and a tmux
+  preset. (#65)
+
+### Fixed
+
+- Trim the first tab's left gap flush to the traffic-light reserve. (#62)
+- Remove the active-pane corner indicator dot. (#63)
+- CI: format code and platform-gate the ctrl glyph in the keymap test. (#67)
+
+## [0.12.0] - 2026-07-13
+
+### Added
+
+- Ship a Linux AppImage alongside the tarball. (#55)
+- Title-bar overflow menu for the command palette and settings. (#57)
+
+### Changed
+
+- Redesigned theme picker with a slide-in panel. (#56)
+
+### Fixed
+
+- Stop the title-bar strip from clipping the Windows close button. (#60)
+- Restore the original terminal-window logo, reverting the branding
+  change. (#59)
+
+## [0.11.0] - 2026-07-12
+
+### Added
+
+- File-based themes, an in-app theme editor, and a UI/branding refresh. (#54)
+
 ## [0.10.0] - 2026-07-11
 
 ### Added
