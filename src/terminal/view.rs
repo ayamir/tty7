@@ -63,6 +63,25 @@ pub struct ChildExited;
 
 impl gpui::EventEmitter<ChildExited> for TerminalView {}
 
+/// A native-SSH pane raised an interactive auth/host-key prompt (or a status
+/// change) that the app should surface in an in-pane sheet. `Tty7App` subscribes
+/// (see `new_terminal`) and drains the pane's pending prompts into
+/// `ui::ssh_prompt`. Zero-payload — the app reads the prompt off the pane's
+/// `RemoteTerminal` (`take_auth_prompt` / `ssh_phase`).
+pub struct AuthPromptReady;
+
+impl gpui::EventEmitter<AuthPromptReady> for TerminalView {}
+
+/// An established native-SSH daemon pane, ready to be wrapped in a view: the
+/// output of the fallible [`TerminalView::spawn_native_ssh_terminal`], consumed
+/// by the infallible [`TerminalView::from_native_ssh_parts`].
+pub struct NativeSshParts {
+    terminal: RemoteTerminal,
+    pane_id: u64,
+    /// Secret-free spec copy retained for session restore / in-pane reconnect.
+    persist: Box<crate::daemon::protocol::NativeSshSpec>,
+}
+
 /// See `TerminalView::drag_scroll`.
 #[derive(Clone, Copy)]
 struct DragScroll {
@@ -86,6 +105,12 @@ pub struct TerminalView {
     /// panes. In-memory only (not persisted) — held so splits of this pane
     /// inherit the same shell.
     shell_spec: Option<ShellSpec>,
+    /// The native-SSH spec this pane was spawned with, **secrets stripped**
+    /// ([`NativeSshSpec::without_secrets`]). `None` for local shells (and a
+    /// foreground `ssh` typed in one). Persisted into the session so a *dead*
+    /// native-SSH pane can be respawned/reconnected on restore (PRD FR-E4 / C2),
+    /// and read live to drive the in-pane reconnect (`RestartSshSession`).
+    ssh_spec: Option<Box<crate::daemon::protocol::NativeSshSpec>>,
     pub focus_handle: FocusHandle,
     pub font: Font,
     /// Optional distinct base face for bold cells (from `font_family_bold`), with
@@ -596,6 +621,49 @@ impl TerminalView {
         Ok(view)
     }
 
+    /// Spawn a native (russh) SSH pane for `spec` and build the view around it
+    /// (PRD FR-C1/E-series). The caller (`ui::ssh_connect`) has already resolved
+    /// keychain secrets into `spec`; this view retains only the **secret-free**
+    /// copy ([`NativeSshSpec::without_secrets`]) for session-restore respawn and
+    /// the in-pane reconnect. Auth/host-key prompts and the connection phase ride
+    /// this pane's own stream and surface through the usual `AuthPromptReady`
+    /// path.
+    /// The fallible half of a native-SSH view: establish the daemon pane first,
+    /// so a refused spawn (daemon down, stale pre-SSH daemon, protocol error)
+    /// surfaces as an `Err` the caller can report — building the view itself
+    /// (inside `cx.new`, via [`Self::from_native_ssh_parts`]) has no failure
+    /// path of its own.
+    pub fn spawn_native_ssh_terminal(
+        spec: Box<crate::daemon::protocol::NativeSshSpec>,
+        working_directory: Option<std::path::PathBuf>,
+    ) -> anyhow::Result<NativeSshParts> {
+        let persist = Box::new(spec.without_secrets());
+        let (terminal, pane_id) = RemoteTerminal::spawn_native_ssh(
+            TermSize::new(80, 24),
+            8,
+            17,
+            working_directory,
+            spec,
+        )?;
+        Ok(NativeSshParts {
+            terminal,
+            pane_id,
+            persist,
+        })
+    }
+
+    /// Wrap an established native-SSH pane (from
+    /// [`Self::spawn_native_ssh_terminal`]) in a view.
+    pub fn from_native_ssh_parts(
+        parts: NativeSshParts,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::with_terminal(parts.terminal, parts.pane_id, window, cx);
+        view.ssh_spec = Some(parts.persist);
+        view
+    }
+
     /// Build the view around an already-connected terminal. Split from [`new`]
     /// so tests can hand in a `RemoteTerminal` backed by a plain socketpair
     /// and exercise the event plumbing without a live daemon.
@@ -773,6 +841,7 @@ impl TerminalView {
             terminal,
             pane_id,
             shell_spec: None,
+            ssh_spec: None,
             focus_handle,
             font,
             font_bold,
@@ -861,10 +930,36 @@ impl TerminalView {
         self.shell_spec.clone()
     }
 
+    /// The secret-free native-SSH spec this pane ran, if it is a native-SSH pane.
+    /// Persisted for session restore and re-used by the in-pane reconnect
+    /// (`RestartSshSession`).
+    pub fn ssh_spec(&self) -> Option<Box<crate::daemon::protocol::NativeSshSpec>> {
+        self.ssh_spec.clone()
+    }
+
+    /// The native-SSH connection phase for the status strip (PRD FR-E1); `None`
+    /// for a non-native pane.
+    pub fn ssh_phase(&self) -> Option<crate::daemon::protocol::SshPhase> {
+        self.terminal.ssh_phase()
+    }
+
+    /// Whether this native-SSH pane's connection is dead (shell exited or the
+    /// connect failed) and so eligible for an in-pane reconnect. False for live
+    /// panes and non-native panes.
+    pub fn ssh_disconnected(&self) -> bool {
+        self.ssh_spec.is_some() && self.terminal.exited
+    }
+
     fn handle_event(&mut self, ev: AlacEvent, cx: &mut Context<Self>) {
         // Surface a child-exit/daemon-disconnect noticed by the reader thread into
         // the field the view reads directly (`self.terminal.exited`).
         self.terminal.poll_exited();
+        // A native-SSH pane may have queued an auth/host-key prompt behind this
+        // wakeup; let the app drain it into the in-pane sheet. Cheap check —
+        // only true during the brief pre-Output auth window.
+        if self.terminal.has_pending_auth() {
+            cx.emit(AuthPromptReady);
+        }
         match ev {
             AlacEvent::Wakeup => cx.notify(),
             AlacEvent::Title(title) => {
@@ -3207,11 +3302,13 @@ impl TerminalView {
     }
 
     fn can_forward_loopback(&self, cx: &mut Context<Self>) -> bool {
+        // A loopback one-click forward runs over the pane's native russh connection
+        // (FR-F4, direct-tcpip). Only native-SSH panes have one.
         cx.global::<Config>().ssh_loopback_forward
             && self
                 .terminal
                 .remote_context()
-                .is_some_and(|remote| remote.control_path.is_some())
+                .is_some_and(|remote| remote.kind == crate::daemon::protocol::RemoteKind::NativeSsh)
     }
 
     /// Update the remembered hovered link for the screen cell `(col, row)` and

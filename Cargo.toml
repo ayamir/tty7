@@ -26,6 +26,18 @@ smallvec.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 
+# SSH connection-manager data layer (`core::ssh_profile` / `core::keychain`).
+# `uuid` mints stable profile ids (v4) and serde-serializes them as strings;
+# `sha2` hashes private-key file contents to the sha512-hex account key that
+# passphrases are stored under in the OS keychain (per PRD §7.2). Both are already
+# in the tree transitively, so pinning them here adds no new native code. `keyring`
+# 4.x is the OS credential-vault backend: its default `v1` feature auto-selects the
+# platform store (macOS Keychain / Windows Credential Manager / Linux Secret
+# Service), so no per-platform feature guards are needed.
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+keyring = "4"
+
 # Theme files. tty7 themes are authored as YAML (`~/.config/tty7/themes/*.yaml`,
 # our own schema); `plist` parses imported iTerm2 `.itermcolors` schemes (XML
 # plist) so the large iTerm color-scheme ecosystem drops straight in. serde_yaml
@@ -60,6 +72,40 @@ notify = "8"
 # one blocking `Read`/`Write`/`resize` API. This is what lets `daemon::pane` share
 # a single code path across platforms instead of hand-rolling fd/ioctl/signal code.
 portable-pty = "0.8"
+
+# Native (pure-Rust) SSH client for the daemon's russh session engine
+# (`daemon::ssh`). Replaces shelling out to the system `ssh` binary for managed
+# connections: it gives us the protocol stack that GUI-hosted auth, host-key
+# prompts, in-memory connection reuse, and (later) SFTP / native port-forwarding
+# all need. 0.62 folded the old `russh-keys` crate in as `russh::keys` (key
+# parsing + ssh-agent client). The async russh session lives on a small tokio
+# runtime owned by `daemon::ssh`; the rest of the daemon stays std-threads and
+# bridges to it through blocking `Read`/`Write` adapters.
+russh = "0.62"
+
+# SFTP client for the native SSH engine (`daemon::ssh::sftp`, Workstream 5).
+# Not part of russh proper: `russh-sftp` drives the SFTP subsystem over any
+# AsyncRead+AsyncWrite stream, which a russh session channel provides via
+# `Channel::into_stream()`. Version-independent of russh (it only needs the
+# channel byte stream), so it rides the same tokio runtime `daemon::ssh` owns.
+russh-sftp = "2"
+
+# tokio powers only the russh session engine — a single runtime `daemon::ssh`
+# owns. The daemon's PTY/reader/writer threads remain std threads and never touch
+# it; they cross into async through bounded/unbounded channels (the blocking
+# `Read`/`Write` adapters in `daemon::ssh::session`).
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "macros",
+    "process",
+    # `fs` powers the local side of SFTP transfers (`daemon::ssh::sftp`): async
+    # file/dir IO on the daemon process's own filesystem during upload/download.
+    "fs",
+] }
 
 # SIMD byte search for the OSC tokenizer's Ground/Ignore fast paths — the
 # sniffers sit on the full-throughput output stream (100+ MB/s at full drain),
@@ -114,6 +160,9 @@ gpui_platform = { workspace = true, features = ["x11", "wayland"] }
 # into test builds and never reaches a release binary.
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+# `test-util` unlocks tokio's paused clock (`start_paused`) so the ssh prompt
+# broker's timeout/retry tests run instantly instead of in real time. Dev-only.
+tokio = { version = "1", features = ["test-util", "macros", "rt"] }
 
 [lints]
 workspace = true

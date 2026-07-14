@@ -25,10 +25,10 @@
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -36,7 +36,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 use crate::core::osc::OscTokenizer;
 use crate::daemon::protocol::{
-    DaemonMsg, PaneInfo, RemoteContext, RemoteKind, ShellSpec, SshSpec, WinSize,
+    AuthResponse, DaemonMsg, NativeSshSpec, PaneInfo, RemoteContext, RemoteKind, ShellSpec, WinSize,
 };
 use crate::daemon::shell_integration;
 
@@ -139,46 +139,16 @@ struct SpawnConfig {
 }
 
 fn build_spawn_config(
-    id: u64,
     cwd: Option<PathBuf>,
     shell: Option<ShellSpec>,
 ) -> anyhow::Result<SpawnConfig> {
     let initial_cwd = initial_working_directory(cwd);
-    let Some(mut shell) = shell else {
-        let (cmd, integration_dir) = build_shell_command(None, &initial_cwd)?;
-        return Ok(SpawnConfig {
-            cmd,
-            initial_cwd,
-            integration_dir,
-            remote: None,
-        });
-    };
-    let Some(ssh) = shell.ssh.take() else {
-        let (cmd, integration_dir) = build_shell_command(Some(shell), &initial_cwd)?;
-        return Ok(SpawnConfig {
-            cmd,
-            initial_cwd,
-            integration_dir,
-            remote: None,
-        });
-    };
-
-    let control_path = ssh_control_path(id)?;
-    let _ = std::fs::remove_file(&control_path);
-    let cmd = build_managed_ssh_command(&shell.program, &ssh, &control_path, &initial_cwd)?;
-    let mut argv = vec![shell.program];
-    argv.extend(ssh.args.clone());
-    argv.push(ssh.target.clone());
+    let (cmd, integration_dir) = build_shell_command(shell, &initial_cwd)?;
     Ok(SpawnConfig {
         cmd,
         initial_cwd,
-        integration_dir: None,
-        remote: Some(RemoteContext {
-            kind: RemoteKind::Ssh,
-            argv,
-            target: ssh.target,
-            control_path: Some(control_path),
-        }),
+        integration_dir,
+        remote: None,
     })
 }
 
@@ -223,73 +193,6 @@ fn build_shell_command(
     let integration_dir = integration.as_ref().and_then(|i| i.dir.clone());
     apply_common_command_setup(&mut cmd, initial_cwd);
     Ok((cmd, integration_dir))
-}
-
-fn build_managed_ssh_command(
-    program: &str,
-    ssh: &SshSpec,
-    control_path: &Path,
-    initial_cwd: &Option<PathBuf>,
-) -> anyhow::Result<CommandBuilder> {
-    ssh.validate().map_err(anyhow::Error::msg)?;
-    let name = Path::new(program)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("ssh program is empty"))?;
-    if !matches!(name, "ssh" | "ssh.exe") {
-        anyhow::bail!("managed SSH tabs must launch ssh, not {program}");
-    }
-
-    let mut cmd = CommandBuilder::new(program);
-    cmd.args([
-        "-tt".to_string(),
-        "-o".to_string(),
-        "ControlMaster=yes".to_string(),
-        "-o".to_string(),
-        "ControlPersist=no".to_string(),
-        "-o".to_string(),
-        format!("ControlPath={}", control_path.display()),
-    ]);
-    cmd.args(&ssh.args);
-    cmd.args([ssh.target.clone()]);
-    apply_common_command_setup(&mut cmd, initial_cwd);
-    Ok(cmd)
-}
-
-fn ssh_control_path(id: u64) -> anyhow::Result<PathBuf> {
-    let dir = ssh_control_dir()?;
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir.join(format!("pane-{id}.sock")))
-}
-
-#[cfg(unix)]
-fn ssh_control_dir() -> anyhow::Result<PathBuf> {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let config_dir = crate::core::config::config_dir_path()
-        .ok_or_else(|| anyhow::anyhow!("could not resolve config dir for ssh control socket"))?;
-    let hash = fnv1a64(config_dir.as_os_str().as_bytes());
-    Ok(base.join(format!("tty7-ssh-{hash:016x}")))
-}
-
-#[cfg(not(unix))]
-fn ssh_control_dir() -> anyhow::Result<PathBuf> {
-    let config_dir = crate::core::config::config_dir_path()
-        .ok_or_else(|| anyhow::anyhow!("could not resolve config dir for ssh control socket"))?;
-    Ok(config_dir.join("ssh-control"))
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
 }
 
 fn initial_working_directory(cwd: Option<PathBuf>) -> Option<PathBuf> {
@@ -459,21 +362,25 @@ struct PaneState {
     alive: bool,
 }
 
-/// One live pane: the PTY handles plus the shared [`PaneState`]. Shared across
-/// connection threads via `Arc`; all mutable stream state lives behind the locks.
-pub struct DaemonPane {
-    pub id: u64,
+/// The byte source behind a pane. The PTY path (`Pty`) is byte-for-byte the
+/// original local-shell backend; `NativeSsh` is a russh shell channel bridged to
+/// the same blocking reader/writer contract (see [`crate::daemon::ssh::session`]).
+/// The reader thread, replay ring, `OutputGate`, and OSC sniffer are identical for
+/// both — only the handle-owning bits (resize, kill/hangup, foreground queries,
+/// reap) differ, and dispatch on this enum.
+enum PaneBackend {
+    Pty(PtyBackend),
+    NativeSsh(NativeSshBackend),
+}
+
+/// The local-PTY backend: the same handles `DaemonPane` has always owned.
+struct PtyBackend {
     /// The PTY master. Kept for the pane's lifetime to `resize` it and to query the
     /// foreground process group (macOS title / cwd fallback, and the reader
     /// thread's remote-prompt gate — see [`foreground_command_running`]). Behind a
-    /// `Mutex` because the trait object is `Send` but not `Sync`, and the pane is
-    /// shared across connection threads via `Arc`; the lock is uncontended in
-    /// practice (resize is rare, the proc query rarer). Wrapped in an `Arc` so the
-    /// reader thread can hold its own handle for that gate.
+    /// `Mutex` because the trait object is `Send` but not `Sync`; wrapped in an
+    /// `Arc` so the reader thread can hold its own handle for that gate.
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    /// The PTY's input side (keyboard input / pasted text). Behind a `Mutex`
-    /// because writes can arrive from different connection threads.
-    writer: Mutex<Box<dyn Write + Send>>,
     /// The child shell. Behind a `Mutex` so `kill` (and `Drop`'s reap) can take it
     /// `&mut`. `kill()` hangs the child up (SIGHUP on Unix); `Drop` then waits it.
     child: Mutex<Box<dyn Child + Send + Sync>>,
@@ -486,6 +393,32 @@ pub struct DaemonPane {
     /// `--rcfile`), removed on drop. `None` if bare, or if the shell (fish)
     /// needed no on-disk file at all.
     integration_dir: Option<PathBuf>,
+}
+
+/// The native-SSH backend: a handle to the async channel driver (for resize /
+/// close) plus the resolved remote context reported to the GUI. Resize becomes a
+/// `window-change`; kill/hangup closes the channel; foreground/pgid queries are
+/// `None` (a remote session has no local process group — the OSC 133 gate is a
+/// no-op, which is correct, per the pipeline brief §9).
+struct NativeSshBackend {
+    handle: Arc<crate::daemon::ssh::SshSessionHandle>,
+    /// The pane's russh connection, published by the connect task once
+    /// authenticated (a `Weak`, upgraded on demand). The seam WS4/WS5 reach
+    /// through [`DaemonPane::ssh_connection`].
+    connection: crate::daemon::ssh::SharedConnection,
+}
+
+/// One live pane: a byte-source backend plus the shared [`PaneState`]. Shared
+/// across connection threads via `Arc`; all mutable stream state lives behind the
+/// locks.
+pub struct DaemonPane {
+    pub id: u64,
+    /// The byte source (local PTY or native-SSH channel).
+    backend: PaneBackend,
+    /// The input side (keyboard input / pasted text): the PTY writer, or the
+    /// native-SSH channel writer. Behind a `Mutex` because writes can arrive from
+    /// different connection threads.
+    writer: Mutex<Box<dyn Write + Send>>,
     /// Set during teardown so the reader doesn't emit a spurious exit.
     shutting_down: Arc<AtomicBool>,
     /// Output backpressure shared by the reader thread (adds + waits) and the
@@ -494,6 +427,10 @@ pub struct DaemonPane {
     state: Arc<Mutex<PaneState>>,
     /// The reader `JoinHandle`, taken and joined in `Drop`.
     reader: Mutex<Option<JoinHandle<()>>>,
+    /// Auth/host-key prompt broker for native-SSH panes; `None` for PTY panes.
+    /// `run_stream` routes `ClientMsg::AuthResponse` here via
+    /// [`DaemonPane::deliver_auth_response`].
+    broker: Option<Arc<crate::daemon::ssh::PromptBroker>>,
 }
 
 /// Fires a pane's "child gone" notification exactly once, whichever thread
@@ -572,7 +509,7 @@ impl DaemonPane {
         let pty_size = pty_size(size);
 
         let pair = native_pty_system().openpty(pty_size)?;
-        let spawn = build_spawn_config(id, cwd, shell)?;
+        let spawn = build_spawn_config(cwd, shell)?;
 
         let child = pair.slave.spawn_command(spawn.cmd)?;
         let shell_pid = child.process_id();
@@ -606,15 +543,18 @@ impl DaemonPane {
 
         let pane = Arc::new(Self {
             id,
-            master: master.clone(),
+            backend: PaneBackend::Pty(PtyBackend {
+                master: master.clone(),
+                child: Mutex::new(child),
+                shell_pid,
+                integration_dir: spawn.integration_dir,
+            }),
             writer: Mutex::new(writer),
-            child: Mutex::new(child),
-            shell_pid,
-            integration_dir: spawn.integration_dir,
             shutting_down: shutting_down.clone(),
             gate: gate.clone(),
             state: state.clone(),
             reader: Mutex::new(None),
+            broker: None,
         });
 
         // Both the reader's EOF and (on Windows) the child-exit monitor report a
@@ -651,6 +591,134 @@ impl DaemonPane {
         *pane.reader.lock().unwrap() = Some(reader);
 
         Ok(pane)
+    }
+
+    /// Spawn a native-SSH pane: a russh shell channel bridged into the *same*
+    /// reader/ring/gate/sniffer pipeline as a PTY pane. Returns immediately; the
+    /// connect → auth → shell sequence runs on the SSH engine's runtime and drives
+    /// this pane through the bridge. Auth/host-key prompts and progress ride this
+    /// pane's own connection via the prompt broker; a failed connect surfaces as a
+    /// normal `Exited` (the driver drops its data sender, EOFing the reader).
+    pub fn spawn_native_ssh(
+        id: u64,
+        size: WinSize,
+        spec: Box<NativeSshSpec>,
+        on_dead: impl FnOnce() + Send + 'static,
+    ) -> anyhow::Result<Arc<Self>> {
+        // The async↔blocking bridge: blocking reader/writer for the daemon threads,
+        // plus the async ends the channel driver takes.
+        let bridge = crate::daemon::ssh::session::make_bridge();
+        let reader_handle: Box<dyn Read + Send> = Box::new(bridge.reader);
+        let writer: Box<dyn Write + Send> = Box::new(bridge.writer);
+        // The connect task fills this once authenticated; the pane exposes it to
+        // WS4/WS5 via `ssh_connection()`.
+        let connection: crate::daemon::ssh::SharedConnection = Arc::new(Mutex::new(Weak::new()));
+
+        // The remote context the GUI reads to label this as a native-SSH pane.
+        // Forwarding/SFTP reach the connection through the in-memory registry.
+        let target = spec
+            .display_name
+            .clone()
+            .unwrap_or_else(|| format!("{}@{}", spec.user, spec.host));
+        let remote = RemoteContext {
+            kind: RemoteKind::NativeSsh,
+            argv: Vec::new(),
+            target,
+        };
+
+        let state = Arc::new(Mutex::new(PaneState {
+            ring: VecDeque::new(),
+            subscriber: None,
+            subscriber_epoch: 0,
+            // The remote cwd is unknown until the remote shell's OSC 7 arrives.
+            cwd: None,
+            shell: ShellState::default(),
+            remote: Some(remote),
+            size,
+            alive: true,
+        }));
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(OutputGate::new());
+
+        // The prompt broker emits `AuthPrompt`/`SshStatus` frames to whatever
+        // client is currently subscribed to this pane, and returns whether a
+        // subscriber was present (so a prompt can wait for the attach to land).
+        let broker = {
+            let state = state.clone();
+            crate::daemon::ssh::PromptBroker::new(Box::new(move |msg: DaemonMsg| {
+                match &state.lock().unwrap().subscriber {
+                    Some(sub) => sub.send(msg).is_ok(),
+                    None => false,
+                }
+            }))
+        };
+
+        let pane = Arc::new(Self {
+            id,
+            backend: PaneBackend::NativeSsh(NativeSshBackend {
+                handle: bridge.handle,
+                connection: connection.clone(),
+            }),
+            writer: Mutex::new(writer),
+            shutting_down: shutting_down.clone(),
+            gate: gate.clone(),
+            state: state.clone(),
+            reader: Mutex::new(None),
+            broker: Some(broker.clone()),
+        });
+
+        let death = Arc::new(DeathReporter::new(on_dead));
+
+        // A remote session has no local PTY foreground process group, so both
+        // gate closures answer "nothing local": OSC 133 marks from the remote
+        // shell are trusted verbatim (correct — the remote shell *is* the session),
+        // and no process-table SSH detection runs (this pane already *is* SSH).
+        let reader = Self::spawn_reader(
+            state,
+            shutting_down,
+            gate,
+            reader_handle,
+            || false,
+            || None,
+            death,
+        );
+        *pane.reader.lock().unwrap() = Some(reader);
+
+        // Kick off the connection on the SSH engine's runtime.
+        crate::daemon::ssh::SshManager::global().spawn_native_session(
+            id,
+            spec,
+            size,
+            broker,
+            bridge.data_tx,
+            bridge.cmd_rx,
+            connection,
+        );
+
+        Ok(pane)
+    }
+
+    /// Deliver a GUI `AuthResponse` to a native-SSH pane's pending auth prompt.
+    /// A no-op for PTY panes (no broker).
+    pub fn deliver_auth_response(&self, request_id: u64, response: AuthResponse) {
+        if let Some(broker) = &self.broker {
+            broker.deliver(request_id, response);
+        }
+    }
+
+    /// The shared russh connection behind a native-SSH pane, if any — the seam WS4
+    /// (port-forwards) and WS5 (SFTP) use to open further channels on the pane's
+    /// existing connection (`open_direct_tcpip` / `open_session_channel`). Returns
+    /// `None` for a PTY pane, or for a native pane that hasn't finished
+    /// authenticating (or whose connection has since dropped). Upgraded from a
+    /// `Weak`, so holding the returned `Arc` keeps the connection alive only for as
+    /// long as the caller needs it.
+    #[allow(dead_code)] // seam consumed by WS4 (forwards) / WS5 (SFTP)
+    pub fn ssh_connection(&self) -> Option<Arc<crate::daemon::ssh::SshConnection>> {
+        match &self.backend {
+            PaneBackend::NativeSsh(b) => b.connection.lock().unwrap().upgrade(),
+            PaneBackend::Pty(_) => None,
+        }
     }
 
     /// Reader thread: blocking-reads PTY bytes and, for each chunk, (a) appends to
@@ -755,12 +823,15 @@ impl DaemonPane {
                             let remote = if std::time::Instant::now() >= next_remote_check {
                                 next_remote_check =
                                     std::time::Instant::now() + REMOTE_CONTEXT_POLL_INTERVAL;
+                                // A native-SSH pane already carries its own remote
+                                // context; process-table detection must not clobber
+                                // it (this pane *is* SSH). Only a plain PTY pane gets
+                                // foreground `ssh` detection.
                                 let managed = {
                                     let st = state.lock().unwrap();
                                     st.remote
                                         .as_ref()
-                                        .and_then(|remote| remote.control_path.as_ref())
-                                        .is_some()
+                                        .is_some_and(|remote| remote.kind == RemoteKind::NativeSsh)
                                 };
                                 (!managed).then(&foreground_remote)
                             } else {
@@ -864,15 +935,31 @@ impl DaemonPane {
         }
     }
 
-    /// Resize the PTY so the child gets a `SIGWINCH` (Unix) / console resize
-    /// (Windows). The daemon holds no grid to resize. Records the new size so a
-    /// later placeholder re-attach can preserve it.
+    /// The local-PTY backend, or `None` for a native-SSH pane. PTY-only
+    /// operations (resize via master, signal groups, foreground proc queries)
+    /// short-circuit when this is `None`.
+    fn pty(&self) -> Option<&PtyBackend> {
+        match &self.backend {
+            PaneBackend::Pty(p) => Some(p),
+            PaneBackend::NativeSsh(_) => None,
+        }
+    }
+
+    /// Resize the byte source: a PTY gets `SIGWINCH` (Unix) / console resize
+    /// (Windows); a native-SSH channel gets a `window-change` request. The daemon
+    /// holds no grid to resize. Records the new size so a later placeholder
+    /// re-attach can preserve it.
     pub fn resize(&self, size: WinSize) {
         self.state.lock().unwrap().size = size;
-        // A failure just means the pty is gone, which the reader will observe as
-        // EOF; `MasterPty::resize` itself takes `&self`.
-        if let Ok(master) = self.master.lock() {
-            let _ = master.resize(pty_size(size));
+        match &self.backend {
+            // A failure just means the pty is gone, which the reader will observe
+            // as EOF; `MasterPty::resize` itself takes `&self`.
+            PaneBackend::Pty(p) => {
+                if let Ok(master) = p.master.lock() {
+                    let _ = master.resize(pty_size(size));
+                }
+            }
+            PaneBackend::NativeSsh(b) => b.handle.resize(size),
         }
     }
 
@@ -917,24 +1004,35 @@ impl DaemonPane {
     /// Idempotent — safe to call from `kill()` and again from `Drop`.
     fn hangup(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
-        // Graceful hangup of the whole group first (lets a shell run EXIT traps).
-        #[cfg(unix)]
-        self.signal_group(libc::SIGHUP);
-        // Windows has no process group to signal: `portable-pty`'s `kill` below
-        // terminates only the shell process, so capture and kill its descendant
-        // tree *first*, while their parent links still point at the (still-live)
-        // shell. Otherwise those children reparent and linger — some still attached
-        // to the ConPTY, which would keep the reader's blocking read from EOFing.
-        #[cfg(windows)]
-        self.kill_descendants();
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
+        match &self.backend {
+            PaneBackend::Pty(p) => {
+                // Graceful hangup of the whole group first (lets a shell run EXIT traps).
+                #[cfg(unix)]
+                Self::signal_group(p, libc::SIGHUP);
+                // Windows has no process group to signal: `portable-pty`'s `kill`
+                // below terminates only the shell process, so capture and kill its
+                // descendant tree *first*, while their parent links still point at
+                // the (still-live) shell. Otherwise those children reparent and
+                // linger — some still attached to the ConPTY, which would keep the
+                // reader's blocking read from EOFing.
+                #[cfg(windows)]
+                Self::kill_descendants(p);
+                if let Ok(mut child) = p.child.lock() {
+                    let _ = child.kill();
+                }
+                // Force-kill anything in the group that ignored/outlived the hangup
+                // (a foreground job in its own process group, a `trap '' HUP`
+                // child): without this they keep the slave PTY open and the reader
+                // thread never EOFs.
+                #[cfg(unix)]
+                Self::signal_group(p, libc::SIGKILL);
+            }
+            // A native-SSH pane has no local child/pgid: closing the channel ends
+            // the driver, which drops its data sender and EOFs the reader — the
+            // same teardown a PTY hangup produces. `shutting_down` (set above) makes
+            // that EOF a silent teardown, not a spurious `Exited`.
+            PaneBackend::NativeSsh(b) => b.handle.close(),
         }
-        // Force-kill anything in the group that ignored/outlived the hangup (a
-        // foreground job in its own process group, a `trap '' HUP` child): without
-        // this they keep the slave PTY open and the reader thread never EOFs.
-        #[cfg(unix)]
-        self.signal_group(libc::SIGKILL);
     }
 
     /// Terminate every descendant of the shell (children, grandchildren, …). The
@@ -942,8 +1040,8 @@ impl DaemonPane {
     /// ConPTY's own teardown doesn't. Best effort — a snapshot failure or an
     /// already-exited process just means nothing to do.
     #[cfg(windows)]
-    fn kill_descendants(&self) {
-        if let Some(pid) = self.shell_pid {
+    fn kill_descendants(pty: &PtyBackend) {
+        if let Some(pid) = pty.shell_pid {
             let procs = crate::daemon::winproc::snapshot();
             for target in crate::daemon::winproc::descendants(&procs, pid) {
                 crate::daemon::winproc::terminate(target);
@@ -1014,21 +1112,21 @@ impl DaemonPane {
     /// inherited the slave PTY; signalling the bare pid (what `child.kill()` does)
     /// leaves them holding it open and wedges the reader.
     #[cfg(unix)]
-    fn signal_group(&self, sig: libc::c_int) {
+    fn signal_group(pty: &PtyBackend, sig: libc::c_int) {
         // SAFETY: `killpg` only posts a signal to a process group; a nonexistent or
         // already-dead group returns `ESRCH`, which we intentionally ignore.
-        if let Some(pid) = self.shell_pid {
+        if let Some(pid) = pty.shell_pid {
             unsafe {
                 libc::killpg(pid as libc::pid_t, sig);
             }
         }
-        let fg = self
+        let fg = pty
             .master
             .lock()
             .ok()
             .and_then(|m| m.process_group_leader());
         if let Some(fg) = fg {
-            if Some(fg as u32) != self.shell_pid {
+            if Some(fg as u32) != pty.shell_pid {
                 unsafe {
                     libc::killpg(fg, sig);
                 }
@@ -1042,6 +1140,7 @@ impl DaemonPane {
     fn foreground_cwd(&self) -> Option<PathBuf> {
         use std::ffi::CStr;
 
+        let pty = self.pty()?;
         let read_cwd = |pid: i32| -> Option<PathBuf> {
             if pid <= 0 {
                 return None;
@@ -1074,32 +1173,33 @@ impl DaemonPane {
             }
         };
 
-        let pgid = self
+        let pgid = pty
             .master
             .lock()
             .ok()
             .and_then(|m| m.process_group_leader());
         pgid.and_then(read_cwd)
-            .or_else(|| read_cwd(self.shell_pid.map(|p| p as i32).unwrap_or(0)))
+            .or_else(|| read_cwd(pty.shell_pid.map(|p| p as i32).unwrap_or(0)))
     }
 
     /// Best-effort foreground cwd via `/proc/<pid>/cwd` (Linux), preferring the
     /// PTY's foreground process group over the shell pid.
     #[cfg(target_os = "linux")]
     fn foreground_cwd(&self) -> Option<PathBuf> {
+        let pty = self.pty()?;
         let read_cwd = |pid: i32| -> Option<PathBuf> {
             if pid <= 0 {
                 return None;
             }
             std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
         };
-        let pgid = self
+        let pgid = pty
             .master
             .lock()
             .ok()
             .and_then(|m| m.process_group_leader());
         pgid.and_then(read_cwd)
-            .or_else(|| read_cwd(self.shell_pid.map(|p| p as i32).unwrap_or(0)))
+            .or_else(|| read_cwd(pty.shell_pid.map(|p| p as i32).unwrap_or(0)))
     }
 
     /// Other platforms: no proc-query fallback (cwd only known via OSC 7).
@@ -1118,7 +1218,10 @@ impl DaemonPane {
     /// pane title (macOS/Linux).
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn foreground_title(&self) -> String {
-        self.master
+        let Some(pty) = self.pty() else {
+            return String::new();
+        };
+        pty.master
             .lock()
             .ok()
             .and_then(|m| m.process_group_leader())
@@ -1133,7 +1236,10 @@ impl DaemonPane {
     /// existing title in place.
     #[cfg(windows)]
     fn foreground_title(&self) -> String {
-        let Some(pid) = self.shell_pid else {
+        let Some(pty) = self.pty() else {
+            return String::new();
+        };
+        let Some(pid) = pty.shell_pid else {
             return String::new();
         };
         let procs = crate::daemon::winproc::snapshot();
@@ -1145,20 +1251,37 @@ impl DaemonPane {
         String::new()
     }
 
+    /// Process-table SSH detection over the local PTY's foreground command. A
+    /// native-SSH pane has no local process to inspect (it already carries its own
+    /// `RemoteContext`), so this is `None` there.
     fn foreground_remote_context(&self) -> Option<RemoteContext> {
-        foreground_remote_context(&self.master)
+        match &self.backend {
+            PaneBackend::Pty(p) => foreground_remote_context(&p.master),
+            PaneBackend::NativeSsh(_) => None,
+        }
     }
 }
 
 impl Drop for DaemonPane {
     fn drop(&mut self) {
-        // Hang up the child and its whole process group (SIGHUP → SIGKILL) so every
-        // descendant holding the slave PTY dies and the reader's `read()` can EOF.
+        // A native-SSH pane's managed forwards (WS4) are attributed to this pane;
+        // tear them down as the pane dies so listeners close and remote bindings are
+        // cancelled — the FR-C2 blast radius when a shared connection drops takes
+        // every pane through here. Detached, so it never blocks this connection
+        // thread.
+        if matches!(self.backend, PaneBackend::NativeSsh(_)) {
+            crate::daemon::ssh::SshManager::global().teardown_pane_forwards(self.id);
+        }
+        // Hang up the byte source: SIGHUP → SIGKILL for a PTY child + its group, or
+        // channel close for a native-SSH session — so the reader's `read()` can EOF.
         self.hangup();
         // Reap the (now SIGKILLed) shell so it isn't left a zombie. It can't block
         // on a live process: SIGKILL can't be caught, so the shell is dead/dying.
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.wait();
+        // A native-SSH pane has no local child to reap.
+        if let PaneBackend::Pty(p) = &self.backend {
+            if let Ok(mut child) = p.child.lock() {
+                let _ = child.wait();
+            }
         }
         // Join the reader, but *bounded*. Normally the group-kill above closed the
         // slave and the reader EOFed at once, so this returns immediately. But a
@@ -1170,8 +1293,10 @@ impl Drop for DaemonPane {
         if let Some(handle) = self.reader.lock().unwrap().take() {
             join_bounded(handle, Duration::from_secs(2));
         }
-        if let Some(dir) = self.integration_dir.take() {
-            let _ = std::fs::remove_dir_all(&dir);
+        if let PaneBackend::Pty(p) = &mut self.backend {
+            if let Some(dir) = p.integration_dir.take() {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
     }
 }
@@ -1584,7 +1709,6 @@ mod tests {
         let over = ShellSpec {
             program: "fish".into(),
             args: vec!["-l".into()],
-            ssh: None,
         };
         let cfg = ("zsh".to_string(), vec!["-i".to_string()]);
 
@@ -1597,42 +1721,6 @@ mod tests {
         assert_eq!(choose_shell(None, Some(cfg.clone())), Some(cfg));
         // Neither → platform default.
         assert_eq!(choose_shell(None, None), None);
-    }
-
-    #[test]
-    fn managed_ssh_command_uses_control_master_without_persisting() {
-        let ssh = SshSpec {
-            target: "dev".into(),
-            args: vec!["-p".into(), "2222".into()],
-        };
-        let cmd = build_managed_ssh_command(
-            "ssh",
-            &ssh,
-            std::path::Path::new("/tmp/tty7-ssh.sock"),
-            &None,
-        )
-        .unwrap();
-        let argv: Vec<_> = cmd
-            .get_argv()
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            argv,
-            vec![
-                "ssh",
-                "-tt",
-                "-o",
-                "ControlMaster=yes",
-                "-o",
-                "ControlPersist=no",
-                "-o",
-                "ControlPath=/tmp/tty7-ssh.sock",
-                "-p",
-                "2222",
-                "dev",
-            ]
-        );
     }
 
     #[test]

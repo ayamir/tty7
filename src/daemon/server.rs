@@ -24,7 +24,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
 use crate::daemon::pane::DaemonPane;
-use crate::daemon::protocol::{ClientMsg, DaemonMsg};
+use crate::daemon::protocol::{ClientMsg, DaemonMsg, RemoteKind};
+use crate::daemon::ssh::SshConnection;
 use crate::daemon::transport::{self, Stream};
 
 /// Shared pane registry: id → pane, plus a monotonic id source.
@@ -84,6 +85,22 @@ impl Registry {
             .map(|p| p.info())
             .collect()
     }
+}
+
+/// Resolve a pane id to its live native-SSH connection, for the SFTP control
+/// handlers. Errors (as a client-facing string) when the pane is unknown or isn't
+/// a native-SSH pane with an established connection (a PTY / compat-`ssh` pane, or
+/// one still authenticating).
+fn ssh_connection_for(
+    registry: &Registry,
+    pane_id: u64,
+) -> Result<Arc<crate::daemon::ssh::SshConnection>, String> {
+    let pane = registry
+        .get(pane_id)
+        .ok_or_else(|| format!("no such pane {pane_id}"))?;
+    pane.ssh_connection().ok_or_else(|| {
+        "pane has no native SSH connection (SFTP needs a native-SSH pane)".to_string()
+    })
 }
 
 /// Run the daemon: bind the socket and serve connections forever. Returns `Err`
@@ -258,6 +275,40 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
             stream_pane(pane, id, read_stream, write_stream, registry)
         }
 
+        ClientMsg::SpawnNativeSsh { cwd: _, size, spec } => {
+            // A native russh-backed pane. Same lifecycle as `Spawn` (allocate,
+            // reclaim-on-detached-death, reply `Spawned`, attach, stream); the pane
+            // spawns fast and the connect/auth runs asynchronously, sending
+            // `AuthPrompt`/`SshStatus` over this same connection.
+            let id = registry.alloc_id();
+            let on_dead = {
+                let registry = registry.clone();
+                move || {
+                    std::thread::Builder::new()
+                        .name("tty7-daemon-pane-reap".to_string())
+                        .spawn(move || {
+                            registry.remove(id);
+                        })
+                        .ok();
+                }
+            };
+            let pane = match DaemonPane::spawn_native_ssh(id, size, spec, on_dead) {
+                Ok(p) => p,
+                Err(e) => {
+                    let mut w = write_stream;
+                    let _ =
+                        DaemonMsg::Error(format!("native ssh spawn failed: {e}")).encode(&mut w);
+                    return Err(e);
+                }
+            };
+            registry.insert(pane.clone());
+            {
+                let mut w = &write_stream;
+                DaemonMsg::Spawned { pane_id: id }.encode(&mut w)?;
+            }
+            stream_pane(pane, id, read_stream, write_stream, registry)
+        }
+
         // The attach `size` is the client's pre-layout placeholder and is
         // deliberately ignored: the daemon reports the recorded geometry via
         // `DaemonMsg::Size` for the replay, and the client sends a real
@@ -309,16 +360,28 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
                 return Ok(());
             };
             let Some(remote) = pane.remote_context() else {
-                DaemonMsg::Error("pane has no managed ssh remote context".to_string())
-                    .encode(&mut w)?;
+                DaemonMsg::Error("pane has no ssh remote context".to_string()).encode(&mut w)?;
                 return Ok(());
             };
-            match crate::daemon::forward::ForwardManager::global().ensure(
-                req.pane_id,
-                &remote,
-                &req.remote_host,
-                req.remote_port,
-            ) {
+            // A loopback forward (FR-F4) is a Local `direct-tcpip` on the pane's
+            // russh connection — native-SSH panes only.
+            let result = if remote.kind == RemoteKind::NativeSsh {
+                match pane.ssh_connection() {
+                    Some(conn) => crate::daemon::ssh::SshManager::global()
+                        .ensure_loopback_forward(
+                            req.pane_id,
+                            conn,
+                            &remote.target,
+                            &req.remote_host,
+                            req.remote_port,
+                        )
+                        .map_err(|e| e.to_string()),
+                    None => Err("native ssh connection is not ready".to_string()),
+                }
+            } else {
+                Err("pane is not a native ssh session".to_string())
+            };
+            match result {
                 Ok(forward) => DaemonMsg::LoopbackForward(forward).encode(&mut w)?,
                 Err(e) => DaemonMsg::Error(format!("forward failed: {e}")).encode(&mut w)?,
             }
@@ -327,16 +390,119 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
 
         ClientMsg::ListLoopbackForwards => {
             let mut w = write_stream;
-            let list = crate::daemon::forward::ForwardManager::global().list();
+            let list = crate::daemon::ssh::SshManager::global().list_loopback_forwards();
             DaemonMsg::LoopbackForwardList(list).encode(&mut w)?;
             Ok(())
         }
 
         ClientMsg::CloseLoopbackForward(id) => {
             let mut w = write_stream;
-            crate::daemon::forward::ForwardManager::global().close(&id);
-            let list = crate::daemon::forward::ForwardManager::global().list();
+            crate::daemon::ssh::SshManager::global().close_loopback_forward(&id);
+            let list = crate::daemon::ssh::SshManager::global().list_loopback_forwards();
             DaemonMsg::LoopbackForwardList(list).encode(&mut w)?;
+            Ok(())
+        }
+
+        ClientMsg::ListKnownHosts => {
+            let mut w = write_stream;
+            let list = crate::daemon::ssh::known_hosts::list();
+            DaemonMsg::KnownHostsList(list).encode(&mut w)?;
+            Ok(())
+        }
+
+        ClientMsg::DeleteKnownHost(id) => {
+            let mut w = write_stream;
+            // Best effort: a delete failure still returns the (unchanged) list so
+            // the UI reflects reality rather than hanging.
+            let _ = crate::daemon::ssh::known_hosts::delete(&id);
+            let list = crate::daemon::ssh::known_hosts::list();
+            DaemonMsg::KnownHostsList(list).encode(&mut w)?;
+            Ok(())
+        }
+
+        ClientMsg::SftpList { pane_id, path } => {
+            let mut w = write_stream;
+            match ssh_connection_for(&registry, pane_id) {
+                Ok(conn) => {
+                    match crate::daemon::ssh::sftp::SftpManager::global().list(&conn, &path) {
+                        Ok(entries) => DaemonMsg::SftpEntries(entries).encode(&mut w)?,
+                        Err(e) => DaemonMsg::Error(e).encode(&mut w)?,
+                    }
+                }
+                Err(e) => DaemonMsg::Error(e).encode(&mut w)?,
+            }
+            Ok(())
+        }
+
+        ClientMsg::AddForward { pane_id, rule } => {
+            let mut w = write_stream;
+            match forward_pane_connection(&registry, pane_id) {
+                Ok(conn) => {
+                    let list =
+                        crate::daemon::ssh::SshManager::global().add_forward(pane_id, conn, &rule);
+                    DaemonMsg::ForwardList(list).encode(&mut w)?;
+                }
+                Err(e) => DaemonMsg::Error(e).encode(&mut w)?,
+            }
+            Ok(())
+        }
+
+        ClientMsg::SftpOp { pane_id, op } => {
+            let mut w = write_stream;
+            match ssh_connection_for(&registry, pane_id) {
+                Ok(conn) => {
+                    let result = crate::daemon::ssh::sftp::SftpManager::global().op(&conn, &op);
+                    DaemonMsg::SftpOpResult(result).encode(&mut w)?;
+                }
+                Err(e) => DaemonMsg::Error(e).encode(&mut w)?,
+            }
+            Ok(())
+        }
+
+        ClientMsg::SftpTransferStart(spec) => {
+            let mut w = write_stream;
+            match ssh_connection_for(&registry, spec.pane_id) {
+                Ok(conn) => {
+                    match crate::daemon::ssh::sftp::SftpManager::global()
+                        .start_transfer(&conn, spec)
+                    {
+                        Ok(job_id) => DaemonMsg::SftpTransferStarted { job_id }.encode(&mut w)?,
+                        Err(e) => DaemonMsg::Error(e).encode(&mut w)?,
+                    }
+                }
+                Err(e) => DaemonMsg::Error(e).encode(&mut w)?,
+            }
+            Ok(())
+        }
+
+        ClientMsg::SftpTransferCancel { job_id } => {
+            let mut w = write_stream;
+            let jobs = crate::daemon::ssh::sftp::SftpManager::global().cancel(job_id);
+            DaemonMsg::SftpTransferProgress(jobs).encode(&mut w)?;
+            Ok(())
+        }
+
+        ClientMsg::SftpTransferList { pane_id } => {
+            let mut w = write_stream;
+            let jobs = crate::daemon::ssh::sftp::SftpManager::global().list_jobs(pane_id);
+            DaemonMsg::SftpTransferProgress(jobs).encode(&mut w)?;
+            Ok(())
+        }
+
+        ClientMsg::RemoveForward {
+            pane_id,
+            forward_id,
+        } => {
+            let mut w = write_stream;
+            let list = crate::daemon::ssh::SshManager::global().remove_forward(pane_id, forward_id);
+            DaemonMsg::ForwardList(list).encode(&mut w)?;
+            Ok(())
+        }
+
+        ClientMsg::ListForwards { pane_id } => {
+            let mut w = write_stream;
+            let list = crate::daemon::ssh::SshManager::global().list_forwards(pane_id);
+            DaemonMsg::ForwardList(list).encode(&mut w)?;
             Ok(())
         }
 
@@ -347,6 +513,20 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Resolve a pane to its live native-SSH connection for a managed-forward request,
+/// or a human-readable reason it can't (wrong pane, PTY/compat pane, or a
+/// still-authenticating / dropped connection).
+fn forward_pane_connection(
+    registry: &Registry,
+    pane_id: u64,
+) -> Result<Arc<SshConnection>, String> {
+    let pane = registry
+        .get(pane_id)
+        .ok_or_else(|| format!("no such pane {pane_id}"))?;
+    pane.ssh_connection()
+        .ok_or_else(|| "pane is not a ready native-ssh session".to_string())
 }
 
 /// `Attach` path: subscribe the connection to an existing pane (sending the
@@ -407,6 +587,12 @@ fn run_stream(
         match ClientMsg::read(&mut read_stream) {
             Ok(ClientMsg::Input(bytes)) => pane.write_input(&bytes),
             Ok(ClientMsg::Resize(size)) => pane.resize(size),
+            // The GUI's reply to a native-SSH auth/host-key prompt; route it to the
+            // pane's prompt broker (a no-op for non-native panes).
+            Ok(ClientMsg::AuthResponse {
+                request_id,
+                response,
+            }) => pane.deliver_auth_response(request_id, response),
             Ok(ClientMsg::Detach) => break,
             Ok(ClientMsg::Kill { pane_id }) => {
                 // Honor a kill for *this* pane; for another id, just remove+kill it

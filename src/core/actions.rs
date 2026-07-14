@@ -57,6 +57,12 @@ actions!(
         ToggleTabSidebar,
         OpenSettings,
         RestartDaemon,
+        // Toggle the SFTP file panel for the focused native-SSH pane (WS5).
+        ToggleSftp,
+        // Open the SSH profile manager/editor full-window page (WS6, FR-P1).
+        OpenSshProfiles,
+        // Reconnect a dead native-SSH pane in place (WS6, FR-E4).
+        RestartSshSession,
         SendTab,
         SendBackTab,
         Quit

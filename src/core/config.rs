@@ -168,6 +168,70 @@ pub struct Config {
     /// key/value editor is a future addition.
     #[serde(default)]
     pub env: HashMap<String, String>,
+
+    // ── SSH connection manager ───────────────────────────────────────────────
+    /// Saved SSH connection profiles (the connection-manager data layer). Secrets
+    /// never live here — a profile only carries a `credential_ref` naming its OS
+    /// keychain entry (see [`crate::core::keychain`]). This is distinct from the
+    /// live `ssh_config` alias *discovery* in [`crate::core::ssh_config`]: these
+    /// are user-owned, editable profiles that can be imported from `~/.ssh/config`.
+    #[serde(default)]
+    pub ssh_profiles: Vec<crate::core::ssh_profile::SshProfile>,
+    /// Global default for verifying SSH host keys against `known_hosts` on the
+    /// native (russh) path. On by default (never weaken security silently). A
+    /// per-profile `verify_host_keys` override wins over this when set; this is
+    /// the fallback when a profile leaves it unset and for QuickConnect. Turning
+    /// it off disables unknown/changed-host-key confirmation entirely — a
+    /// deliberate, documented escape hatch (PRD FR-S4).
+    #[serde(default = "default_true")]
+    pub verify_host_keys: bool,
+    /// Global default for the "confirm before closing a live SSH session"
+    /// prompt (PRD FR-E3). Off by default (closing is unsurprising for most
+    /// panes). A per-profile `warn_on_close: Some(true/false)` override wins over
+    /// this when set; this is the fallback for profiles that leave it unset and
+    /// for QuickConnect panes.
+    #[serde(default)]
+    pub ssh_warn_on_close: bool,
+    /// Per-profile usage stats driving the palette's frecency ordering (PRD
+    /// FR-P3): a saved profile's id → how many times it was connected and when it
+    /// was last used. Bumped on every connect; read to rank the palette's profile
+    /// rows. Entries for deleted profiles are harmless (never surfaced).
+    #[serde(default)]
+    pub ssh_profile_frecency: HashMap<uuid::Uuid, ProfileUsage>,
+}
+
+/// One saved profile's usage record for palette frecency (see
+/// [`Config::ssh_profile_frecency`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ProfileUsage {
+    /// Times this profile has been connected.
+    pub count: u32,
+    /// Unix timestamp (seconds) of the most recent connect.
+    pub last_used: u64,
+}
+
+impl ProfileUsage {
+    /// A frecency score combining frequency (how often) with recency (how
+    /// recently), so the palette floats both heavily-used and just-used profiles
+    /// to the top. Recency decays smoothly over days; `now` is unix seconds.
+    pub fn score(&self, now: u64) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        let age_days = now.saturating_sub(self.last_used) as f64 / 86_400.0;
+        // Frequency, discounted by how stale the last use is (halves ~weekly).
+        self.count as f64 / (1.0 + age_days / 7.0)
+    }
+}
+
+/// The current unix time in whole seconds (0 before the epoch, which never
+/// happens). Used to stamp [`ProfileUsage::last_used`].
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Policy for a shell's starting directory (see [`Config::working_directory`]).
@@ -358,6 +422,10 @@ impl Default for Config {
             startup_mode: StartupMode::Normal,
             working_directory: WorkingDirectory::default(),
             env: HashMap::new(),
+            ssh_profiles: Vec::new(),
+            verify_host_keys: true,
+            ssh_warn_on_close: false,
+            ssh_profile_frecency: HashMap::new(),
         }
     }
 }
@@ -619,7 +687,7 @@ pub const MAX_SCROLLBACK: usize = 100_000;
 /// whole `config.json` parse — one bad entry must never reset every other
 /// setting to its default. Missing fields are still handled by the container's
 /// `#[serde(default)]`, which never calls this.
-fn de_lenient<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+pub(crate) fn de_lenient<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::de::DeserializeOwned + Default,
@@ -634,6 +702,53 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_usage_score_ranks_frequency_and_recency() {
+        let now = 100_000_000u64;
+        let day = 86_400u64;
+        // Never-used scores zero.
+        assert_eq!(ProfileUsage::default().score(now), 0.0);
+        // Same recency, more uses ⇒ higher score.
+        let a = ProfileUsage {
+            count: 10,
+            last_used: now,
+        };
+        let b = ProfileUsage {
+            count: 2,
+            last_used: now,
+        };
+        assert!(a.score(now) > b.score(now));
+        // Same count, more recent ⇒ higher score (recency decays with age).
+        let recent = ProfileUsage {
+            count: 3,
+            last_used: now,
+        };
+        let stale = ProfileUsage {
+            count: 3,
+            last_used: now - 30 * day,
+        };
+        assert!(recent.score(now) > stale.score(now));
+    }
+
+    #[test]
+    fn ssh_warn_on_close_and_frecency_round_trip() {
+        let mut cfg = Config::default();
+        assert!(!cfg.ssh_warn_on_close);
+        cfg.ssh_warn_on_close = true;
+        let id = uuid::Uuid::new_v4();
+        cfg.ssh_profile_frecency.insert(
+            id,
+            ProfileUsage {
+                count: 4,
+                last_used: 42,
+            },
+        );
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert!(back.ssh_warn_on_close);
+        assert_eq!(back.ssh_profile_frecency.get(&id).unwrap().count, 4);
+    }
 
     #[test]
     fn font_features_are_optional_and_parse_as_gpui_features() {
@@ -894,7 +1009,8 @@ mod tests {
     #[test]
     fn save_load_and_shell_command_round_trip_through_disk() {
         pin_config_dir();
-        // Persist a config with a non-default shell + font, then read it back.
+        // Persist a config with a non-default shell + font + an SSH profile, then
+        // read it back.
         let mut cfg = Config {
             font_size: 18.0,
             ..Config::default()
@@ -903,6 +1019,15 @@ mod tests {
             program: "fish".to_string(),
             args: vec!["-l".to_string()],
         });
+        let mut profile = crate::core::ssh_profile::SshProfile::new("prod-web");
+        profile.host = "10.0.0.5".to_string();
+        profile.user = "deploy".to_string();
+        profile.port = 2222;
+        profile.auth = crate::core::ssh_profile::AuthMode::PublicKey;
+        profile.credential_ref = Some(crate::core::keychain::CredentialRef::password(
+            "deploy", "10.0.0.5", 2222,
+        ));
+        cfg.ssh_profiles = vec![profile.clone()];
         cfg.save();
 
         let loaded = Config::load();
@@ -911,11 +1036,37 @@ mod tests {
             loaded.shell.as_ref().map(|s| s.program.as_str()),
             Some("fish")
         );
+        // The SSH profile round-trips byte-for-byte, id included, with no plaintext
+        // secret anywhere (only the credential *ref*).
+        assert_eq!(loaded.ssh_profiles, vec![profile]);
 
         // `shell_command` reads the same on-disk config for the daemon side.
         let (program, args) = shell_command().expect("shell override present");
         assert_eq!(program, "fish");
         assert_eq!(args, vec!["-l".to_string()]);
+    }
+
+    #[test]
+    fn ssh_profiles_default_empty_and_parse_from_json() {
+        // Absent key → empty (a config predating profiles still loads).
+        let cfg = Config::default();
+        assert!(cfg.ssh_profiles.is_empty());
+        let cfg: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
+        assert!(cfg.ssh_profiles.is_empty());
+
+        // A present profile array parses; a bad enum value inside one profile falls
+        // back leniently instead of failing the whole config parse.
+        let cfg: Config = serde_json::from_str(
+            r#"{"ssh_profiles":[{"name":"a","host":"h","auth":"bogus","port":2200}]}"#,
+        )
+        .expect("a bad per-profile enum must not fail the whole config parse");
+        assert_eq!(cfg.ssh_profiles.len(), 1);
+        assert_eq!(cfg.ssh_profiles[0].name, "a");
+        assert_eq!(cfg.ssh_profiles[0].port, 2200);
+        assert_eq!(
+            cfg.ssh_profiles[0].auth,
+            crate::core::ssh_profile::AuthMode::Auto
+        );
     }
 
     #[test]
