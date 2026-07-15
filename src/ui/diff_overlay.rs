@@ -19,9 +19,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use gpui::{
-    AnyElement, FocusHandle, FontWeight, KeyDownEvent, Window, div, prelude::*, px,
-};
+use gpui::{AnyElement, FocusHandle, FontWeight, KeyDownEvent, Window, div, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 
@@ -265,14 +263,17 @@ impl Tty7App {
                 })
             })
             // A quiet "refreshing" hint while a re-probe flies over stale data.
-            .when(overlay.loading && matches!(overlay.load, DiffLoad::Ready(_)), |bar| {
-                bar.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("refreshing…"),
-                )
-            })
+            .when(
+                overlay.loading && matches!(overlay.load, DiffLoad::Ready(_)),
+                |bar| {
+                    bar.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("refreshing…"),
+                    )
+                },
+            )
             .child(div().flex_1())
             .child(
                 Button::new("diff-overlay-close")
