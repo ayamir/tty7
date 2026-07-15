@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0-beta.1] - 2026-07-15
+
+### Added
+
+- Per-agent hook integrations (Claude Code, Codex, Copilot CLI, OpenCode,
+  Pi) with install state and actions in Settings → Agents. (#87)
+- CLI coding agents and the git branch are recognized and shown in the
+  sidebar. (#85)
+- Multi-line prompt editor, plus an I-beam mouse pointer over text. (#80)
+- SSH: Unix GSSAPI (Kerberos) authentication. (#81)
+
+### Changed
+
+- Splitting an SSH pane opens another SSH pane on the same host. (#83)
+
+### Fixed
+
+- The grid shifts up when wrapped command input overflows the bottom of
+  the screen, keeping the caret visible. (#86)
+- Each tab keeps its own active pane across tab switches. (#84)
+- The theme panel stays on-screen on narrow windows. (#82)
+
 ## [0.14.0] - 2026-07-14
 
 ### Added
