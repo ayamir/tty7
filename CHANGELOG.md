@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-15
+
+### Added
+
+- **Daemon protocol version handshake** — the GUI asks a running daemon
+  which wire protocol it speaks before reusing it; after an app upgrade a
+  mismatched daemon is kept alive and a prompt offers Keep Sessions or
+  Restart Daemon instead of silently killing every persisted session. (#90)
+
+### Changed
+
+- **Tab close affordance** hides until hover on the active tab too, so the
+  sidebar and tab strip read clean. (#90)
+- **Command palette** no longer offers the Claude-only hook install entry;
+  Settings → Agents owns hook installs with per-agent state.
+
+### Fixed
+
+- **SSH connection state** shows as a corner status dot on the tab avatar
+  (amber connecting, green connected, red failed) in the same semantic
+  colors as agent dots, replacing a theme-grey border ring that read as no
+  state at all. (#90)
+- **Sidebar git branch/diff line** is shared per repository: panes in one
+  work tree read one snapshot refreshed by whichever pane probed last, so
+  rows for the same directory no longer show stale or missing +/− counts.
+  (#90)
+- **Command palette** no longer pins Connect/Save rows above command
+  matches for bare words like `java`; QuickConnect rows require a
+  host-like query (`@`, `:` or `.`). (#90)
+
 ## [0.15.0-beta.1] - 2026-07-15
 
 ### Added
