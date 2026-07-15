@@ -417,12 +417,17 @@ impl RemoteTerminal {
                 // so mixed client/daemon versions keep working.
                 let mut zle_tok = OscTokenizer::new(&[b"133"]);
                 // Bytes read but not yet framed, plus the recorded geometry
-                // waiting for its paired Snapshot: the daemon sends `Size`
-                // immediately followed by the ring replay, and both must apply
-                // under ONE grid lock — with two separate lock scopes, the UI
-                // thread's layout `resize()` could slot in between and the
-                // replay would run at the layout width, mis-wrapping history
-                // (the exact defect the Size frame exists to prevent).
+                // waiting for its paired Snapshot: the attach replay is a
+                // `Size` → `Snapshot` pair per ring segment, and each pair
+                // must apply under ONE grid lock — with two separate lock
+                // scopes, the UI thread's layout `resize()` could slot in
+                // between and that segment would replay at the layout width,
+                // mis-wrapping history (the exact defect the Size frame
+                // exists to prevent). The guarantee is per pair: a layout
+                // resize landing *between* pairs only re-reflows already-
+                // applied history, and the next pair's Size (ultimately the
+                // final pair, which carries the PTY's current geometry)
+                // restores the recorded width before more bytes advance.
                 let mut pending: Vec<u8> = Vec::new();
                 let mut pending_size: Option<WinSize> = None;
                 // Sized to the daemon writer's coalesced-frame cap so one large
@@ -2293,6 +2298,153 @@ mod tests {
             .unwrap();
         daemon_side.flush().unwrap();
         assert!(poll(false), "C (command start) should disarm zle_reading");
+    }
+
+    /// Everything in the grid — screen rows plus scrollback — flattened to one
+    /// string, one row per line, for substring counting in the replay test.
+    fn full_dump(term: &RemoteTerminal) -> String {
+        use alacritty_terminal::grid::Dimensions as _;
+        let t = term.term.lock();
+        let grid = t.grid();
+        let mut out = String::new();
+        for l in -(grid.history_size() as i32)..grid.screen_lines() as i32 {
+            for c in 0..grid.columns() {
+                out.push(
+                    grid[alacritty_terminal::index::Line(l)][alacritty_terminal::index::Column(c)]
+                        .c,
+                );
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// One Claude-Code/ink-style redraw: return to the frame's first row with
+    /// CR + cursor-up, erase below, reprint every line. `prev_rows` is the row
+    /// count the *app* believes the previous frame occupied — correct only if
+    /// the terminal wrapped it at the width the app rendered for.
+    fn tui_frame(lines: &[String], prev_rows: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        if prev_rows > 1 {
+            b.extend_from_slice(format!("\r\x1b[{}A\x1b[J", prev_rows - 1).as_bytes());
+        }
+        b.extend_from_slice(lines.join("\r\n").as_bytes());
+        b
+    }
+
+    /// Regression for the "Claude Code output duplicated all over scrollback
+    /// after restart" bug. The daemon's replay ring is raw bytes; a TUI's
+    /// cursor-up redraws only replay cleanly at the width they were rendered
+    /// for. The daemon therefore segments the ring by geometry and attach
+    /// replays a `Size` → `Snapshot` pair per segment (see
+    /// `daemon/pane.rs::ReplayRing`) — this test drives the reader with
+    /// exactly that frame sequence and asserts the replay reproduces the live
+    /// rendering, no duplication. The final leg replays the same bytes the
+    /// pre-segmentation way (one Snapshot at the final width) and shows the
+    /// duplication, pinning that the segmented path is what prevents it.
+    #[test]
+    fn segmented_ring_replay_reproduces_live_rendering() {
+        const MARK: &str = "DUPMARK";
+        // 10 logical lines of 90 chars: one row on a 100-col grid, two on 80.
+        let frame_lines = |f: usize| -> Vec<String> {
+            (0..10)
+                .map(|i| format!("{MARK} f{f:02} l{i:02} {:.<74}", ""))
+                .collect()
+        };
+        // The app renders 8 frames believing each line is one row (true at the
+        // 100-col width it was written for).
+        let mut history = Vec::new();
+        for f in 0..8 {
+            history.extend(tui_frame(&frame_lines(f), if f == 0 { 0 } else { 10 }));
+        }
+
+        let wait_for = |term: &RemoteTerminal, needle: &str| -> String {
+            let mut dump = String::new();
+            for _ in 0..400 {
+                dump = full_dump(term);
+                if dump.contains(needle) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            dump
+        };
+        let ws = |cols: u16| WinSize {
+            cols,
+            rows: 24,
+            cell_w: 8,
+            cell_h: 17,
+        };
+
+        // Live: the bytes stream into a 100-col grid as PTY output, then the
+        // pane shrinks to 80 (reflow) — the sequence the ring recorded.
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let mut live = RemoteTerminal::from_stream(client_side, TermSize::new(100, 24)).unwrap();
+        DaemonMsg::Output(history.clone())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        let dump = wait_for(&live, "f07 l09");
+        assert!(dump.contains("f07 l09"), "live output should have landed");
+        live.resize(TermSize::new(80, 24), 8, 17);
+        let live_count = full_dump(&live).matches(MARK).count();
+        assert_eq!(
+            live_count, 10,
+            "live rendering is clean: each redraw erases the previous frame, \
+             so exactly one 10-line copy survives the resize"
+        );
+
+        // Attach replay, as the daemon now sends it: the 100-col segment at
+        // its recorded width, then the (empty) post-resize segment's pair
+        // ending the grid at the current 80 cols.
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let replay = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        DaemonMsg::Size(ws(100)).encode(&mut daemon_side).unwrap();
+        DaemonMsg::Snapshot(history.clone())
+            .encode(&mut daemon_side)
+            .unwrap();
+        DaemonMsg::Size(ws(80)).encode(&mut daemon_side).unwrap();
+        DaemonMsg::Snapshot(Vec::new())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        let dump = wait_for(&replay, "f07 l09");
+        {
+            use alacritty_terminal::grid::Dimensions as _;
+            let mut cols = 0;
+            for _ in 0..400 {
+                cols = replay.term.lock().columns();
+                if cols == 80 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(cols, 80, "the trailing pair must end the grid at 80 cols");
+        }
+        let replay_count = dump.matches(MARK).count();
+        assert_eq!(
+            replay_count, live_count,
+            "the segmented replay must reproduce the live rendering exactly"
+        );
+
+        // Contrast (and guard that the markers actually exercise the wrap
+        // hazard): the pre-segmentation replay — everything in one Snapshot at
+        // the final 80-col width — mis-wraps the frames, the redraws land
+        // mid-frame, and stale copies flood scrollback.
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let flat = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        DaemonMsg::Size(ws(80)).encode(&mut daemon_side).unwrap();
+        DaemonMsg::Snapshot(history)
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        let dump = wait_for(&flat, "f07 l09");
+        let flat_count = dump.matches(MARK).count();
+        assert!(
+            flat_count > live_count,
+            "flat replay at the final width should duplicate (got {flat_count}); \
+             if it stopped, the segmented path may no longer be exercising anything"
+        );
     }
 }
 
