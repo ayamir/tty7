@@ -2488,8 +2488,9 @@ impl TerminalView {
                 // Landing through `update_global` wakes the sidebar's
                 // `observe_global`, so every pane in the repo repaints — not
                 // just this one.
-                let rerun = cx
-                    .update_global::<GitStatusCache, _>(|cache, _| cache.finish_probe(&cwd, result));
+                let rerun = cx.update_global::<GitStatusCache, _>(|cache, _| {
+                    cache.finish_probe(&cwd, result)
+                });
                 // A trigger arrived while we flew; go once more so its state
                 // is observed — unless this pane has since left that cwd.
                 if rerun && view.git_status_cwd.as_deref() == Some(&cwd) {

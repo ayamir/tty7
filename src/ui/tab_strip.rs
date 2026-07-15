@@ -269,7 +269,9 @@ impl Tty7App {
                 // SSH connection phase as a corner status dot — the same
                 // element as an agent's, not a border ring around the badge
                 // (a ring read as a second, differently-shaped avatar style).
-                .when_some(ssh, |b, rgb| b.child(Self::status_dot(rgb, false, size, cx)))
+                .when_some(ssh, |b, rgb| {
+                    b.child(Self::status_dot(rgb, false, size, cx))
+                })
                 .into_any_element(),
         }
     }

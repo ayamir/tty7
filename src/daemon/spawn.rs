@@ -58,8 +58,7 @@ pub struct MismatchedDaemon {
     pub version: Option<DaemonVersion>,
 }
 
-static MISMATCHED_DAEMON: std::sync::Mutex<Option<MismatchedDaemon>> =
-    std::sync::Mutex::new(None);
+static MISMATCHED_DAEMON: std::sync::Mutex<Option<MismatchedDaemon>> = std::sync::Mutex::new(None);
 
 /// The protocol mismatch recorded by [`ensure_running`] this launch, if any.
 /// Take-semantics so the prompt fires once per launch, not per window.
@@ -187,7 +186,12 @@ fn query_daemon_version(stream: &mut transport::Stream) -> VersionProbe {
     }
     match DaemonMsg::read(stream) {
         Ok(DaemonMsg::Version(v)) => VersionProbe::Speaks(v),
-        Err(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => {
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) =>
+        {
             VersionProbe::Unresponsive
         }
         // EOF/reset (the pre-versioning hangup) — and, conservatively, any

@@ -446,8 +446,8 @@ impl Tty7App {
         // sidebar's branch/diff lines read from it, and the probing pane's own
         // notify wouldn't re-render rows belonging to *other* panes.
         cx.default_global::<crate::terminal::git_status::GitStatusCache>();
-        let git_status_watch = cx
-            .observe_global::<crate::terminal::git_status::GitStatusCache>(|_, cx| cx.notify());
+        let git_status_watch =
+            cx.observe_global::<crate::terminal::git_status::GitStatusCache>(|_, cx| cx.notify());
         // Any real keypress means "chord, not a bare hold": cancel the held-⌘
         // tab badges and whatever reveal is pending (see `ui::hints`).
         let this = cx.weak_entity();
@@ -2867,7 +2867,7 @@ impl Tty7App {
             } else {
                 match phase {
                     SshPhase::Connecting | SshPhase::Authenticating => 0xF59E0B, // amber: in flight
-                    SshPhase::Connected => 0x22C55E, // green: link up
+                    SshPhase::Connected => 0x22C55E,                             // green: link up
                     SshPhase::Failed { .. } => 0xEF4444, // red: never made it
                 }
             };
