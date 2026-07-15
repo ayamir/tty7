@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-07-15
+
+### Fixed
+
+- **Sidebar diff overlay only opens from the `+N`/`−N` counts** — clicking
+  anywhere on a tab row's git line (branch icon, branch name) used to toggle
+  the diff overlay, hijacking ordinary clicks on the lower half of the row.
+  Now only the diff counts are the click target; the rest of the line
+  activates the tab like the rest of the row. (#95)
+
 ## [0.16.0] - 2026-07-15
 
 ### Added
