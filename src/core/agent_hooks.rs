@@ -15,7 +15,7 @@
 //! shell tty7 spawns), so hooks installed globally stay silent when an agent
 //! runs in another terminal.
 
-use std::io::Read as _;
+use std::io::{IsTerminal as _, Read as _};
 use std::path::{Path, PathBuf};
 
 use crate::core::cli_agent::AGENT_EVENT_SENTINEL;
@@ -40,9 +40,14 @@ pub fn run_agent_hook(agent: &str, event: &str) {
     }
     // Hook payload: the agent writes JSON ({"session_id": …, "message": …, …})
     // and closes stdin. Absent/malformed input still emits the bare event —
-    // the state machine works without ids or messages.
+    // the state machine works without ids or messages. A tty stdin means the
+    // spawner inherited the pane's terminal instead of piping a payload (e.g.
+    // OpenCode's plugin runner, issue #88); reading it would block forever on
+    // an EOF that never comes and swallow the user's keystrokes, so skip it.
     let mut input = String::new();
-    let _ = std::io::stdin().take(MAX_STDIN).read_to_string(&mut input);
+    if !std::io::stdin().is_terminal() {
+        let _ = std::io::stdin().take(MAX_STDIN).read_to_string(&mut input);
+    }
     let Some(event) = effective_event(agent, event, &input) else {
         return;
     };
