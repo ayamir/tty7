@@ -308,6 +308,7 @@ fn build_spec_inner(
 fn map_auth_mode(auth: AuthMode) -> SshAuthMode {
     match auth {
         AuthMode::Auto => SshAuthMode::Auto,
+        AuthMode::Gssapi => SshAuthMode::Gssapi,
         AuthMode::Password => SshAuthMode::Password,
         AuthMode::PublicKey => SshAuthMode::PublicKey,
         AuthMode::Agent => SshAuthMode::Agent,

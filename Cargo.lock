@@ -4151,6 +4151,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "libgssapi"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e440a6151f5ef06571612e4121709aed90cfc0c40f8161f9090c71656758086d"
+dependencies = [
+ "bitflags 2.13.0",
+ "bytes",
+ "libgssapi-sys",
+]
+
+[[package]]
+name = "libgssapi-sys"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5103ac4557eacd36ff678b654b943f8966d3db9688fbd180a0b4c5464759ce17"
+dependencies = [
+ "bindgen",
+ "pkg-config",
+]
+
+[[package]]
 name = "libloading"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5336,8 +5357,7 @@ dependencies = [
 [[package]]
 name = "pageant"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f3a5ae18f65a85c67a77d18d42d3606c07948e3c17c1e5f74852b26589e88a5"
+source = "git+https://github.com/ayamir/russh?rev=0d1d073350ed823069252075cbf3db9672d5b490#0d1d073350ed823069252075cbf3db9672d5b490"
 dependencies = [
  "base16ct",
  "byteorder",
@@ -6513,8 +6533,7 @@ dependencies = [
 [[package]]
 name = "russh"
 version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca6c3c1dd0a9ad3a9915a2f6e907d158f9a7e9ac32ddc772b003faafc027d9a8"
+source = "git+https://github.com/ayamir/russh?rev=0d1d073350ed823069252075cbf3db9672d5b490#0d1d073350ed823069252075cbf3db9672d5b490"
 dependencies = [
  "aes 0.9.1",
  "aws-lc-rs",
@@ -6585,8 +6604,7 @@ dependencies = [
 [[package]]
 name = "russh-cryptovec"
 version = "0.62.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aec6cb630dbe85d72ffd7bcd95f07e1bd69f9f270ee8adfa1afe443a6331438"
+source = "git+https://github.com/ayamir/russh?rev=0d1d073350ed823069252075cbf3db9672d5b490#0d1d073350ed823069252075cbf3db9672d5b490"
 dependencies = [
  "log",
  "nix 0.31.3",
@@ -6617,8 +6635,7 @@ dependencies = [
 [[package]]
 name = "russh-util"
 version = "0.52.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "668424a5dde0bcb45b55ba7de8476b93831b4aa2fa6947e145f3b053e22c60b6"
+source = "git+https://github.com/ayamir/russh?rev=0d1d073350ed823069252075cbf3db9672d5b490#0d1d073350ed823069252075cbf3db9672d5b490"
 dependencies = [
  "chrono",
  "tokio",
@@ -8475,6 +8492,7 @@ dependencies = [
  "gpui_platform",
  "keyring",
  "libc",
+ "libgssapi",
  "log",
  "memchr",
  "notify 8.2.0",

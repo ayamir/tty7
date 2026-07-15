@@ -1935,10 +1935,11 @@ impl Tty7App {
 
         let auth_idx = match form.auth {
             AuthMode::Auto => 0,
-            AuthMode::Password => 1,
-            AuthMode::PublicKey => 2,
-            AuthMode::Agent => 3,
-            AuthMode::KeyboardInteractive => 4,
+            AuthMode::Gssapi => 1,
+            AuthMode::Password => 2,
+            AuthMode::PublicKey => 3,
+            AuthMode::Agent => 4,
+            AuthMode::KeyboardInteractive => 5,
         };
         let header = h_flex()
             .items_center()
@@ -2010,16 +2011,17 @@ impl Tty7App {
                 "Authentication method. Auto tries every applicable method.",
                 self.segmented(
                     "ssh-form-auth",
-                    &["Auto", "Password", "Key", "Agent", "2FA"],
+                    &["Auto", "GSSAPI", "Password", "Key", "Agent", "2FA"],
                     auth_idx,
                     cx,
                     |this, ix, _w, cx| {
                         if let Some(f) = this.ssh_form_mut() {
                             f.auth = match ix {
                                 0 => AuthMode::Auto,
-                                1 => AuthMode::Password,
-                                2 => AuthMode::PublicKey,
-                                3 => AuthMode::Agent,
+                                1 => AuthMode::Gssapi,
+                                2 => AuthMode::Password,
+                                3 => AuthMode::PublicKey,
+                                4 => AuthMode::Agent,
                                 _ => AuthMode::KeyboardInteractive,
                             };
                             cx.notify();
