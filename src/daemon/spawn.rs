@@ -15,6 +15,7 @@
 //! Then we poll the endpoint until it's connectable, so the caller can immediately
 //! proceed to connect.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -46,34 +47,89 @@ const REAP_TERM_TIMEOUT: Duration = Duration::from_secs(6);
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const REAP_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// A live daemon `ensure_running` reused *despite* a protocol mismatch: killing
+/// it would end every persisted session, and the mismatch may well be benign
+/// for the messages actually exercised — so that call is the user's to make,
+/// not startup's. Recorded here and consumed by the first window
+/// ([`take_mismatched_daemon`]), which raises a keep-or-restart prompt.
+pub struct MismatchedDaemon {
+    /// What the daemon answered, or `None` for one so old it predates the
+    /// `Version` request entirely.
+    pub version: Option<DaemonVersion>,
+}
+
+static MISMATCHED_DAEMON: std::sync::Mutex<Option<MismatchedDaemon>> =
+    std::sync::Mutex::new(None);
+
+/// The protocol mismatch recorded by [`ensure_running`] this launch, if any.
+/// Take-semantics so the prompt fires once per launch, not per window.
+pub fn take_mismatched_daemon() -> Option<MismatchedDaemon> {
+    MISMATCHED_DAEMON.lock().ok()?.take()
+}
+
+/// How a live daemon answered the version handshake.
+#[derive(Debug, PartialEq, Eq)]
+enum VersionProbe {
+    /// It replied: it knows the handshake, at this dialect.
+    Speaks(DaemonVersion),
+    /// It hung up (or answered garbage) — a daemon from before the `Version`
+    /// request existed errors on the unknown kind and drops the connection.
+    /// Alive and serving its panes fine; just an older dialect.
+    Legacy,
+    /// It kept the connection open but never answered within
+    /// [`HANDSHAKE_TIMEOUT`] (or the write itself failed): wedged. Unlike
+    /// `Legacy`, this daemon can't serve anything — replace it outright.
+    Unresponsive,
+}
+
 /// Ensure a daemon is running for this process's config dir, spawning a detached
 /// one if needed. Returns `Ok(())` once the endpoint is connectable; `Err` if the
 /// endpoint can't be resolved or the daemon never came up within
 /// [`STARTUP_TIMEOUT`].
 pub fn ensure_running() -> anyhow::Result<()> {
-    // Fast path: a live daemon answers `connect` — but only reuse it if it
-    // speaks our protocol version. The daemon outlives the GUI binary, so after
-    // an app upgrade the running daemon may be an older build; reusing one
-    // whose wire dialect differs would misdecode frames mid-session. A mismatch
-    // (or a daemon too old to know `Version` at all) means restart, not reuse.
+    // Fast path: a live daemon answers `connect`. The daemon outlives the GUI
+    // binary, so after an app upgrade the running daemon may be an older build
+    // whose wire dialect differs. That daemon still holds every persisted
+    // session, so we don't kill it here: reuse it, record the mismatch, and let
+    // the first window ask the user whether to keep it or restart clean
+    // (`take_mismatched_daemon`). Only a daemon that can't answer at all —
+    // wedged mid-handshake — is replaced outright, since it can't serve its
+    // panes either way.
     if let Ok(mut stream) = transport::connect() {
         match query_daemon_version(&mut stream) {
-            Some(v) if v.protocol == PROTOCOL_VERSION => return Ok(()),
-            Some(v) => log::info!(
-                "daemon (build {}) speaks protocol {}, this build needs {}; restarting it",
-                v.build,
-                v.protocol,
-                PROTOCOL_VERSION
-            ),
-            None => log::info!(
-                "daemon predates protocol versioning or is unresponsive; restarting it"
-            ),
+            VersionProbe::Speaks(v) if v.protocol == PROTOCOL_VERSION => return Ok(()),
+            VersionProbe::Speaks(v) => {
+                log::warn!(
+                    "daemon (build {}) speaks protocol {}, this build needs {}; \
+                     keeping it and deferring to the user",
+                    v.build,
+                    v.protocol,
+                    PROTOCOL_VERSION
+                );
+                if let Ok(mut slot) = MISMATCHED_DAEMON.lock() {
+                    *slot = Some(MismatchedDaemon { version: Some(v) });
+                }
+                return Ok(());
+            }
+            VersionProbe::Legacy => {
+                log::warn!(
+                    "daemon predates protocol versioning; keeping it and deferring to the user"
+                );
+                if let Ok(mut slot) = MISMATCHED_DAEMON.lock() {
+                    *slot = Some(MismatchedDaemon { version: None });
+                }
+                return Ok(());
+            }
+            VersionProbe::Unresponsive => {
+                log::info!("daemon did not answer the version handshake; restarting it");
+                drop(stream);
+                // `stop` shuts the old daemon down gracefully (`Shutdown`
+                // predates versioning, so even the oldest daemon honors it),
+                // escalating to a pid-based reap if it won't go, and clears the
+                // endpoint marker.
+                stop();
+            }
         }
-        drop(stream);
-        // `stop` shuts the old daemon down gracefully (`Shutdown` predates
-        // versioning, so even the oldest daemon honors it), escalating to a
-        // pid-based reap if it won't go, and clears the endpoint marker.
-        stop();
     } else {
         // Nobody answers — but "unreachable" is not "gone". If the pidfile
         // records a daemon that is still alive (wedged, or one whose endpoint
@@ -113,20 +169,31 @@ pub fn ensure_running() -> anyhow::Result<()> {
     }
 }
 
-/// Ask a freshly connected daemon which protocol version it speaks. `None`
-/// covers every non-answer the same way: a daemon that predates
-/// `ClientMsg::Version` (unknown kind → it drops the connection without
-/// replying), a wedged daemon (read timeout), or a garbled reply. Callers
-/// treat `None` as "must be replaced".
-fn query_daemon_version(stream: &mut transport::Stream) -> Option<DaemonVersion> {
+/// Ask a freshly connected daemon which protocol version it speaks, and
+/// classify every way that can go (see [`VersionProbe`]). The split that
+/// matters: a *hangup* is how a pre-versioning daemon reacts to the unknown
+/// kind — it's healthy, keep it; a *timeout* is a daemon that can't process
+/// messages at all — replace it.
+fn query_daemon_version(stream: &mut transport::Stream) -> VersionProbe {
     use std::io::Write as _;
 
     let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
-    ClientMsg::Version.encode(stream).ok()?;
-    stream.flush().ok()?;
+    if ClientMsg::Version
+        .encode(stream)
+        .and_then(|()| stream.flush())
+        .is_err()
+    {
+        return VersionProbe::Unresponsive;
+    }
     match DaemonMsg::read(stream) {
-        Ok(DaemonMsg::Version(v)) => Some(v),
-        _ => None,
+        Ok(DaemonMsg::Version(v)) => VersionProbe::Speaks(v),
+        Err(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => {
+            VersionProbe::Unresponsive
+        }
+        // EOF/reset (the pre-versioning hangup) — and, conservatively, any
+        // other well-formed-but-unexpected reply: the daemon is alive enough
+        // to answer, so it stays the user's call.
+        _ => VersionProbe::Legacy,
     }
 }
 
@@ -540,17 +607,22 @@ mod tests {
             .unwrap();
         });
 
-        let got = query_daemon_version(&mut client).expect("a live daemon must answer");
-        assert_eq!(got.protocol, PROTOCOL_VERSION);
-        assert_eq!(got.build, "test");
+        match query_daemon_version(&mut client) {
+            VersionProbe::Speaks(got) => {
+                assert_eq!(got.protocol, PROTOCOL_VERSION);
+                assert_eq!(got.build, "test");
+            }
+            other => panic!("a live daemon must answer, got {other:?}"),
+        }
         server.join().unwrap();
     }
 
     /// The handshake against a pre-versioning daemon: it reads an unknown kind
-    /// and drops the connection without replying. That must come back as
-    /// `None` — the signal to replace the daemon — not hang or panic.
+    /// and drops the connection without replying. That must classify as
+    /// `Legacy` — a healthy daemon on an older dialect, the user's call to
+    /// keep or replace — not hang, panic, or read as wedged.
     #[test]
-    fn version_handshake_treats_a_hangup_as_no_version() {
+    fn version_handshake_treats_a_hangup_as_legacy() {
         use crate::daemon::protocol::ClientMsg;
 
         let (mut client, mut daemon) = UnixStream::pair().unwrap();
@@ -560,8 +632,26 @@ mod tests {
             drop(daemon);
         });
 
-        assert_eq!(query_daemon_version(&mut client), None);
+        assert_eq!(query_daemon_version(&mut client), VersionProbe::Legacy);
         server.join().unwrap();
+    }
+
+    /// The handshake against a wedged daemon: the peer accepts the request but
+    /// never answers. The read must time out ([`HANDSHAKE_TIMEOUT`]) and
+    /// classify as `Unresponsive` — the one case `ensure_running` replaces the
+    /// daemon without asking, since it can't serve its panes anyway.
+    #[test]
+    fn version_handshake_treats_silence_as_unresponsive() {
+        let (mut client, daemon) = UnixStream::pair().unwrap();
+        // Keep the daemon end open (no reply, no hangup) until the client
+        // gives up.
+        let start = Instant::now();
+        assert_eq!(
+            query_daemon_version(&mut client),
+            VersionProbe::Unresponsive
+        );
+        assert!(start.elapsed() >= HANDSHAKE_TIMEOUT);
+        drop(daemon);
     }
 
     /// A stale socket file (one nothing is listening on) must be treated as "not

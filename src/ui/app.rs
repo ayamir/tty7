@@ -349,7 +349,61 @@ impl Tty7App {
         } else {
             None
         };
-        Self::with_session(session, window, cx)
+        let app = Self::with_session(session, window, cx);
+        // If startup reused a daemon that speaks a different wire protocol
+        // (an app upgrade while the old service kept running), the sessions
+        // just restored above are living on that old dialect. Surface the
+        // keep-or-restart choice now that there's a window to ask in.
+        Self::prompt_daemon_version_mismatch(window, cx);
+        app
+    }
+
+    /// Ask what to do about a protocol-mismatched daemon that
+    /// `spawn::ensure_running` deliberately left running (rather than silently
+    /// killing every persisted session at startup): keep using it — sessions
+    /// survive, features whose wire shape changed may misbehave — or restart
+    /// the service clean via the shared
+    /// [`restart_daemon_confirmed`](Self::restart_daemon_confirmed) path
+    /// (tabs reopen with fresh shells). Keeping is the default: dismissing
+    /// the prompt changes nothing.
+    fn prompt_daemon_version_mismatch(window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mismatch) = crate::daemon::spawn::take_mismatched_daemon() else {
+            return;
+        };
+        let ours = crate::daemon::protocol::PROTOCOL_VERSION;
+        let detail = match mismatch.version {
+            Some(v) => format!(
+                "The daemon holding your sessions is from another build \
+                 (v{}, protocol {} — this app speaks {}). You can keep using it and \
+                 your sessions stay, but features whose wire format changed may \
+                 misbehave until it's restarted. Restarting starts a clean daemon: \
+                 tabs reopen with fresh shells and anything running in them is \
+                 terminated.",
+                v.build, v.protocol, ours
+            ),
+            None => "The daemon holding your sessions is from an older \
+                 version of the app. You can keep using it and your sessions stay, \
+                 but newer features may misbehave until it's restarted. Restarting \
+                 starts a clean daemon: tabs reopen with fresh shells and anything \
+                 running in them is terminated."
+                .to_string(),
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Daemon Is From Another Version",
+            Some(&detail),
+            &["Keep Sessions", "Restart Daemon"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            // Index 1 == "Restart Daemon"; "Keep Sessions" or a dismissed
+            // prompt leave the old daemon (and every session) untouched.
+            if !matches!(answer.await, Ok(1)) {
+                return;
+            }
+            let _ = this.update_in(cx, |this, _window, cx| this.restart_daemon_confirmed(cx));
+        })
+        .detach();
     }
 
     /// The whole constructor behind `new`, with the saved session injected
@@ -631,6 +685,17 @@ impl Tty7App {
             if !matches!(answer.await, Ok(1)) {
                 return;
             }
+            let _ = this.update_in(cx, |this, _window, cx| this.restart_daemon_confirmed(cx));
+        })
+        .detach();
+    }
+
+    /// The restart itself, past any confirmation — shared by
+    /// [`restart_daemon`](Self::restart_daemon)'s prompt and the startup
+    /// version-mismatch prompt
+    /// ([`prompt_daemon_version_mismatch`](Self::prompt_daemon_version_mismatch)).
+    fn restart_daemon_confirmed(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
             // Persist the current layout + cwds, then tear the live terminals down
             // *before* the daemon dies: dropping each `RemoteTerminal` detaches its
             // socket, so no reader thread is mid-read when the daemon exits. The

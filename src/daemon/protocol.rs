@@ -34,8 +34,10 @@ pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 /// Version of this wire protocol. The daemon outlives the GUI binary, so after
 /// an app upgrade the two can be different builds; the GUI asks a running
-/// daemon for its version (`ClientMsg::Version`) before reusing it and
-/// restarts it on a mismatch (see `spawn::ensure_running`).
+/// daemon for its version (`ClientMsg::Version`) before reusing it and, on a
+/// mismatch, keeps it alive but asks the user whether to keep their sessions
+/// on the old dialect or restart the service clean (see
+/// `spawn::ensure_running`).
 ///
 /// Bump this on any change an old peer would *misread*: a repurposed kind
 /// byte, a changed payload shape, altered framing. Purely additive changes —
@@ -774,8 +776,9 @@ pub enum ClientMsg {
     /// Ask which protocol version the daemon speaks (control connection); the
     /// daemon replies `Version`. A daemon that predates versioning doesn't know
     /// this kind and drops the connection instead of replying — the client
-    /// reads any non-answer as "older than every versioned daemon" and
-    /// restarts it (see `spawn::ensure_running`).
+    /// reads that hangup as "older than every versioned daemon" and treats it
+    /// like any other mismatch: keep it, ask the user (see
+    /// `spawn::ensure_running`).
     Version,
 }
 
