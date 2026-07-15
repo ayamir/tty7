@@ -27,8 +27,7 @@ pub mod protocol;
 pub(crate) mod remote;
 pub mod server;
 pub mod spawn;
-/// Native (russh) SSH session engine — see the module docs and
-/// `docs/ssh-native-architecture.md`.
+/// Native (russh) SSH session engine — see the module docs.
 pub mod ssh;
 pub mod transport;
 

@@ -4,7 +4,7 @@
 //! [`SshConnection`]s. The rest of the daemon is std-threads and never enters this
 //! runtime; a native-SSH pane crosses the boundary only through the blocking
 //! `Read`/`Write` adapters in [`session`] (fed by the async channel driver) and
-//! the [`PromptBroker`] (auth/host-key round-trips). See `docs/ssh-native-architecture.md`.
+//! the [`PromptBroker`] (auth/host-key round-trips).
 //!
 //! ## Connection reuse & the API WS4/WS5 build on (FR-C2)
 //! Connections are keyed by [`ConnectionKey`] (host/port/user/proxy/jump chain).
