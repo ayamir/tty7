@@ -1038,6 +1038,16 @@ impl TerminalView {
             .status_for(cwd)
     }
 
+    /// The cwd the pane's git line reads from — the same path [`git_status`]
+    /// resolves through, so the diff overlay opened from that line probes the
+    /// identical repo (not a fresh foreground-cwd syscall that could disagree
+    /// mid-command). `None` outside a repo-probe-worthy state.
+    ///
+    /// [`git_status`]: Self::git_status
+    pub fn git_status_cwd(&self) -> Option<&std::path::Path> {
+        self.git_status_cwd.as_deref()
+    }
+
     /// The current grid selection as text, if any non-blank one exists — the
     /// source for "Agent: Send Selection".
     pub fn selection_text(&self) -> Option<String> {

@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod assets;
+pub mod diff_overlay;
 pub mod forwards;
 pub mod hints;
 pub mod home;

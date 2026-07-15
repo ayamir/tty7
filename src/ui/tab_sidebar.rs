@@ -93,13 +93,39 @@ impl Tty7App {
             // branch, then the working-tree diff as green `+N` / red `−N`
             // badges — a per-session branch row. Built here so the row can
             // grow to fit it (a non-repo pane keeps the compact two-line row).
+            // The line is also the diff overlay's toggle: the cwd it probes is
+            // the same one the status resolved through, so overlay and badge
+            // always describe the same repo.
+            let git_cwd = tab
+                .pane
+                .focused_or_first(window, cx)
+                .and_then(|leaf| leaf.read(cx).git_status_cwd().map(|p| p.to_path_buf()));
             let git_line = tab.git_status(Some(window), cx).map(|g| {
                 let mut line = h_flex()
+                    .id(("sidebar-git", i))
                     .w_full()
                     .items_center()
                     .gap_1p5()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
+                    // Click to peek the full diff in an overlay over the
+                    // terminal — without activating this row's tab, which is
+                    // the point: glance at another session's changes while
+                    // staying where you are. Quiet until hovered (the line
+                    // brightens and shows a pointer), so the rail stays calm.
+                    .when_some(git_cwd, |line, cwd| {
+                        line.cursor_pointer()
+                            .hover(|s| s.text_color(cx.theme().foreground))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                    // Swallow the press so the row/label
+                                    // handlers don't also activate the tab.
+                                    cx.stop_propagation();
+                                    this.toggle_diff_overlay(cwd.clone(), window, cx);
+                                }),
+                            )
+                    })
                     .child(
                         gpui::svg()
                             .path("icons/git-branch.svg")

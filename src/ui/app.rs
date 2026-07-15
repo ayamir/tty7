@@ -328,6 +328,11 @@ pub struct Tty7App {
     /// (not a tab), so it covers the tab rail / title bar and never clutters the
     /// tab list. Holds all the settings widget state + its subscriptions.
     settings: Option<SettingsState>,
+    /// `Some` while the working-tree diff overlay is open (clicked from a
+    /// sidebar row's git line). Covers the terminal body only — the sidebar
+    /// stays visible so other repos' git lines remain one click away. See
+    /// [`crate::ui::diff_overlay`].
+    pub(crate) diff_overlay: Option<crate::ui::diff_overlay::DiffOverlayState>,
     /// In-pane native-SSH auth / host-key sheet state (WS3). Holds the active
     /// prompt (keyed to the pane that raised it), its input widgets, and
     /// dismissable banners. Empty when no prompt is pending.
@@ -449,10 +454,15 @@ impl Tty7App {
         let config_watch = cx.observe_global::<Config>(|this, cx| this.reload_from_config(cx));
         // Repaint when any pane's git probe lands in the shared cache — the
         // sidebar's branch/diff lines read from it, and the probing pane's own
-        // notify wouldn't re-render rows belonging to *other* panes.
+        // notify wouldn't re-render rows belonging to *other* panes. The open
+        // diff overlay rides the same signal: if the landed numbers disagree
+        // with what it shows, it re-probes the full diff.
         cx.default_global::<crate::terminal::git_status::GitStatusCache>();
         let git_status_watch =
-            cx.observe_global::<crate::terminal::git_status::GitStatusCache>(|_, cx| cx.notify());
+            cx.observe_global::<crate::terminal::git_status::GitStatusCache>(|this, cx| {
+                this.maybe_refresh_diff_overlay(cx);
+                cx.notify();
+            });
         // Any real keypress means "chord, not a bare hold": cancel the held-⌘
         // tab badges and whatever reveal is pending (see `ui::hints`).
         let this = cx.weak_entity();
@@ -543,6 +553,7 @@ impl Tty7App {
             sidebar_search,
             _sidebar_search_sub: sidebar_search_sub,
             settings: None,
+            diff_overlay: None,
             ssh_prompt: crate::ui::ssh_prompt::SshPromptState::new(cx),
             ssh_close_confirm: None,
             window_bounds: window.window_bounds().get_bounds(),
@@ -1484,7 +1495,7 @@ impl Tty7App {
     /// tab's `last_focused`, so `focus_active` can restore it when we come back.
     /// Call this before any transition that moves focus off the active tab
     /// (switching tabs, opening a focus-stealing overlay).
-    fn remember_active_pane(&mut self, window: &Window, cx: &App) {
+    pub(crate) fn remember_active_pane(&mut self, window: &Window, cx: &App) {
         let active = self.active;
         if let Some(tab) = self.tabs.get_mut(active) {
             if let Some(leaf) = tab.pane.focused_leaf(window, cx) {
@@ -3437,7 +3448,11 @@ impl Render for Tty7App {
             // Live-SSH close-confirmation sheet (E3).
             .when_some(self.render_ssh_close_confirm_overlay(cx), |this, el| {
                 this.child(el)
-            });
+            })
+            // Working-tree diff overlay (clicked from a sidebar git line) —
+            // last child, so it paints over every pane-contextual element
+            // above. It covers only the body: the sidebar stays interactive.
+            .when_some(self.render_diff_overlay(cx), |this, el| this.child(el));
 
         // The two layouts. Horizontal (default): a column of [title bar / body].
         // Vertical: the rail is a full-height *left column* that reaches the very
