@@ -20,6 +20,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::core::config;
+use crate::daemon::protocol::{ClientMsg, DaemonMsg, DaemonVersion, PROTOCOL_VERSION};
 use crate::daemon::{pidfile, transport};
 
 /// How long to wait for a freshly spawned daemon to start listening before we
@@ -29,6 +30,10 @@ use crate::daemon::{pidfile, transport};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// Poll interval while waiting for the socket to come up.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How long the version handshake with an already-running daemon may take.
+/// Local socket, tiny reply — a daemon that can't answer within this is wedged
+/// (or so old it dropped the connection), and gets replaced either way.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long to wait for the old daemon to exit after we ask it to shut down.
 /// Generous on purpose: the daemon hangs up every pane's child (a ~200 ms SIGHUP
 /// grace each) before it exits, so a session with several panes needs a moment.
@@ -46,25 +51,45 @@ const REAP_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 /// endpoint can't be resolved or the daemon never came up within
 /// [`STARTUP_TIMEOUT`].
 pub fn ensure_running() -> anyhow::Result<()> {
-    // Fast path: a live daemon answers `connect` immediately. We only want to
-    // probe — drop the connection right away so we don't hold a pane open.
-    if transport::connect().is_ok() {
-        return Ok(());
-    }
+    // Fast path: a live daemon answers `connect` — but only reuse it if it
+    // speaks our protocol version. The daemon outlives the GUI binary, so after
+    // an app upgrade the running daemon may be an older build; reusing one
+    // whose wire dialect differs would misdecode frames mid-session. A mismatch
+    // (or a daemon too old to know `Version` at all) means restart, not reuse.
+    if let Ok(mut stream) = transport::connect() {
+        match query_daemon_version(&mut stream) {
+            Some(v) if v.protocol == PROTOCOL_VERSION => return Ok(()),
+            Some(v) => log::info!(
+                "daemon (build {}) speaks protocol {}, this build needs {}; restarting it",
+                v.build,
+                v.protocol,
+                PROTOCOL_VERSION
+            ),
+            None => log::info!(
+                "daemon predates protocol versioning or is unresponsive; restarting it"
+            ),
+        }
+        drop(stream);
+        // `stop` shuts the old daemon down gracefully (`Shutdown` predates
+        // versioning, so even the oldest daemon honors it), escalating to a
+        // pid-based reap if it won't go, and clears the endpoint marker.
+        stop();
+    } else {
+        // Nobody answers — but "unreachable" is not "gone". If the pidfile
+        // records a daemon that is still alive (wedged, or one whose endpoint
+        // was lost), its panes are already beyond reach; reap it before
+        // claiming the endpoint so it can't linger forever holding every
+        // pane's PTY and children.
+        reap_recorded_daemon();
 
-    // Nobody answers — but "unreachable" is not "gone". If the pidfile records
-    // a daemon that is still alive (wedged, or one whose endpoint was lost),
-    // its panes are already beyond reach; reap it before claiming the endpoint
-    // so it can't linger forever holding every pane's PTY and children.
-    reap_recorded_daemon();
-
-    // If an endpoint marker is sitting there, it's a stale leftover from a
-    // crashed daemon (a *live* one would have answered the connect above),
-    // so clear it. The daemon's own `run()` clears stale endpoints too, but doing
-    // it here means our post-spawn polling connects on the first try instead of
-    // racing the daemon's cleanup.
-    if transport::endpoint_exists() {
-        transport::remove_stale_endpoint();
+        // If an endpoint marker is sitting there, it's a stale leftover from a
+        // crashed daemon (a *live* one would have answered the connect above),
+        // so clear it. The daemon's own `run()` clears stale endpoints too, but
+        // doing it here means our post-spawn polling connects on the first try
+        // instead of racing the daemon's cleanup.
+        if transport::endpoint_exists() {
+            transport::remove_stale_endpoint();
+        }
     }
 
     spawn_detached()?;
@@ -85,6 +110,23 @@ pub fn ensure_running() -> anyhow::Result<()> {
             );
         }
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Ask a freshly connected daemon which protocol version it speaks. `None`
+/// covers every non-answer the same way: a daemon that predates
+/// `ClientMsg::Version` (unknown kind → it drops the connection without
+/// replying), a wedged daemon (read timeout), or a garbled reply. Callers
+/// treat `None` as "must be replaced".
+fn query_daemon_version(stream: &mut transport::Stream) -> Option<DaemonVersion> {
+    use std::io::Write as _;
+
+    let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+    ClientMsg::Version.encode(stream).ok()?;
+    stream.flush().ok()?;
+    match DaemonMsg::read(stream) {
+        Ok(DaemonMsg::Version(v)) => Some(v),
+        _ => None,
     }
 }
 
@@ -114,7 +156,6 @@ pub fn restart() -> anyhow::Result<()> {
 /// that same file, so Windows locks it until the daemon exits. Stopping it here
 /// releases the lock so the install/uninstall can overwrite/remove the binary.
 pub fn stop() {
-    use crate::daemon::protocol::ClientMsg;
     use std::io::Write as _;
 
     // Ask a running daemon to stop. Best effort: a failed connect/write means
@@ -478,6 +519,49 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(!process_alive(pid));
+    }
+
+    /// The handshake against a current daemon: the peer answers `Version` and
+    /// the client reads it back. Driven over a socketpair so no real daemon is
+    /// needed — `query_daemon_version` only sees a `Stream`.
+    #[test]
+    fn version_handshake_reads_a_matching_reply() {
+        use crate::daemon::protocol::{ClientMsg, DaemonMsg, DaemonVersion, PROTOCOL_VERSION};
+
+        let (mut client, mut daemon) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let msg = ClientMsg::read(&mut daemon).unwrap();
+            assert_eq!(msg, ClientMsg::Version);
+            DaemonMsg::Version(DaemonVersion {
+                protocol: PROTOCOL_VERSION,
+                build: "test".into(),
+            })
+            .encode(&mut daemon)
+            .unwrap();
+        });
+
+        let got = query_daemon_version(&mut client).expect("a live daemon must answer");
+        assert_eq!(got.protocol, PROTOCOL_VERSION);
+        assert_eq!(got.build, "test");
+        server.join().unwrap();
+    }
+
+    /// The handshake against a pre-versioning daemon: it reads an unknown kind
+    /// and drops the connection without replying. That must come back as
+    /// `None` — the signal to replace the daemon — not hang or panic.
+    #[test]
+    fn version_handshake_treats_a_hangup_as_no_version() {
+        use crate::daemon::protocol::ClientMsg;
+
+        let (mut client, mut daemon) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            // An old daemon errors on the unknown kind and closes the socket.
+            let _ = ClientMsg::read(&mut daemon);
+            drop(daemon);
+        });
+
+        assert_eq!(query_daemon_version(&mut client), None);
+        server.join().unwrap();
     }
 
     /// A stale socket file (one nothing is listening on) must be treated as "not

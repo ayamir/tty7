@@ -24,7 +24,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
 use crate::daemon::pane::DaemonPane;
-use crate::daemon::protocol::{ClientMsg, DaemonMsg, RemoteKind};
+use crate::daemon::protocol::{ClientMsg, DaemonMsg, DaemonVersion, RemoteKind, PROTOCOL_VERSION};
 use crate::daemon::ssh::SshConnection;
 use crate::daemon::transport::{self, Stream};
 
@@ -327,6 +327,16 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
         ClientMsg::List => {
             let mut w = write_stream;
             DaemonMsg::PaneList(registry.list()).encode(&mut w)?;
+            Ok(())
+        }
+
+        ClientMsg::Version => {
+            let mut w = write_stream;
+            DaemonMsg::Version(DaemonVersion {
+                protocol: PROTOCOL_VERSION,
+                build: env!("CARGO_PKG_VERSION").to_string(),
+            })
+            .encode(&mut w)?;
             Ok(())
         }
 

@@ -32,6 +32,27 @@ use serde::{Deserialize, Serialize};
 /// protocol desync and we error rather than allocate.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
+/// Version of this wire protocol. The daemon outlives the GUI binary, so after
+/// an app upgrade the two can be different builds; the GUI asks a running
+/// daemon for its version (`ClientMsg::Version`) before reusing it and
+/// restarts it on a mismatch (see `spawn::ensure_running`).
+///
+/// Bump this on any change an old peer would *misread*: a repurposed kind
+/// byte, a changed payload shape, altered framing. Purely additive changes —
+/// a brand-new kind, a new `#[serde(default)]` field — don't need a bump;
+/// the existing unknown-kind / missing-field behavior already covers them.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Reply to `ClientMsg::Version`: the protocol dialect the daemon speaks, plus
+/// its crate version for logs/diagnostics. Only `protocol` drives decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonVersion {
+    pub protocol: u32,
+    /// The daemon binary's `CARGO_PKG_VERSION`. Display only.
+    #[serde(default)]
+    pub build: String,
+}
+
 /// Terminal geometry shared by spawn/attach/resize. Cell pixel size travels too
 /// so the daemon can set an accurate `TIOCSWINSZ` (`ws_xpixel`/`ws_ypixel`),
 /// which some full-screen apps read.
@@ -750,6 +771,12 @@ pub enum ClientMsg {
     /// Ask for the managed forwards attributed to `pane_id`. Control-connection
     /// message; the daemon replies with a `ForwardList`.
     ListForwards { pane_id: u64 },
+    /// Ask which protocol version the daemon speaks (control connection); the
+    /// daemon replies `Version`. A daemon that predates versioning doesn't know
+    /// this kind and drops the connection instead of replying — the client
+    /// reads any non-answer as "older than every versioned daemon" and
+    /// restarts it (see `spawn::ensure_running`).
+    Version,
 }
 
 /// Messages the daemon sends back to the GUI client.
@@ -820,6 +847,8 @@ pub enum DaemonMsg {
     /// Reply to `AddForward` / `RemoveForward` / `ListForwards`: the managed
     /// forwards currently attributed to the requested pane (WS4).
     ForwardList(Vec<ManagedForward>),
+    /// Reply to `Version`.
+    Version(DaemonVersion),
     /// A request failed (e.g. `Attach` to an unknown/dead pane id).
     Error(String),
 }
@@ -870,6 +899,9 @@ mod kind {
     pub const REMOVE_FORWARD: u8 = 21;
     /// `ListForwards` — list a pane's managed forwards (WS4).
     pub const LIST_FORWARDS: u8 = 22;
+    /// `Version` — protocol-version handshake. 40 sits clear of every reserved
+    /// range above (WS3 16–19, WS4 20–24, SFTP 30–36).
+    pub const VERSION: u8 = 40;
 
     // Daemon -> client
     pub const SPAWNED: u8 = 1;
@@ -902,6 +934,9 @@ mod kind {
     pub const AGENT: u8 = 21;
     /// `AgentStatus` — the pane's rich agent-session status (or its clear).
     pub const AGENT_STATUS: u8 = 22;
+    /// `Version` — reply to the client-space `VERSION` request (same value by
+    /// design; the spaces are independent).
+    pub const VERSION_REPLY: u8 = 40;
 }
 
 /// Write one framed message: `[u32 LE len][u8 kind][payload]`.
@@ -1046,6 +1081,7 @@ impl ClientMsg {
             ClientMsg::ListForwards { pane_id } => {
                 write_frame(w, kind::LIST_FORWARDS, &to_json(pane_id)?)
             }
+            ClientMsg::Version => write_frame(w, kind::VERSION, &[]),
         }
     }
 
@@ -1121,6 +1157,7 @@ impl ClientMsg {
             kind::LIST_FORWARDS => ClientMsg::ListForwards {
                 pane_id: from_json(&payload)?,
             },
+            kind::VERSION => ClientMsg::Version,
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1184,6 +1221,7 @@ impl DaemonMsg {
                 write_frame(w, kind::SFTP_TRANSFER_PROGRESS, &to_json(jobs)?)
             }
             DaemonMsg::ForwardList(list) => write_frame(w, kind::FORWARD_LIST, &to_json(list)?),
+            DaemonMsg::Version(version) => write_frame(w, kind::VERSION_REPLY, &to_json(version)?),
             DaemonMsg::Error(msg) => write_frame(w, kind::ERROR, &to_json(msg)?),
         }
     }
@@ -1230,6 +1268,7 @@ impl DaemonMsg {
             },
             kind::SFTP_TRANSFER_PROGRESS => DaemonMsg::SftpTransferProgress(from_json(&payload)?),
             kind::FORWARD_LIST => DaemonMsg::ForwardList(from_json(&payload)?),
+            kind::VERSION_REPLY => DaemonMsg::Version(from_json(&payload)?),
             kind::ERROR => DaemonMsg::Error(from_json(&payload)?),
             other => {
                 return Err(io::Error::new(
@@ -1447,6 +1486,7 @@ mod tests {
                 forward_id: 3,
             },
             ClientMsg::ListForwards { pane_id: 7 },
+            ClientMsg::Version,
         ];
         let mut buf = Vec::new();
         for m in &msgs {
@@ -1585,6 +1625,10 @@ mod tests {
                     status: ForwardStatus::Error("bind refused".into()),
                 },
             ]),
+            DaemonMsg::Version(DaemonVersion {
+                protocol: PROTOCOL_VERSION,
+                build: "0.15.0".into(),
+            }),
             DaemonMsg::Error("nope".into()),
         ];
         let mut buf = Vec::new();
