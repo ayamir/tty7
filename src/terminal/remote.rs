@@ -417,12 +417,17 @@ impl RemoteTerminal {
                 // so mixed client/daemon versions keep working.
                 let mut zle_tok = OscTokenizer::new(&[b"133"]);
                 // Bytes read but not yet framed, plus the recorded geometry
-                // waiting for its paired Snapshot: the daemon sends `Size`
-                // immediately followed by the ring replay, and both must apply
-                // under ONE grid lock — with two separate lock scopes, the UI
-                // thread's layout `resize()` could slot in between and the
-                // replay would run at the layout width, mis-wrapping history
-                // (the exact defect the Size frame exists to prevent).
+                // waiting for its paired Snapshot: the attach replay is a
+                // `Size` → `Snapshot` pair per ring segment, and each pair
+                // must apply under ONE grid lock — with two separate lock
+                // scopes, the UI thread's layout `resize()` could slot in
+                // between and that segment would replay at the layout width,
+                // mis-wrapping history (the exact defect the Size frame
+                // exists to prevent). The guarantee is per pair: a layout
+                // resize landing *between* pairs only re-reflows already-
+                // applied history, and the next pair's Size (ultimately the
+                // final pair, which carries the PTY's current geometry)
+                // restores the recorded width before more bytes advance.
                 let mut pending: Vec<u8> = Vec::new();
                 let mut pending_size: Option<WinSize> = None;
                 // Sized to the daemon writer's coalesced-frame cap so one large

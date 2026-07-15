@@ -246,6 +246,15 @@ fn apply_common_command_setup(cmd: &mut CommandBuilder, initial_cwd: &Option<Pat
 /// from some recent point onward, and a client's emulator tolerates a truncated
 /// prefix far better than a hole punched in the middle.
 const RING_CAP: usize = 8 * 1024 * 1024;
+
+/// Cap on the ring's geometry segments. The client does a full grid reflow per
+/// replayed `Size`, and drag-resizing a pane whose TUI redraws on every
+/// SIGWINCH cuts a segment per column change — tiny segments that never fill
+/// `RING_CAP`, so over a long-lived pane's life they would accumulate without
+/// bound and attach would degrade linearly. Past the cap the two *oldest*
+/// segments merge (the older one's bytes replay at the newer one's geometry):
+/// like the byte cap, precision degrades from the oldest scrollback first.
+const MAX_RING_SEGMENTS: usize = 64;
 const REMOTE_CONTEXT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Backpressure between a pane's PTY reader and its connection writer: counts
@@ -1455,7 +1464,8 @@ impl ReplayRing {
     /// a fresh segment. A same-size resize is a no-op, and an empty tail is
     /// retagged in place, so repeated resizes with no output in between (a
     /// window drag over an idle pane) collapse into one segment instead of
-    /// piling up empty ones.
+    /// piling up empty ones. At `MAX_RING_SEGMENTS` the two oldest segments
+    /// merge to make room, mis-wrapping only the oldest scrollback.
     fn resize(&mut self, size: WinSize) {
         let tail = self.tail();
         if tail.size == size {
@@ -1463,9 +1473,19 @@ impl ReplayRing {
         }
         if tail.bytes.is_empty() {
             tail.size = size;
-        } else {
-            self.segments.push_back(RingSegment::empty(size));
+            return;
         }
+        if self.segments.len() >= MAX_RING_SEGMENTS {
+            let old = self.segments.pop_front().expect("len >= cap");
+            let head = self.segments.front_mut().expect("cap >= 2");
+            // The merged segment keeps `head`'s (newer) geometry; prepending
+            // the older bytes shifts the wrap error onto history that was
+            // already the least accurate.
+            let mut merged = old.bytes;
+            merged.extend(head.bytes.drain(..));
+            head.bytes = merged;
+        }
+        self.segments.push_back(RingSegment::empty(size));
     }
 
     /// Append `bytes` to the live tail, dropping the oldest bytes — and any
@@ -2326,6 +2346,36 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         ring.replay(&tx);
         assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(s)) if s == ws(80, 24)));
+    }
+
+    /// Tiny segments (a drag-resize over a redrawing TUI) must not accumulate
+    /// without bound: past `MAX_RING_SEGMENTS` the oldest two merge — no bytes
+    /// lost, and the merged head carries the *newer* of the two geometries.
+    #[test]
+    fn ring_caps_segment_count_by_merging_oldest() {
+        let mut ring = ReplayRing::new(ws(100, 24));
+        let rounds = MAX_RING_SEGMENTS + 10;
+        for i in 0..rounds {
+            ring.append(format!("seg{i:02} ").as_bytes());
+            ring.resize(ws(101 + i as u16, 24));
+        }
+        assert_eq!(ring.segments.len(), MAX_RING_SEGMENTS);
+
+        // Every byte survives the merges, in order.
+        let flat = String::from_utf8(ring.flatten()).unwrap();
+        let expect: String = (0..rounds).map(|i| format!("seg{i:02} ")).collect();
+        assert_eq!(flat, expect);
+
+        // 74 recorded segments squeezed into 64: the head absorbed the 11
+        // oldest, and replays them at the geometry of the newest one merged
+        // (seg 11 was recorded at 111 cols).
+        let head = ring.segments.front().unwrap();
+        assert_eq!(head.size, ws(111, 24));
+        assert!(
+            String::from_utf8(head.to_vec())
+                .unwrap()
+                .ends_with("seg11 ")
+        );
     }
 
     /// OSC 7 cwd is sniffed and surfaced as a `cwd` signal.
