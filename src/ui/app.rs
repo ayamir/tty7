@@ -2793,29 +2793,34 @@ impl Tty7App {
     }
 
     /// The status-dot colour for a tab whose representative pane is an SSH
-    /// session (PRD FR-E2): native panes are phase-coloured (connecting = warning,
-    /// connected = accent, failed/disconnected = red); a foreground `ssh` typed
-    /// into a shell gets a plain neutral dot. `None` for non-SSH tabs (no dot).
-    pub(crate) fn tab_ssh_dot(&self, tab: &Tab, cx: &App) -> Option<gpui::Hsla> {
+    /// session (PRD FR-E2), as an RGB value from the same hardcoded semantic
+    /// palette as [`AgentStatus::dot_rgb`] — not the theme's UI tokens, which
+    /// in this app are soft neutral fills (accent is the list-selection grey)
+    /// and read as no state at all. Native panes are phase-coloured
+    /// (connecting = amber, connected = green, failed/disconnected = red); a
+    /// foreground `ssh` typed into a shell gets a plain neutral dot. `None`
+    /// for non-SSH tabs (no dot).
+    ///
+    /// [`AgentStatus::dot_rgb`]: crate::core::cli_agent::AgentStatus::dot_rgb
+    pub(crate) fn tab_ssh_dot(&self, tab: &Tab, cx: &App) -> Option<u32> {
         use crate::daemon::protocol::SshPhase;
         let leaf = tab.pane.first_leaf()?;
         let v = leaf.read(cx);
-        let theme = cx.theme();
         if let Some(phase) = v.ssh_phase() {
             // Native pane.
-            let color = if v.ssh_disconnected() {
-                theme.danger
+            let rgb = if v.ssh_disconnected() {
+                0xEF4444 // red: link lost
             } else {
                 match phase {
-                    SshPhase::Connecting | SshPhase::Authenticating => theme.warning,
-                    SshPhase::Connected => theme.accent,
-                    SshPhase::Failed { .. } => theme.danger,
+                    SshPhase::Connecting | SshPhase::Authenticating => 0xF59E0B, // amber: in flight
+                    SshPhase::Connected => 0x22C55E, // green: link up
+                    SshPhase::Failed { .. } => 0xEF4444, // red: never made it
                 }
             };
-            Some(color)
+            Some(rgb)
         } else if v.remote_context().is_some() {
             // A foreground `ssh` typed into a shell: a plain neutral dot.
-            Some(theme.muted_foreground)
+            Some(0x9CA3AF)
         } else {
             None
         }
