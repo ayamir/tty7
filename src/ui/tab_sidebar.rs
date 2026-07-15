@@ -134,17 +134,15 @@ impl Tty7App {
                         .items_center()
                         .gap_1p5()
                         .when_some(git_cwd, |counts, cwd| {
-                            counts
-                                .cursor_pointer()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                                        // Swallow the press so the row/label
-                                        // handlers don't also activate the tab.
-                                        cx.stop_propagation();
-                                        this.toggle_diff_overlay(cwd.clone(), window, cx);
-                                    }),
-                                )
+                            counts.cursor_pointer().on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                    // Swallow the press so the row/label
+                                    // handlers don't also activate the tab.
+                                    cx.stop_propagation();
+                                    this.toggle_diff_overlay(cwd.clone(), window, cx);
+                                }),
+                            )
                         });
                     if g.added > 0 {
                         counts = counts.child(
