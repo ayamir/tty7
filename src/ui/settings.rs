@@ -2791,7 +2791,7 @@ impl Tty7App {
     /// Agents section: one row per hook-capable agent — install state + actions
     /// per row, copy kept terse.
     fn render_settings_agents(&self, cx: &mut Context<Self>) -> AnyElement {
-        use crate::core::agent_hooks::{HookAgent, HooksState};
+        use crate::core::agent_hooks::HooksState;
 
         let theme = cx.theme();
         let (foreground, muted_fg) = (theme.foreground, theme.muted_foreground);

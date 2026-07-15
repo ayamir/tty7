@@ -2170,30 +2170,6 @@ impl Tty7App {
             OpenSshProfiles => self.open_settings_section(SettingsSection::Ssh, window, cx),
             SendSelectionToAgent => self.send_selection_to_agent(window, cx),
             SendGitDiffToAgent => self.send_git_diff_to_agent(window, cx),
-            InstallClaudeHooks => {
-                // Synchronous file edit; report the outcome as a toast either
-                // way. Installing over an existing install just refreshes the
-                // entries (e.g. after the tty7 binary moved) — say so.
-                use crate::core::agent_hooks::{HookAgent, HooksState};
-                let refreshed = crate::core::agent_hooks::hooks_state(HookAgent::Claude)
-                    != HooksState::NotInstalled;
-                match crate::core::agent_hooks::install_hooks(HookAgent::Claude) {
-                    Ok(summary) if refreshed => crate::terminal::notify_desktop(
-                        Some("tty7"),
-                        &format!("Refreshed: {summary}"),
-                    ),
-                    Ok(summary) => crate::terminal::notify_desktop(Some("tty7"), &summary),
-                    Err(e) => crate::terminal::notify_desktop(
-                        Some("tty7"),
-                        &format!("Claude Code hook install failed: {e}"),
-                    ),
-                }
-                // Keep an open Settings → Agents page truthful about what just
-                // happened behind its back.
-                if let Some(s) = self.settings.as_mut() {
-                    s.agent_hooks_states = Self::agent_hooks_snapshot();
-                }
-            }
             // Handled inside `PaletteView` (opens a sub-list); these never emit a
             // `Confirm` for this variant, so they never reach here.
             OpenThemePicker | OpenSshConnectInput => {}

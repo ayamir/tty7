@@ -66,9 +66,6 @@ pub enum CommandKind {
     /// Send the repo's uncommitted `git diff` (from the focused pane's cwd) to
     /// a running CLI coding agent's pane as a review prompt.
     SendGitDiffToAgent,
-    /// Wire tty7's Claude Code hooks into `~/.claude/settings.json` so panes
-    /// running `claude` report rich status (working / needs input / done).
-    InstallClaudeHooks,
     /// Opens the theme sub-list (a nested palette). Handled in `PaletteView`.
     OpenThemePicker,
     /// Opens a typed SSH connection sub-list. Handled in `PaletteView`.
@@ -142,7 +139,6 @@ impl CommandKind {
             RestartSshSession => "RestartSshSession",
             SendSelectionToAgent
             | SendGitDiffToAgent
-            | InstallClaudeHooks
             | FindInTerminal
             | OpenThemePicker
             | OpenSshConnectInput
@@ -230,8 +226,6 @@ impl Command {
                 .with_subtitle("selection → running coding agent"),
             Command::new("Agent: Send Git Diff for Review", SendGitDiffToAgent)
                 .with_subtitle("git diff → running coding agent"),
-            Command::new("Agent: Install Claude Code Hooks", InstallClaudeHooks)
-                .with_subtitle("rich status + resume for claude"),
         ]
     }
 
