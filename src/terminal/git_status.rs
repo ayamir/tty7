@@ -149,8 +149,10 @@ impl GitStatusCache {
     }
 }
 
-/// The current branch name, or a short sha for a detached HEAD.
-fn branch_name(cwd: &Path) -> Option<String> {
+/// The current branch name, or a short sha for a detached HEAD. Shared with
+/// [`git_diff`](crate::terminal::git_diff), which fronts its overlay with the
+/// same branch label the sidebar row shows.
+pub(crate) fn branch_name(cwd: &Path) -> Option<String> {
     // On a branch — even before the first commit — `symbolic-ref` names it.
     if let Some(out) = git(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
         let name = out.trim();
@@ -186,8 +188,9 @@ fn diff_numstat(cwd: &Path) -> Option<(u32, u32)> {
 /// Run `git -C <cwd> <args>` and return stdout on success, `None` on a
 /// non-zero exit or a missing `git`. `GIT_OPTIONAL_LOCKS=0` makes the read
 /// truly read-only; stdin is nulled so a misconfigured git can't block on a
-/// prompt.
-fn git(cwd: &Path, args: &[&str]) -> Option<String> {
+/// prompt. Shared with [`git_diff`](crate::terminal::git_diff) so every git
+/// read in the app goes through the same lock-free, prompt-proof invocation.
+pub(crate) fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(cwd)

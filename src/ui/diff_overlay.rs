@@ -1,0 +1,560 @@
+//! The working-tree diff overlay: a read-only, GitHub-style unified diff that
+//! covers the terminal area when the user clicks a sidebar row's git line
+//! (`⎇ branch +N −N`). One scrolling column — per-file cards with collapsible
+//! hunk bodies, plus an untracked-files section `git diff` itself can't show.
+//!
+//! Deliberately a *lens*, not a git client: no staging, no discard, no
+//! side-by-side. The terminal keeps running underneath (the overlay covers
+//! only the body area, never the sidebar, so other tabs' git lines stay
+//! clickable to switch which repo is shown). Esc, the ✕, or re-clicking the
+//! same git line closes it.
+//!
+//! Data comes from [`crate::terminal::git_diff`], probed off-thread on open
+//! and re-probed automatically while open whenever the shared
+//! [`GitStatusCache`](crate::terminal::git_status::GitStatusCache) lands a
+//! snapshot whose branch or counts disagree with what's shown — so a finishing
+//! command or agent turn refreshes the overlay through the exact trigger
+//! machinery the sidebar numbers already use.
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+use gpui::{
+    AnyElement, FocusHandle, FontWeight, KeyDownEvent, Window, div, prelude::*, px,
+};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+
+use crate::terminal::git_diff::{
+    self, AUTO_COLLAPSE_LINES, DiffSnapshot, FileDiff, FileStatus, LineKind,
+};
+use crate::ui::app::Tty7App;
+
+/// What the overlay currently shows: probing, a parsed snapshot, or the
+/// answer that the cwd stopped being a repo.
+pub(crate) enum DiffLoad {
+    /// First probe still in flight.
+    Loading,
+    Ready(DiffSnapshot),
+    /// The probe came back "not a work tree" (repo deleted, dir gone).
+    NotARepo,
+}
+
+/// State of the open diff overlay (`None` on [`Tty7App`] when closed).
+pub(crate) struct DiffOverlayState {
+    /// The pane cwd the diff is probed from — the same path the clicked git
+    /// line resolved its status through, so overlay and sidebar agree on the
+    /// repo. Also the toggle key: re-clicking a line with this cwd closes.
+    pub(crate) cwd: PathBuf,
+    /// Focus target so Esc lands on the overlay's key handler.
+    pub(crate) focus_handle: FocusHandle,
+    pub(crate) load: DiffLoad,
+    /// A probe is currently in flight (initial or refresh).
+    pub(crate) loading: bool,
+    /// Files the user flipped away from their default collapse state (small
+    /// files default open, big/binary ones closed). Keyed by path so the set
+    /// survives a background refresh of the snapshot.
+    pub(crate) toggled: HashSet<String>,
+}
+
+impl Tty7App {
+    /// Open the diff overlay for `cwd` — or close it when it's already open
+    /// for that same cwd (the git line acts as a toggle). Opening for a
+    /// different cwd swaps the overlay's repo in place.
+    pub(crate) fn toggle_diff_overlay(
+        &mut self,
+        cwd: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.diff_overlay.as_ref().is_some_and(|o| o.cwd == cwd) {
+            self.close_diff_overlay(window, cx);
+            return;
+        }
+        // The overlay steals focus (it needs Esc); snapshot the active pane so
+        // closing lands back on the same terminal — same discipline as Settings.
+        self.remember_active_pane(window, cx);
+        let focus_handle = cx.focus_handle();
+        self.diff_overlay = Some(DiffOverlayState {
+            cwd,
+            focus_handle: focus_handle.clone(),
+            load: DiffLoad::Loading,
+            loading: false,
+            toggled: HashSet::new(),
+        });
+        window.focus(&focus_handle, cx);
+        self.spawn_diff_probe(cx);
+        cx.notify();
+    }
+
+    /// Close the overlay (Esc, ✕, or the toggle) and give focus back to the
+    /// active terminal.
+    pub(crate) fn close_diff_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.diff_overlay.take().is_some() {
+            self.focus_active(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Kick off an off-thread full-diff probe for the overlay's cwd. In-flight
+    /// dedup is a simple flag: refresh triggers while one flies are dropped —
+    /// the status cache will fire again on the next real change, and a
+    /// just-landed diff is fresh enough.
+    fn spawn_diff_probe(&mut self, cx: &mut Context<Self>) {
+        let Some(overlay) = self.diff_overlay.as_mut() else {
+            return;
+        };
+        if overlay.loading {
+            return;
+        }
+        overlay.loading = true;
+        let cwd = overlay.cwd.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let cwd = cwd.clone();
+                    async move { git_diff::probe(&cwd) }
+                })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                // Guarded by cwd: if the overlay was closed, or swapped to
+                // another repo while we flew, this landing is obsolete.
+                let Some(overlay) = app.diff_overlay.as_mut().filter(|o| o.cwd == cwd) else {
+                    return;
+                };
+                overlay.loading = false;
+                overlay.load = match result {
+                    Some(snap) => DiffLoad::Ready(snap),
+                    None => DiffLoad::NotARepo,
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Re-probe the open overlay when the shared status cache learned
+    /// something newer than what's shown — called from the app's
+    /// `observe_global::<GitStatusCache>` hook, i.e. on the very triggers
+    /// (command end, agent-turn end, cwd change) that refresh the sidebar
+    /// numbers. Comparing branch + totals keeps the quiet case (unrelated
+    /// repo's probe landing) from spawning needless `git diff` runs.
+    pub(crate) fn maybe_refresh_diff_overlay(&mut self, cx: &mut Context<Self>) {
+        let Some(overlay) = self.diff_overlay.as_ref() else {
+            return;
+        };
+        if overlay.loading {
+            return;
+        }
+        let DiffLoad::Ready(snap) = &overlay.load else {
+            return; // initial probe pending, or repo gone — nothing to diff against
+        };
+        let Some(status) = cx
+            .try_global::<crate::terminal::git_status::GitStatusCache>()
+            .and_then(|cache| cache.status_for(&overlay.cwd))
+        else {
+            return;
+        };
+        if status.branch != snap.branch || (status.added, status.removed) != snap.totals() {
+            self.spawn_diff_probe(cx);
+        }
+    }
+
+    /// The overlay element, or `None` when closed. Mounted as the topmost
+    /// absolute child of the body area — it covers the terminal but not the
+    /// sidebar or title strip.
+    pub(crate) fn render_diff_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let overlay = self.diff_overlay.as_ref()?;
+
+        let content = match &overlay.load {
+            DiffLoad::Loading => self.diff_message("Reading diff…", cx),
+            DiffLoad::NotARepo => self.diff_message("Not a git repository", cx),
+            DiffLoad::Ready(snap) if snap.files.is_empty() && snap.untracked.is_empty() => {
+                self.diff_message("Working tree clean", cx)
+            }
+            DiffLoad::Ready(snap) => self.diff_file_list(snap, &overlay.toggled, cx),
+        };
+
+        let header = self.diff_header(overlay, cx);
+
+        Some(
+            v_flex()
+                .absolute()
+                .inset_0()
+                // Blocks mouse from reaching the terminal underneath.
+                .occlude()
+                .bg(cx.theme().background)
+                .text_color(cx.theme().foreground)
+                .track_focus(&overlay.focus_handle)
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                    if ev.keystroke.key.as_str() == "escape" {
+                        this.close_diff_overlay(window, cx);
+                    }
+                }))
+                .child(header)
+                .child(content)
+                .into_any_element(),
+        )
+    }
+
+    /// Top bar: branch, file/line totals, a subtle refresh spinner slot, ✕.
+    fn diff_header(
+        &self,
+        overlay: &DiffOverlayState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let (branch, files, untracked, added, removed) = match &overlay.load {
+            DiffLoad::Ready(s) => {
+                let (a, r) = s.totals();
+                (s.branch.clone(), s.files.len(), s.untracked.len(), a, r)
+            }
+            _ => (String::new(), 0, 0, 0, 0),
+        };
+        h_flex()
+            .flex_shrink_0()
+            .h(px(40.))
+            .px_3()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                gpui::svg()
+                    .path("icons/git-branch.svg")
+                    .flex_shrink_0()
+                    .size(px(13.))
+                    .text_color(cx.theme().muted_foreground),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(branch),
+            )
+            .when(matches!(overlay.load, DiffLoad::Ready(_)), |bar| {
+                let mut summary = format!(
+                    "{} changed file{}",
+                    files,
+                    if files == 1 { "" } else { "s" }
+                );
+                if untracked > 0 {
+                    summary.push_str(&format!(" · {untracked} untracked"));
+                }
+                bar.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(summary),
+                )
+                .when(added > 0, |bar| {
+                    bar.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().success)
+                            .child(format!("+{added}")),
+                    )
+                })
+                .when(removed > 0, |bar| {
+                    bar.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().danger)
+                            .child(format!("−{removed}")),
+                    )
+                })
+            })
+            // A quiet "refreshing" hint while a re-probe flies over stale data.
+            .when(overlay.loading && matches!(overlay.load, DiffLoad::Ready(_)), |bar| {
+                bar.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("refreshing…"),
+                )
+            })
+            .child(div().flex_1())
+            .child(
+                Button::new("diff-overlay-close")
+                    .icon(IconName::Close)
+                    .ghost()
+                    .small()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close_diff_overlay(window, cx);
+                    })),
+            )
+    }
+
+    /// A centered single-line state (loading / clean / not-a-repo).
+    fn diff_message(&self, text: &'static str, cx: &Context<Self>) -> AnyElement {
+        div()
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(text)
+            .into_any_element()
+    }
+
+    /// The scrolling column of per-file diff cards plus the untracked section.
+    fn diff_file_list(
+        &self,
+        snap: &DiffSnapshot,
+        toggled: &HashSet<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut list = v_flex().gap_3().p_4().w_full();
+        for (idx, file) in snap.files.iter().enumerate() {
+            let expanded = file_expanded(file, toggled);
+            list = list.child(self.diff_file_card(idx, file, expanded, cx));
+        }
+        if !snap.untracked.is_empty() {
+            list = list.child(self.diff_untracked_section(&snap.untracked, cx));
+        }
+        div()
+            .id("diff-overlay-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .child(list)
+            .into_any_element()
+    }
+
+    /// One file's card: a clickable header row and, when expanded, the hunks.
+    fn diff_file_card(
+        &self,
+        idx: usize,
+        file: &FileDiff,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Binary files and pure renames have no hunk body to reveal; their
+        // header is inert (no chevron, no click).
+        let expandable = !file.binary && !file.hunks.is_empty();
+        let (glyph, glyph_color) = match file.status {
+            FileStatus::Added => ("A", cx.theme().success),
+            FileStatus::Modified => ("M", cx.theme().warning),
+            FileStatus::Deleted => ("D", cx.theme().danger),
+            FileStatus::Renamed => ("R", cx.theme().muted_foreground),
+        };
+        // `old → new` for renames, the plain path otherwise.
+        let shown_path = match &file.old_path {
+            Some(old) => format!("{old} → {}", file.path),
+            None => file.path.clone(),
+        };
+
+        let mut header = h_flex()
+            .id(("diff-file-header", idx))
+            .w_full()
+            .items_center()
+            .gap_2()
+            .px_2p5()
+            .py_1p5()
+            .bg(cx.theme().secondary)
+            .when(expandable, |h| {
+                let path = file.path.clone();
+                h.cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().list_hover))
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        if let Some(overlay) = this.diff_overlay.as_mut() {
+                            // Flip this file's override; removing an existing
+                            // entry returns it to its default state.
+                            if !overlay.toggled.remove(&path) {
+                                overlay.toggled.insert(path.clone());
+                            }
+                            cx.notify();
+                        }
+                    }))
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .small()
+                        .text_color(cx.theme().muted_foreground),
+                    )
+            })
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .font_family(self.font_family.clone())
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(glyph_color)
+                    .child(glyph),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .font_family(self.font_family.clone())
+                    .child(shown_path),
+            );
+        if file.binary {
+            header = header.child(
+                div()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("binary"),
+            );
+        }
+        if file.added > 0 {
+            header = header.child(
+                div()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(cx.theme().success)
+                    .child(format!("+{}", file.added)),
+            );
+        }
+        if file.removed > 0 {
+            header = header.child(
+                div()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(format!("−{}", file.removed)),
+            );
+        }
+
+        let mut card = v_flex()
+            .w_full()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded_md()
+            .overflow_hidden()
+            .child(header);
+
+        if expanded {
+            let mut body = v_flex().w_full();
+            for hunk in &file.hunks {
+                body = body.child(
+                    div()
+                        .w_full()
+                        .px_2()
+                        .py_0p5()
+                        .bg(cx.theme().muted)
+                        .text_xs()
+                        .font_family(self.font_family.clone())
+                        .text_color(cx.theme().muted_foreground)
+                        .truncate()
+                        .child(hunk.header.clone()),
+                );
+                for line in &hunk.lines {
+                    body = body.child(self.diff_line_row(line, cx));
+                }
+            }
+            if file.truncated {
+                body = body.child(
+                    div()
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "Diff truncated at {} lines — run `git diff` in the terminal for the rest.",
+                            git_diff::MAX_LINES_PER_FILE
+                        )),
+                );
+            }
+            card = card.child(body);
+        }
+        card.into_any_element()
+    }
+
+    /// One diff line: two right-aligned line-number gutters, then the marker
+    /// and text in the terminal font, the whole row tinted green/red.
+    fn diff_line_row(&self, line: &git_diff::DiffLine, cx: &Context<Self>) -> AnyElement {
+        let (marker, tint) = match line.kind {
+            LineKind::Added => ("+", Some(cx.theme().success.opacity(0.12))),
+            LineKind::Removed => ("−", Some(cx.theme().danger.opacity(0.12))),
+            LineKind::Context => (" ", None),
+        };
+        let gutter = |no: Option<u32>| {
+            h_flex()
+                .flex_shrink_0()
+                .w(px(42.))
+                .justify_end()
+                .pr_1p5()
+                .text_color(cx.theme().muted_foreground.opacity(0.7))
+                .child(no.map(|n| n.to_string()).unwrap_or_default())
+        };
+        h_flex()
+            .w_full()
+            // Fixed row height so blank diff lines don't collapse.
+            .h(px(19.))
+            .items_center()
+            .text_xs()
+            .font_family(self.font_family.clone())
+            .when_some(tint, |row, bg| row.bg(bg))
+            .child(gutter(line.old_no))
+            .child(gutter(line.new_no))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    // Tabs don't expand in UI text layout; four spaces keeps
+                    // indentation readable.
+                    .child(format!("{marker} {}", line.text.replace('\t', "    "))),
+            )
+            .into_any_element()
+    }
+
+    /// The trailing "Untracked files" section: names only — `git diff HEAD`
+    /// has no blob to diff a never-added file against, but hiding them would
+    /// read as lost work (agents create files constantly).
+    fn diff_untracked_section(&self, untracked: &[String], cx: &Context<Self>) -> AnyElement {
+        let mut section = v_flex()
+            .w_full()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded_md()
+            .overflow_hidden()
+            .child(
+                div()
+                    .w_full()
+                    .px_2p5()
+                    .py_1p5()
+                    .bg(cx.theme().secondary)
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("Untracked files ({})", untracked.len())),
+            );
+        for path in untracked {
+            section = section.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .px_2p5()
+                    .py_1()
+                    .text_xs()
+                    .font_family(self.font_family.clone())
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(cx.theme().success)
+                            .child("A"),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(path.clone())),
+            );
+        }
+        section.into_any_element()
+    }
+}
+
+/// Whether a file's body shows: small text diffs default open, big ones (and
+/// anything the user explicitly flipped) invert via the `toggled` set.
+fn file_expanded(file: &FileDiff, toggled: &HashSet<String>) -> bool {
+    let default_open = file.added + file.removed <= AUTO_COLLAPSE_LINES;
+    default_open != toggled.contains(&file.path)
+}
