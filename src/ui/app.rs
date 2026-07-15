@@ -2,7 +2,8 @@
 //! with the active terminal filling the rest. Owns all tabs (each its own PTY).
 
 use gpui::{
-    App, Axis, Context, Entity, Focusable, PromptLevel, Subscription, Window, div, prelude::*, px,
+    App, Axis, Bounds, Context, Entity, Focusable, Pixels, PromptLevel, Subscription, Window, div,
+    prelude::*, px,
 };
 use gpui_component::color_picker::{ColorPickerEvent, ColorPickerState};
 use gpui_component::input::{InputEvent, InputState};
@@ -334,6 +335,10 @@ pub struct Tty7App {
     /// In-pane "confirm close of a live SSH session" state (PRD FR-E3): the close
     /// action awaiting confirmation, or `None` when no prompt is up.
     pub(crate) ssh_close_confirm: Option<SshCloseKind>,
+    /// Latest window geometry (the restore bounds while fullscreen), kept
+    /// current by a bounds observer so the quit hook can persist it to
+    /// `window.json` — at quit time no `&Window` is in reach to ask directly.
+    window_bounds: Bounds<Pixels>,
 }
 
 /// Which close action a live-SSH close-confirmation is gating (PRD FR-E3).
@@ -540,6 +545,7 @@ impl Tty7App {
             settings: None,
             ssh_prompt: crate::ui::ssh_prompt::SshPromptState::new(cx),
             ssh_close_confirm: None,
+            window_bounds: window.window_bounds().get_bounds(),
         };
         // Discover this machine's shells for the "+" dropdown off the UI thread
         // (the WSL probe on Windows spawns a process, and /etc/shells hits the
@@ -567,7 +573,21 @@ impl Tty7App {
         // after teardown).
         cx.on_app_quit(|app, cx| {
             app.save_session(cx);
+            // Also persist the window's final geometry so the next launch can
+            // reopen there (`remember_window_size`). Written unconditionally —
+            // startup gates on the config — so toggling the setting back on
+            // restores the most recent quit, not some stale pre-toggle state.
+            crate::core::window_state::WindowState::from_bounds(app.window_bounds).save();
             async move {}
+        })
+        .detach();
+
+        // Keep `window_bounds` tracking the live window: moves and resizes both
+        // fire this observer, and `window_bounds()` reports the *restore* bounds
+        // while fullscreen, so a fullscreen quit doesn't record a screen-sized
+        // window for the next normal launch.
+        cx.observe_window_bounds(window, |this, window, _cx| {
+            this.window_bounds = window.window_bounds().get_bounds();
         })
         .detach();
 
@@ -1433,6 +1453,10 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) {
         self.update_config(cx, |cfg| cfg.startup_mode = mode);
+    }
+
+    pub(crate) fn set_remember_window_size(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.remember_window_size = on);
     }
 
     pub(crate) fn focus_active(&self, window: &mut Window, cx: &mut App) {

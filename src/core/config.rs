@@ -156,6 +156,12 @@ pub struct Config {
     /// Window state at launch: normal / maximized / fullscreen.
     #[serde(default, deserialize_with = "de_lenient")]
     pub startup_mode: StartupMode,
+    /// Reopen a normal (non-maximized/fullscreen) startup window at the size
+    /// and position it had when tty7 last quit. On by default; off opens
+    /// centered at the built-in default size. The remembered geometry itself
+    /// lives in `window.json` (see [`crate::core::window_state`]), not here.
+    #[serde(default = "default_true")]
+    pub remember_window_size: bool,
 
     // ── Shell environment ───────────────────────────────────────────────────
     /// Where a shell starts when the client doesn't pass an explicit directory
@@ -436,6 +442,7 @@ impl Default for Config {
             clipboard_trim_trailing_spaces: false,
             copy_on_select: false,
             startup_mode: StartupMode::Normal,
+            remember_window_size: true,
             working_directory: WorkingDirectory::default(),
             env: HashMap::new(),
             ssh_profiles: Vec::new(),

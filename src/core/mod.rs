@@ -25,3 +25,4 @@ pub mod ssh_config;
 pub mod ssh_profile;
 pub mod threads;
 pub mod update;
+pub mod window_state;
