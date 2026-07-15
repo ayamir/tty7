@@ -134,8 +134,9 @@ impl Tab {
     /// The git snapshot (branch + working-tree diff) of the tab's label-driving
     /// terminal — the focused leaf with a `window`, else the first — for the
     /// sidebar row's branch line (the branch and change count shown under the
-    /// title). `None` when that leaf isn't inside a git work tree, or before
-    /// its first probe lands.
+    /// title). Read through the shared per-repo cache, so tabs in one work
+    /// tree always agree. `None` when that leaf isn't inside a git work tree,
+    /// or before the repo's first probe lands.
     pub(crate) fn git_status(
         &self,
         window: Option<&Window>,
@@ -145,7 +146,7 @@ impl Tab {
             Some(window) => self.pane.focused_or_first(window, cx),
             None => self.pane.first_leaf(),
         }?;
-        leaf.read(cx).git_status()
+        leaf.read(cx).git_status(cx)
     }
 
     /// The coding agent running in this tab, or `None`. Any leaf counts (a
@@ -262,6 +263,11 @@ pub struct Tty7App {
     /// by then — this window never gets that `ModifiersChanged`, so without
     /// this the badges stuck on until some later keypress. Never read.
     _activation_watch: Subscription,
+    /// Keeps the `observe_global::<GitStatusCache>` subscription alive: a git
+    /// probe landing (from *any* pane) repaints the sidebar, so every row in
+    /// the same repo shows the just-refreshed branch/diff line, not a stale
+    /// per-row copy. Never read.
+    _git_status_watch: Subscription,
     /// `Some` while the command palette overlay is open; `None` when closed.
     /// The view owns its search input, filtered list and keyboard handling and
     /// emits a `PaletteEvent`; we build the catalog and run the chosen command.
@@ -349,7 +355,61 @@ impl Tty7App {
         } else {
             None
         };
-        Self::with_session(session, window, cx)
+        let app = Self::with_session(session, window, cx);
+        // If startup reused a daemon that speaks a different wire protocol
+        // (an app upgrade while the old service kept running), the sessions
+        // just restored above are living on that old dialect. Surface the
+        // keep-or-restart choice now that there's a window to ask in.
+        Self::prompt_daemon_version_mismatch(window, cx);
+        app
+    }
+
+    /// Ask what to do about a protocol-mismatched daemon that
+    /// `spawn::ensure_running` deliberately left running (rather than silently
+    /// killing every persisted session at startup): keep using it — sessions
+    /// survive, features whose wire shape changed may misbehave — or restart
+    /// the service clean via the shared
+    /// [`restart_daemon_confirmed`](Self::restart_daemon_confirmed) path
+    /// (tabs reopen with fresh shells). Keeping is the default: dismissing
+    /// the prompt changes nothing.
+    fn prompt_daemon_version_mismatch(window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mismatch) = crate::daemon::spawn::take_mismatched_daemon() else {
+            return;
+        };
+        let ours = crate::daemon::protocol::PROTOCOL_VERSION;
+        let detail = match mismatch.version {
+            Some(v) => format!(
+                "The daemon holding your sessions is from another build \
+                 (v{}, protocol {} — this app speaks {}). You can keep using it and \
+                 your sessions stay, but features whose wire format changed may \
+                 misbehave until it's restarted. Restarting starts a clean daemon: \
+                 tabs reopen with fresh shells and anything running in them is \
+                 terminated.",
+                v.build, v.protocol, ours
+            ),
+            None => "The daemon holding your sessions is from an older \
+                 version of the app. You can keep using it and your sessions stay, \
+                 but newer features may misbehave until it's restarted. Restarting \
+                 starts a clean daemon: tabs reopen with fresh shells and anything \
+                 running in them is terminated."
+                .to_string(),
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Daemon Is From Another Version",
+            Some(&detail),
+            &["Keep Sessions", "Restart Daemon"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            // Index 1 == "Restart Daemon"; "Keep Sessions" or a dismissed
+            // prompt leave the old daemon (and every session) untouched.
+            if !matches!(answer.await, Ok(1)) {
+                return;
+            }
+            let _ = this.update_in(cx, |this, _window, cx| this.restart_daemon_confirmed(cx));
+        })
+        .detach();
     }
 
     /// The whole constructor behind `new`, with the saved session injected
@@ -382,6 +442,12 @@ impl Tty7App {
         // and colors are handled separately by `apply_theme`; here we cover the
         // font knobs that live on `Tty7App`/the panes.
         let config_watch = cx.observe_global::<Config>(|this, cx| this.reload_from_config(cx));
+        // Repaint when any pane's git probe lands in the shared cache — the
+        // sidebar's branch/diff lines read from it, and the probing pane's own
+        // notify wouldn't re-render rows belonging to *other* panes.
+        cx.default_global::<crate::terminal::git_status::GitStatusCache>();
+        let git_status_watch = cx
+            .observe_global::<crate::terminal::git_status::GitStatusCache>(|_, cx| cx.notify());
         // Any real keypress means "chord, not a bare hold": cancel the held-⌘
         // tab badges and whatever reveal is pending (see `ui::hints`).
         let this = cx.weak_entity();
@@ -443,6 +509,7 @@ impl Tty7App {
             _config_watch: config_watch,
             _keystroke_watch: keystroke_watch,
             _activation_watch: activation_watch,
+            _git_status_watch: git_status_watch,
             palette: None,
             palette_sub: None,
             closed: Vec::new(),
@@ -631,6 +698,17 @@ impl Tty7App {
             if !matches!(answer.await, Ok(1)) {
                 return;
             }
+            let _ = this.update_in(cx, |this, _window, cx| this.restart_daemon_confirmed(cx));
+        })
+        .detach();
+    }
+
+    /// The restart itself, past any confirmation — shared by
+    /// [`restart_daemon`](Self::restart_daemon)'s prompt and the startup
+    /// version-mismatch prompt
+    /// ([`prompt_daemon_version_mismatch`](Self::prompt_daemon_version_mismatch)).
+    fn restart_daemon_confirmed(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
             // Persist the current layout + cwds, then tear the live terminals down
             // *before* the daemon dies: dropping each `RemoteTerminal` detaches its
             // socket, so no reader thread is mid-read when the daemon exits. The
@@ -2793,29 +2871,34 @@ impl Tty7App {
     }
 
     /// The status-dot colour for a tab whose representative pane is an SSH
-    /// session (PRD FR-E2): native panes are phase-coloured (connecting = warning,
-    /// connected = accent, failed/disconnected = red); a foreground `ssh` typed
-    /// into a shell gets a plain neutral dot. `None` for non-SSH tabs (no dot).
-    pub(crate) fn tab_ssh_dot(&self, tab: &Tab, cx: &App) -> Option<gpui::Hsla> {
+    /// session (PRD FR-E2), as an RGB value from the same hardcoded semantic
+    /// palette as [`AgentStatus::dot_rgb`] — not the theme's UI tokens, which
+    /// in this app are soft neutral fills (accent is the list-selection grey)
+    /// and read as no state at all. Native panes are phase-coloured
+    /// (connecting = amber, connected = green, failed/disconnected = red); a
+    /// foreground `ssh` typed into a shell gets a plain neutral dot. `None`
+    /// for non-SSH tabs (no dot).
+    ///
+    /// [`AgentStatus::dot_rgb`]: crate::core::cli_agent::AgentStatus::dot_rgb
+    pub(crate) fn tab_ssh_dot(&self, tab: &Tab, cx: &App) -> Option<u32> {
         use crate::daemon::protocol::SshPhase;
         let leaf = tab.pane.first_leaf()?;
         let v = leaf.read(cx);
-        let theme = cx.theme();
         if let Some(phase) = v.ssh_phase() {
             // Native pane.
-            let color = if v.ssh_disconnected() {
-                theme.danger
+            let rgb = if v.ssh_disconnected() {
+                0xEF4444 // red: link lost
             } else {
                 match phase {
-                    SshPhase::Connecting | SshPhase::Authenticating => theme.warning,
-                    SshPhase::Connected => theme.accent,
-                    SshPhase::Failed { .. } => theme.danger,
+                    SshPhase::Connecting | SshPhase::Authenticating => 0xF59E0B, // amber: in flight
+                    SshPhase::Connected => 0x22C55E, // green: link up
+                    SshPhase::Failed { .. } => 0xEF4444, // red: never made it
                 }
             };
-            Some(color)
+            Some(rgb)
         } else if v.remote_context().is_some() {
             // A foreground `ssh` typed into a shell: a plain neutral dot.
-            Some(theme.muted_foreground)
+            Some(0x9CA3AF)
         } else {
             None
         }

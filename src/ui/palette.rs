@@ -334,7 +334,17 @@ impl PaletteDelegate {
     }
 
     /// The QuickConnect rows for a query at the root, if it parses as a target.
+    ///
+    /// Beyond parsing, the query must *look like* a connect target — contain
+    /// `@`, `:` or `.` (`user@host`, `host:port`, an FQDN/IP; `ssh://` and
+    /// bracketed IPv6 both carry a `:`). A bare word like "java" parses as a
+    /// valid hostname too, but injecting these rows for every word would pin
+    /// them above all command searches; bare short names keep the SSH Connect
+    /// input as their path.
     fn quick_connect_commands(query: &str) -> Vec<Command> {
+        if !query.contains(['@', ':', '.']) {
+            return Vec::new();
+        }
         match parse_quick_connect(query) {
             Some(_) => {
                 let target = query.trim().to_string();
@@ -721,5 +731,53 @@ impl Render for PaletteView {
                 }),
             )
             .child(div().occlude().child(card))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Titles of the QuickConnect rows injected for a root-palette query.
+    fn row_titles(query: &str) -> Vec<String> {
+        PaletteDelegate::quick_connect_commands(query)
+            .into_iter()
+            .map(|c| c.title)
+            .collect()
+    }
+
+    #[test]
+    fn bare_word_gets_no_quick_connect_rows() {
+        assert!(row_titles("java").is_empty());
+        assert!(row_titles("split").is_empty());
+        assert!(row_titles("").is_empty());
+    }
+
+    #[test]
+    fn host_like_queries_get_connect_and_save_rows() {
+        for q in [
+            "deploy@10.0.0.5",
+            "host.example.com",
+            "java:2222",
+            "ssh://java",
+            "[::1]:2222",
+        ] {
+            let titles = row_titles(q);
+            assert_eq!(
+                titles,
+                vec![
+                    format!("Connect to \"{q}\""),
+                    format!("Save \"{q}\" as profile…"),
+                ],
+                "query {q:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_like_but_unparsable_gets_no_rows() {
+        // Contains ':' but the port segment is invalid → parse fails.
+        assert!(row_titles("java:99999").is_empty());
+        assert!(row_titles("@").is_empty());
     }
 }

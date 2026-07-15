@@ -147,7 +147,8 @@ impl Render for DragTab {
 }
 
 impl Tty7App {
-    /// The status dot pinned to an agent avatar's bottom-right corner: a solid
+    /// The status dot pinned to a tab avatar's bottom-right corner (an agent's
+    /// live status, or an SSH pane's connection phase): a solid
     /// `rgb` disc with a surface-colored separator ring so it reads as sitting
     /// on the badge. When `unread` (a finished turn you haven't looked at), the
     /// dot gains a crisp outer ring of the same hue — the dot's separator ring
@@ -204,16 +205,17 @@ impl Tty7App {
     /// The leading avatar for a tab row/chip: a rounded badge that brands the
     /// tab by what's running in it — each session fronted with an icon. A
     /// recognized coding agent gets its brand mark — a white silhouette
-    /// (gpui tints SVGs as an alpha mask) on the vendor accent; an SSH pane gets
-    /// a terminal glyph ringed in its connection-status colour; a plain shell
-    /// gets a neutral terminal glyph. An agent's live status rides the corner as
-    /// a [`status_dot`](Self::status_dot). `size` is the badge's edge in px.
+    /// (gpui tints SVGs as an alpha mask) on the vendor accent; a plain shell
+    /// gets a neutral terminal glyph. Live status rides the corner as a
+    /// [`status_dot`](Self::status_dot) — the agent's working/waiting/done, or
+    /// an SSH pane's connection phase (`ssh`) — one corner-dot language for
+    /// the whole avatar column. `size` is the badge's edge in px.
     pub(crate) fn tab_avatar(
         &self,
         agent: Option<crate::core::cli_agent::CLIAgent>,
         status: Option<crate::core::cli_agent::AgentStatus>,
         unread: bool,
-        ssh: Option<gpui::Hsla>,
+        ssh: Option<u32>,
         size: f32,
         cx: &App,
     ) -> gpui::AnyElement {
@@ -251,11 +253,11 @@ impl Tty7App {
                     .into_any_element()
             }
             None => base
+                .relative()
                 .rounded_full()
                 // A clearly-visible neutral disc (a neutral grey shell badge), not a
                 // near-transparent tint — so the avatar column reads as a column.
                 .bg(cx.theme().muted)
-                .when_some(ssh, |d, c| d.border_2().border_color(c))
                 .child(
                     // A flush `>_` prompt (not the boxed `square-terminal`) so it
                     // fills the badge at the same visual weight as a brand mark.
@@ -264,6 +266,10 @@ impl Tty7App {
                         .size(px(size * 0.56))
                         .text_color(cx.theme().foreground.opacity(0.65)),
                 )
+                // SSH connection phase as a corner status dot — the same
+                // element as an agent's, not a border ring around the badge
+                // (a ring read as a second, differently-shaped avatar style).
+                .when_some(ssh, |b, rgb| b.child(Self::status_dot(rgb, false, size, cx)))
                 .into_any_element(),
         }
     }
@@ -560,8 +566,14 @@ impl Tty7App {
                     }),
                 )
                 // Leading SSH status dot when this tab hosts an SSH session.
-                .when_some(ssh_dot, |c, color| {
-                    c.child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(color))
+                .when_some(ssh_dot, |c, rgb| {
+                    c.child(
+                        div()
+                            .flex_shrink_0()
+                            .size(px(6.))
+                            .rounded_full()
+                            .bg(gpui::rgb(rgb)),
+                    )
                 })
                 // Leading agent brand avatar, when a coding agent runs in this
                 // tab — the vendor mark on its accent. Only agents get an avatar
@@ -579,12 +591,12 @@ impl Tty7App {
                 })
                 // Clickable / editable label region.
                 .child(label_region)
-                // Trailing slot: normally the close affordance — always shown on
-                // the active tab; on the others it stays out of the way
-                // (opacity 0) and fades in on chip hover, so a row of tabs reads
-                // clean instead of three-icons-per-chip busy. Space is reserved
-                // either way, so nothing shifts on hover. While the shortcut
-                // hints are armed, the same slot shows the tab's ⌘N badge instead.
+                // Trailing slot: normally the close affordance — kept out of the
+                // way (opacity 0) on every chip, active or not, and fades in on
+                // chip hover, so a row of tabs reads clean instead of
+                // three-icons-per-chip busy. Space is reserved either way, so
+                // nothing shifts on hover. While the shortcut hints are armed,
+                // the same slot shows the tab's ⌘N badge instead.
                 .child(if show_badges && i < 9 {
                     // Bare digit, no keycap box — the hint blends into the chip
                     // rather than reading as another button. Sized to the exact
@@ -609,11 +621,9 @@ impl Tty7App {
                 } else {
                     div()
                         .flex_shrink_0()
-                        .when(!is_active, |s| {
-                            s.opacity(0.)
-                                .group_hover(SharedString::from(format!("tab-chip-{i}")), |s| {
-                                    s.opacity(1.)
-                                })
+                        .opacity(0.)
+                        .group_hover(SharedString::from(format!("tab-chip-{i}")), |s| {
+                            s.opacity(1.)
                         })
                         .child(
                             Button::new(("tab-close", i))
