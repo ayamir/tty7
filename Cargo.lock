@@ -5357,7 +5357,7 @@ dependencies = [
 [[package]]
 name = "pageant"
 version = "0.2.1"
-source = "git+https://github.com/ayamir/russh?branch=gssapi-with-mic#0d1d073350ed823069252075cbf3db9672d5b490"
+source = "git+https://github.com/ayamir/russh?rev=0d1d073350ed823069252075cbf3db9672d5b490#0d1d073350ed823069252075cbf3db9672d5b490"
 dependencies = [
  "base16ct",
  "byteorder",
@@ -6533,7 +6533,7 @@ dependencies = [
 [[package]]
 name = "russh"
 version = "0.62.2"
-source = "git+https://github.com/ayamir/russh?branch=gssapi-with-mic#0d1d073350ed823069252075cbf3db9672d5b490"
+source = "git+https://github.com/ayamir/russh?rev=0d1d073350ed823069252075cbf3db9672d5b490#0d1d073350ed823069252075cbf3db9672d5b490"
 dependencies = [
  "aes 0.9.1",
  "aws-lc-rs",
@@ -6604,7 +6604,7 @@ dependencies = [
 [[package]]
 name = "russh-cryptovec"
 version = "0.62.0"
-source = "git+https://github.com/ayamir/russh?branch=gssapi-with-mic#0d1d073350ed823069252075cbf3db9672d5b490"
+source = "git+https://github.com/ayamir/russh?rev=0d1d073350ed823069252075cbf3db9672d5b490#0d1d073350ed823069252075cbf3db9672d5b490"
 dependencies = [
  "log",
  "nix 0.31.3",
@@ -6635,7 +6635,7 @@ dependencies = [
 [[package]]
 name = "russh-util"
 version = "0.52.0"
-source = "git+https://github.com/ayamir/russh?branch=gssapi-with-mic#0d1d073350ed823069252075cbf3db9672d5b490"
+source = "git+https://github.com/ayamir/russh?rev=0d1d073350ed823069252075cbf3db9672d5b490#0d1d073350ed823069252075cbf3db9672d5b490"
 dependencies = [
  "chrono",
  "tokio",

@@ -1,8 +1,9 @@
 //! The authentication flow for a native SSH connection.
 //!
 //! Ordering follows the Tabby reference (brief §2): a leading `none` probe (which
-//! also learns the server's remaining methods), then — for `Auto` — publickey,
-//! agent, password, keyboard-interactive; a non-`Auto` mode restricts attempts to
+//! also learns the server's remaining methods), then — for `Auto` — gssapi-with-mic
+//! (matching OpenSSH's default preference), publickey, agent, password,
+//! keyboard-interactive; a non-`Auto` mode restricts attempts to
 //! that one family. The server's advertised remaining-methods set gates which
 //! families are worth trying and is refreshed after each failure (only when the
 //! server actually sends a non-empty set). Passwords/passphrases come from the
@@ -184,11 +185,14 @@ impl GssapiAuthenticator for GssapiClient {
                 mic: Some(mic.to_vec()),
             })
         } else {
+            // An incomplete context that produced no token to send is a stalled
+            // exchange; claiming completion here would send the server a MIC-less
+            // exchange-complete it will reject with an opaque failure. Error out
+            // instead so the real cause reaches the user.
             let Some(token) = output else {
-                return Ok(GssapiStep::Complete {
-                    token: None,
-                    mic: None,
-                });
+                return Err(GssapiAuthError::Other(
+                    "gssapi context stalled: incomplete with no output token".to_string(),
+                ));
             };
             Ok(GssapiStep::Continue {
                 token: token.to_vec(),

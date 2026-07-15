@@ -199,8 +199,12 @@ smallvec = "1"
 smol = "2"
 
 [patch.crates-io]
-# Temporary until upstream russh releases gssapi-with-mic client auth support.
-russh = { git = "https://github.com/ayamir/russh", branch = "gssapi-with-mic" }
+# Temporary until upstream russh releases gssapi-with-mic client auth support
+# (https://github.com/Eugeny/russh/pull/737) — remove this patch and take the
+# crates.io release once it lands. Pinned to an exact rev (never a branch):
+# russh is the SSH protocol layer handling user credentials, and a moving
+# branch on a third-party fork could change what `cargo update` builds.
+russh = { git = "https://github.com/ayamir/russh", rev = "0d1d073350ed823069252075cbf3db9672d5b490" }
 
 [workspace.lints.clippy]
 dbg_macro = "deny"
