@@ -591,12 +591,12 @@ impl Tty7App {
                 })
                 // Clickable / editable label region.
                 .child(label_region)
-                // Trailing slot: normally the close affordance — always shown on
-                // the active tab; on the others it stays out of the way
-                // (opacity 0) and fades in on chip hover, so a row of tabs reads
-                // clean instead of three-icons-per-chip busy. Space is reserved
-                // either way, so nothing shifts on hover. While the shortcut
-                // hints are armed, the same slot shows the tab's ⌘N badge instead.
+                // Trailing slot: normally the close affordance — kept out of the
+                // way (opacity 0) on every chip, active or not, and fades in on
+                // chip hover, so a row of tabs reads clean instead of
+                // three-icons-per-chip busy. Space is reserved either way, so
+                // nothing shifts on hover. While the shortcut hints are armed,
+                // the same slot shows the tab's ⌘N badge instead.
                 .child(if show_badges && i < 9 {
                     // Bare digit, no keycap box — the hint blends into the chip
                     // rather than reading as another button. Sized to the exact
@@ -621,11 +621,9 @@ impl Tty7App {
                 } else {
                     div()
                         .flex_shrink_0()
-                        .when(!is_active, |s| {
-                            s.opacity(0.)
-                                .group_hover(SharedString::from(format!("tab-chip-{i}")), |s| {
-                                    s.opacity(1.)
-                                })
+                        .opacity(0.)
+                        .group_hover(SharedString::from(format!("tab-chip-{i}")), |s| {
+                            s.opacity(1.)
                         })
                         .child(
                             Button::new(("tab-close", i))

@@ -253,9 +253,9 @@ impl Tty7App {
                 .child(self.tab_avatar(agent, agent_status, agent_unread, ssh_dot, 22., cx))
                 .child(label_region)
                 // Trailing slot: while the shortcut hints are armed it shows the
-                // row's ⌘N switch digit; otherwise the close affordance — always
-                // shown on the active row, opacity-0-until-hover on the others so
-                // a column of tabs reads clean. Space is reserved either way.
+                // row's ⌘N switch digit; otherwise the close affordance —
+                // opacity-0-until-hover on every row, active or not, so a column
+                // of tabs reads clean. Space is reserved either way.
                 .child(if show_badges && i < 9 {
                     // Bare digit, no keycap box — matches the chip badge exactly.
                     div()
@@ -276,11 +276,9 @@ impl Tty7App {
                 } else {
                     div()
                         .flex_shrink_0()
-                        .when(!is_active, |s| {
-                            s.opacity(0.)
-                                .group_hover(SharedString::from(format!("tab-row-{i}")), |s| {
-                                    s.opacity(1.)
-                                })
+                        .opacity(0.)
+                        .group_hover(SharedString::from(format!("tab-row-{i}")), |s| {
+                            s.opacity(1.)
                         })
                         .child(
                             Button::new(("sidebar-close", i))
