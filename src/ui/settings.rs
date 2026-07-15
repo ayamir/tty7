@@ -247,6 +247,11 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: WindowTabs,
+            title: "Remember window size",
+            keywords: "window size position bounds geometry launch startup remember",
+        },
+        SearchEntry {
+            section: WindowTabs,
             title: "New tab position",
             keywords: "tabs order end after",
         },
@@ -2885,6 +2890,7 @@ impl Tty7App {
             NewTabPosition::End => 1,
         };
         let restore_session = cfg.restore_session;
+        let remember_window_size = cfg.remember_window_size;
         let tab_bar_idx = match cfg.tab_bar_position {
             TabBarPosition::Top => 0,
             TabBarPosition::Left => 1,
@@ -2893,6 +2899,10 @@ impl Tty7App {
         let restore_switch = Switch::new("wt-restore-session")
             .checked(restore_session)
             .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_restore_session(*on, cx)))
+            .into_any_element();
+        let remember_window_switch = Switch::new("wt-remember-window")
+            .checked(remember_window_size)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_remember_window_size(*on, cx)))
             .into_any_element();
         let startup_radio = self.segmented(
             "wt-startup",
@@ -2943,6 +2953,12 @@ impl Tty7App {
                 "Startup window",
                 "Window state when tty7 launches.",
                 startup_radio,
+                cx,
+            ))
+            .child(self.settings_row(
+                "Remember window size",
+                "Reopen at the size and position the window had when tty7 last quit. Off opens centered at the default size.",
+                remember_window_switch,
                 cx,
             ))
             .child(self.settings_row(

@@ -347,12 +347,30 @@ fn main() {
             keymap::init(cx);
 
             cx.spawn(async move |cx| {
-                // Open at a roomy default, centred on the primary display (`centered`
-                // needs `&App`, which the async cx hands out via `update`).
-                let default_size = size(px(1440.), px(900.));
-                let bounds = cx.update(|cx| Bounds::centered(None, default_size, cx));
-                // Launch state from config: a normal centered window, or maximized /
-                // fullscreen. Each variant still carries the centered bounds as the
+                // Open where the user left off: `window.json` holds the geometry from
+                // the last quit (written by the quit hook in `ui::app`), applied only
+                // while `remember_window_size` is on. A remembered window that no
+                // longer touches any display (monitor unplugged, resolution change)
+                // keeps its size but re-centers; with nothing remembered, open at a
+                // roomy default, centred on the primary display (`centered` needs
+                // `&App`, which the async cx hands out via `update`).
+                let remembered = cx
+                    .update(|cx| cx.global::<Config>().remember_window_size)
+                    .then(crate::core::window_state::WindowState::load)
+                    .flatten();
+                let bounds = cx.update(|cx| match remembered {
+                    Some(state) => {
+                        let bounds = state.bounds();
+                        if cx.displays().iter().any(|d| d.bounds().intersects(&bounds)) {
+                            bounds
+                        } else {
+                            Bounds::centered(None, bounds.size, cx)
+                        }
+                    }
+                    None => Bounds::centered(None, size(px(1440.), px(900.)), cx),
+                });
+                // Launch state from config: a normal window, or maximized /
+                // fullscreen. Each variant still carries the bounds above as the
                 // size to restore to when the user un-maximizes / exits fullscreen.
                 let startup_mode = cx.update(|cx| cx.global::<Config>().startup_mode);
                 let window_bounds = match startup_mode {
