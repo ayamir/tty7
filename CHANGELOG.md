@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Attach replay no longer duplicates TUI output into scrollback** — the
+  daemon's replay ring is now segmented by the geometry its bytes were
+  recorded under, and attach replays a `Size` → `Snapshot` pair per segment.
+  Previously the whole ring replayed at the final PTY width, so any resize
+  during a session (a pane split, a window drag) re-wrapped older output and
+  a TUI's cursor-up redraws (Claude Code's inline renderer, most visibly)
+  landed mid-frame, flooding the reattached pane's scrollback with stale
+  frame copies that never existed live.
+
 ## [0.15.0] - 2026-07-15
 
 ### Added

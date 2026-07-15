@@ -5,8 +5,9 @@
 //! (a) appends raw PTY bytes to a bounded *replay ring*, (b) forwards them to the
 //! currently-attached client as `DaemonMsg::Output`, and (c) feeds an OSC sniffer
 //! that learns the cwd (OSC 7) and prompt state (OSC 133) and pushes those to the
-//! client. The client rebuilds the screen locally from a `Snapshot` (the ring
-//! replayed on attach) plus the live `Output` tail.
+//! client. The client rebuilds the screen locally from the attach replay (the
+//! ring's segments, a `Size` + `Snapshot` pair each — see [`ReplayRing`]) plus
+//! the live `Output` tail.
 //!
 //! The PTY is driven by [`portable-pty`](portable_pty): a Unix pty on Unix and a
 //! ConPTY on Windows, behind one blocking `Read`/`Write`/`resize` API. That keeps
@@ -339,12 +340,11 @@ impl OutputGate {
 /// PTY master, writer, child) so a single `Mutex` guards everything the reader
 /// thread and the connection threads both touch.
 struct PaneState {
-    /// The replay ring (raw PTY bytes, oldest-first), bounded to `RING_CAP`.
-    /// A `VecDeque` so evicting the oldest bytes is O(evicted): with a `Vec`,
-    /// every append to a full ring memmoved the whole 8 MiB to close the front
-    /// gap — at the ~1 KiB-per-read cadence macOS PTYs deliver, that memmove
-    /// dominated the daemon's read loop and capped drain throughput at ~5 MB/s.
-    ring: VecDeque<u8>,
+    /// The replay ring: raw PTY bytes bounded to `RING_CAP`, segmented by the
+    /// geometry they were recorded under so `attach` can replay each stretch
+    /// at the width it was written for. Also the owner of the pane's current
+    /// size (the tail segment's geometry). See [`ReplayRing`].
+    ring: ReplayRing,
     /// The currently-attached client's outbound channel, or `None` when detached.
     /// v1 is single-subscriber: a new attach replaces this, and the old
     /// connection's receiver then sees its sender dropped and ends.
@@ -370,10 +370,6 @@ struct PaneState {
     /// (with an opaque OSC 9/777 fallback). Cleared when the agent exits.
     /// See [`crate::core::cli_agent::AgentSessionState`].
     agent_session: Option<crate::core::cli_agent::AgentSessionState>,
-    /// Last geometry the PTY was sized to (spawn size, then each `resize`).
-    /// Reported to a re-attaching client as `DaemonMsg::Size` so its replay of
-    /// the ring runs at the geometry the ring was recorded under.
-    size: WinSize,
     /// False once the child has exited; the pane lingers so its ring stays
     /// readable by a late attach.
     alive: bool,
@@ -556,7 +552,7 @@ impl DaemonPane {
         let writer = pair.master.take_writer()?;
 
         let state = Arc::new(Mutex::new(PaneState {
-            ring: VecDeque::new(),
+            ring: ReplayRing::new(size),
             subscriber: None,
             subscriber_epoch: 0,
             cwd: spawn.initial_cwd,
@@ -564,7 +560,6 @@ impl DaemonPane {
             remote: spawn.remote.clone(),
             agent: None,
             agent_session: None,
-            size,
             alive: true,
         }));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -662,7 +657,7 @@ impl DaemonPane {
         };
 
         let state = Arc::new(Mutex::new(PaneState {
-            ring: VecDeque::new(),
+            ring: ReplayRing::new(size),
             subscriber: None,
             subscriber_epoch: 0,
             // The remote cwd is unknown until the remote shell's OSC 7 arrives.
@@ -673,7 +668,6 @@ impl DaemonPane {
             // agent detection never runs for it.
             agent: None,
             agent_session: None,
-            size,
             alive: true,
         }));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -896,7 +890,7 @@ impl DaemonPane {
 
                             let tr1 = trace.then(std::time::Instant::now);
                             let mut st = state.lock().unwrap();
-                            ring_append(&mut st.ring, bytes);
+                            st.ring.append(bytes);
                             if let Some(sub) = &st.subscriber {
                                 // A send error just means the client is gone; ignore
                                 // it and let the next attach install a new sender.
@@ -932,10 +926,10 @@ impl DaemonPane {
             .expect("spawn daemon pane reader thread")
     }
 
-    /// Become this pane's sole subscriber (replacing any prior one): report the
-    /// recorded geometry, replay the ring as a `Snapshot`, then push the
-    /// currently-known `Cwd` / `Prompt` so the fresh client is immediately in
-    /// sync.
+    /// Become this pane's sole subscriber (replacing any prior one): replay
+    /// the ring (a `Size` + `Snapshot` pair per geometry segment), then push
+    /// the currently-known `Cwd` / `Prompt` so the fresh client is immediately
+    /// in sync.
     ///
     /// The PTY is deliberately *not* resized here. A re-attaching client only
     /// knows a pre-layout placeholder size at this point; resizing to it would
@@ -1006,10 +1000,10 @@ impl DaemonPane {
 
     /// Resize the byte source: a PTY gets `SIGWINCH` (Unix) / console resize
     /// (Windows); a native-SSH channel gets a `window-change` request. The daemon
-    /// holds no grid to resize. Records the new size so a later placeholder
-    /// re-attach can preserve it.
+    /// holds no grid to resize. Seals the ring's current segment so bytes from
+    /// here on are recorded — and later replayed — under the new geometry.
     pub fn resize(&self, size: WinSize) {
-        self.state.lock().unwrap().size = size;
+        self.state.lock().unwrap().ring.resize(size);
         match &self.backend {
             // A failure just means the pty is gone, which the reader will observe
             // as EOF; `MasterPty::resize` itself takes `&self`.
@@ -1396,32 +1390,139 @@ fn pty_size(size: WinSize) -> PtySize {
     }
 }
 
-/// Append `bytes` to the ring, dropping the oldest bytes if it would exceed
-/// `RING_CAP`. A single write larger than the cap keeps only its trailing
-/// `RING_CAP` bytes (the most recent screen state).
-fn ring_append(ring: &mut VecDeque<u8>, bytes: &[u8]) {
-    if bytes.len() >= RING_CAP {
-        // The new chunk alone overflows the ring: keep only its tail.
-        ring.clear();
-        ring.extend(&bytes[bytes.len() - RING_CAP..]);
-        return;
-    }
-    let overflow = (ring.len() + bytes.len()).saturating_sub(RING_CAP);
-    if overflow > 0 {
-        // Drop the oldest `overflow` bytes from the front.
-        ring.drain(..overflow);
-    }
-    ring.extend(bytes);
+/// The replay ring: raw PTY bytes, oldest-first, segmented by the geometry
+/// they were recorded under.
+///
+/// Raw bytes are only replayable at the width the program wrote them for. A
+/// TUI that redraws with cursor-up + erase (Claude Code's inline renderer is
+/// the canonical case) computes its row counts from the then-current width;
+/// replaying the whole ring at the *final* width re-wraps every older frame,
+/// so those redraws land mid-frame and each one leaks stale rows into
+/// scrollback — duplication that never existed live. Cutting a new segment at
+/// every resize lets `attach` replay each stretch of history at its recorded
+/// geometry (a `Size` → `Snapshot` pair per segment), re-wrapping between
+/// segments exactly where the live client did.
+struct ReplayRing {
+    /// Oldest-first, never empty: the back segment is the live tail, and its
+    /// geometry is the PTY's current size.
+    segments: VecDeque<RingSegment>,
+    /// Total payload bytes across all segments, kept ≤ `RING_CAP`.
+    len: usize,
 }
 
-/// The ring's bytes, oldest-first, as one contiguous `Vec` (the `Snapshot`
-/// payload). One copy over the deque's two slices.
-fn ring_to_vec(ring: &VecDeque<u8>) -> Vec<u8> {
-    let (a, b) = ring.as_slices();
-    let mut out = Vec::with_capacity(ring.len());
-    out.extend_from_slice(a);
-    out.extend_from_slice(b);
-    out
+/// One stretch of PTY output recorded under a single geometry.
+struct RingSegment {
+    size: WinSize,
+    /// A `VecDeque` so evicting the oldest bytes is O(evicted): with a `Vec`,
+    /// every append to a full ring memmoved the whole 8 MiB to close the front
+    /// gap — at the ~1 KiB-per-read cadence macOS PTYs deliver, that memmove
+    /// dominated the daemon's read loop and capped drain throughput at ~5 MB/s.
+    bytes: VecDeque<u8>,
+}
+
+impl RingSegment {
+    fn empty(size: WinSize) -> Self {
+        Self {
+            size,
+            bytes: VecDeque::new(),
+        }
+    }
+
+    /// The segment's bytes, oldest-first, as one contiguous `Vec` (the
+    /// `Snapshot` payload). One copy over the deque's two slices.
+    fn to_vec(&self) -> Vec<u8> {
+        let (a, b) = self.bytes.as_slices();
+        let mut out = Vec::with_capacity(self.bytes.len());
+        out.extend_from_slice(a);
+        out.extend_from_slice(b);
+        out
+    }
+}
+
+impl ReplayRing {
+    fn new(size: WinSize) -> Self {
+        Self {
+            segments: VecDeque::from([RingSegment::empty(size)]),
+            len: 0,
+        }
+    }
+
+    fn tail(&mut self) -> &mut RingSegment {
+        self.segments.back_mut().expect("ring always has a tail")
+    }
+
+    /// Seal the tail at a new geometry: bytes appended from here on belong to
+    /// a fresh segment. A same-size resize is a no-op, and an empty tail is
+    /// retagged in place, so repeated resizes with no output in between (a
+    /// window drag over an idle pane) collapse into one segment instead of
+    /// piling up empty ones.
+    fn resize(&mut self, size: WinSize) {
+        let tail = self.tail();
+        if tail.size == size {
+            return;
+        }
+        if tail.bytes.is_empty() {
+            tail.size = size;
+        } else {
+            self.segments.push_back(RingSegment::empty(size));
+        }
+    }
+
+    /// Append `bytes` to the live tail, dropping the oldest bytes — and any
+    /// segments this empties — past `RING_CAP`. A single write larger than
+    /// the cap keeps only its trailing `RING_CAP` bytes (the most recent
+    /// screen state), all recorded under the tail's geometry.
+    fn append(&mut self, bytes: &[u8]) {
+        if bytes.len() >= RING_CAP {
+            let size = self.tail().size;
+            self.segments.clear();
+            let mut tail = RingSegment::empty(size);
+            tail.bytes.extend(&bytes[bytes.len() - RING_CAP..]);
+            self.segments.push_back(tail);
+            self.len = RING_CAP;
+            return;
+        }
+        self.tail().bytes.extend(bytes);
+        self.len += bytes.len();
+        let mut overflow = self.len.saturating_sub(RING_CAP);
+        while overflow > 0 {
+            let head = self
+                .segments
+                .front_mut()
+                .expect("len > 0 implies a segment");
+            let drop = overflow.min(head.bytes.len());
+            head.bytes.drain(..drop);
+            self.len -= drop;
+            overflow -= drop;
+            if head.bytes.is_empty() && self.segments.len() > 1 {
+                self.segments.pop_front();
+            }
+        }
+    }
+
+    /// Replay the ring through `subscriber`: a `Size` + `Snapshot` pair per
+    /// segment, oldest first. The client applies each `Size` to its grid
+    /// right before advancing the paired `Snapshot` (see the client reader's
+    /// `pending_size`), reflowing between segments exactly like the live
+    /// resizes did. The tail's pair always goes out — even empty — so the
+    /// replay ends at the PTY's current geometry.
+    fn replay(&self, subscriber: &Sender<DaemonMsg>) {
+        for seg in &self.segments {
+            let _ = subscriber.send(DaemonMsg::Size(seg.size));
+            let _ = subscriber.send(DaemonMsg::Snapshot(seg.to_vec()));
+        }
+    }
+
+    /// All payload bytes, oldest-first, geometry boundaries elided. Test-only:
+    /// production replay must keep the per-segment sizes.
+    #[cfg(test)]
+    fn flatten(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.len);
+        for seg in &self.segments {
+            out.extend(seg.to_vec());
+        }
+        out
+    }
 }
 
 /// Install `subscriber` as the pane's sole subscriber (replacing any prior
@@ -1429,17 +1530,17 @@ fn ring_to_vec(ring: &VecDeque<u8>) -> Vec<u8> {
 /// lock held (the pure core of [`DaemonPane::attach`], split out so it is
 /// testable without a PTY).
 ///
-/// Send size + snapshot + known signals *through the new channel* before we
+/// Send the ring replay + known signals *through the new channel* before we
 /// install it, so the client's first frames are the replay, ahead of any live
-/// `Output` the reader enqueues next. Size leads: the client must set its grid
-/// geometry before replaying the ring. Installing drops the previous sender
-/// (its receiver then ends — v1 single-client takeover). Returns the new
-/// subscriber epoch.
+/// `Output` the reader enqueues next. The replay is a `Size` → `Snapshot`
+/// pair per ring segment: each Size leads its segment so the client's grid is
+/// at the recorded geometry before those bytes advance (see [`ReplayRing`]).
+/// Installing drops the previous sender (its receiver then ends — v1
+/// single-client takeover). Returns the new subscriber epoch.
 fn attach_subscriber(st: &mut PaneState, subscriber: Sender<DaemonMsg>) -> u64 {
     st.subscriber_epoch += 1;
 
-    let _ = subscriber.send(DaemonMsg::Size(st.size));
-    let _ = subscriber.send(DaemonMsg::Snapshot(ring_to_vec(&st.ring)));
+    st.ring.replay(&subscriber);
     if let Some(cwd) = &st.cwd {
         let _ = subscriber.send(DaemonMsg::Cwd(cwd.clone()));
     }
@@ -2119,39 +2220,112 @@ mod tests {
         assert!(t0.elapsed() < Duration::from_millis(100));
     }
 
+    fn ws(cols: u16, rows: u16) -> WinSize {
+        WinSize {
+            cols,
+            rows,
+            cell_w: 8,
+            cell_h: 16,
+        }
+    }
+
     /// The ring keeps appending verbatim while under the cap.
     #[test]
     fn ring_under_cap_keeps_all() {
-        let mut ring = VecDeque::new();
-        ring_append(&mut ring, b"hello ");
-        ring_append(&mut ring, b"world");
-        assert_eq!(ring_to_vec(&ring), b"hello world");
+        let mut ring = ReplayRing::new(ws(80, 24));
+        ring.append(b"hello ");
+        ring.append(b"world");
+        assert_eq!(ring.flatten(), b"hello world");
     }
 
     /// Once total exceeds the cap, the oldest bytes are dropped from the front and
     /// the ring holds exactly the most recent `RING_CAP` bytes.
     #[test]
     fn ring_over_cap_drops_oldest() {
-        let mut ring = VecDeque::new();
-        ring_append(&mut ring, &vec![b'a'; RING_CAP]);
-        assert_eq!(ring.len(), RING_CAP);
-        ring_append(&mut ring, &vec![b'b'; 100]);
-        assert_eq!(ring.len(), RING_CAP);
-        let flat = ring_to_vec(&ring);
+        let mut ring = ReplayRing::new(ws(80, 24));
+        ring.append(&vec![b'a'; RING_CAP]);
+        assert_eq!(ring.len, RING_CAP);
+        ring.append(&vec![b'b'; 100]);
+        assert_eq!(ring.len, RING_CAP);
+        let flat = ring.flatten();
         assert_eq!(&flat[..RING_CAP - 100], &vec![b'a'; RING_CAP - 100][..]);
         assert_eq!(&flat[RING_CAP - 100..], &vec![b'b'; 100][..]);
     }
 
-    /// A single chunk larger than the cap keeps only its trailing `RING_CAP` bytes.
+    /// A single chunk larger than the cap keeps only its trailing `RING_CAP`
+    /// bytes, and collapses any older geometry segments with it.
     #[test]
     fn ring_giant_chunk_keeps_tail() {
-        let mut ring = VecDeque::new();
-        ring_append(&mut ring, b"seed");
+        let mut ring = ReplayRing::new(ws(100, 24));
+        ring.append(b"seed");
+        ring.resize(ws(80, 24));
         let mut big = vec![b'x'; RING_CAP];
         big.extend_from_slice(b"TAIL");
-        ring_append(&mut ring, &big);
-        assert_eq!(ring.len(), RING_CAP);
-        assert_eq!(&ring_to_vec(&ring)[RING_CAP - 4..], b"TAIL");
+        ring.append(&big);
+        assert_eq!(ring.len, RING_CAP);
+        assert_eq!(ring.segments.len(), 1);
+        assert_eq!(&ring.flatten()[RING_CAP - 4..], b"TAIL");
+    }
+
+    /// Regression for the "Claude Code scrollback duplicated after reattach"
+    /// bug: bytes recorded before and after a resize must replay as separate
+    /// `Size` + `Snapshot` pairs, each at its recorded geometry — replaying
+    /// everything at the final width re-wraps the older stretch, and a TUI's
+    /// cursor-up redraws then leak stale frames into scrollback.
+    #[test]
+    fn ring_resize_splits_replay_into_geometry_segments() {
+        let mut ring = ReplayRing::new(ws(100, 24));
+        ring.append(b"wide bytes");
+        ring.resize(ws(80, 24));
+        ring.append(b"narrow bytes");
+
+        let (tx, rx) = mpsc::channel();
+        ring.replay(&tx);
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(s)) if s == ws(100, 24)));
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"wide bytes"));
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(s)) if s == ws(80, 24)));
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"narrow bytes"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Same-size resizes are no-ops and an idle (empty-tail) pane's resizes
+    /// retag the tail in place — a window drag must not pile up segments. The
+    /// replay still ends at the current geometry, empty tail included.
+    #[test]
+    fn ring_idle_resizes_collapse_and_replay_ends_at_current_size() {
+        let mut ring = ReplayRing::new(ws(100, 24));
+        ring.append(b"bytes");
+        ring.resize(ws(100, 24));
+        assert_eq!(ring.segments.len(), 1);
+        ring.resize(ws(90, 24));
+        ring.resize(ws(80, 30));
+        assert_eq!(ring.segments.len(), 2);
+
+        let (tx, rx) = mpsc::channel();
+        ring.replay(&tx);
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(s)) if s == ws(100, 24)));
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"bytes"));
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(s)) if s == ws(80, 30)));
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b.is_empty()));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Cap eviction that empties a leading segment drops the segment itself,
+    /// so its geometry no longer appears in the replay.
+    #[test]
+    fn ring_eviction_drops_emptied_segments() {
+        let mut ring = ReplayRing::new(ws(100, 24));
+        ring.append(b"old");
+        ring.resize(ws(80, 24));
+        ring.append(&vec![b'n'; RING_CAP - 2]);
+        assert_eq!(ring.segments.len(), 2, "two bytes of the old segment left");
+        ring.append(b"nn");
+        assert_eq!(ring.segments.len(), 1, "the emptied old segment is gone");
+        assert_eq!(ring.len, RING_CAP);
+
+        let (tx, rx) = mpsc::channel();
+        ring.replay(&tx);
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(s)) if s == ws(80, 24)));
     }
 
     /// OSC 7 cwd is sniffed and surfaced as a `cwd` signal.
@@ -2446,7 +2620,7 @@ mod tests {
     /// A fresh `PaneState` for the PTY-less state-machine tests.
     fn test_state(alive: bool) -> PaneState {
         PaneState {
-            ring: VecDeque::new(),
+            ring: ReplayRing::new(ws(80, 24)),
             subscriber: None,
             subscriber_epoch: 0,
             cwd: None,
@@ -2454,12 +2628,6 @@ mod tests {
             remote: None,
             agent: None,
             agent_session: None,
-            size: WinSize {
-                cols: 80,
-                rows: 24,
-                cell_w: 8,
-                cell_h: 16,
-            },
             alive,
         }
     }
@@ -2570,7 +2738,7 @@ mod tests {
     #[test]
     fn attach_replays_state_in_order_and_installs_subscriber() {
         let mut st = test_state(true);
-        st.ring = VecDeque::from(b"screen".to_vec());
+        st.ring.append(b"screen");
         st.cwd = Some(PathBuf::from("/work"));
 
         let (tx, rx) = mpsc::channel();
@@ -2607,7 +2775,7 @@ mod tests {
     #[test]
     fn attach_to_a_dead_pane_replays_exited() {
         let mut st = test_state(false);
-        st.ring = VecDeque::from(b"final screen".to_vec());
+        st.ring.append(b"final screen");
 
         let (tx, rx) = mpsc::channel();
         attach_subscriber(&mut st, tx);
@@ -2647,7 +2815,7 @@ mod tests {
         handle.join().unwrap(); // the Cursor EOFs immediately after "tail"
 
         assert!(!state.lock().unwrap().alive);
-        assert_eq!(ring_to_vec(&state.lock().unwrap().ring), b"tail");
+        assert_eq!(state.lock().unwrap().ring.flatten(), b"tail");
         assert!(matches!(sub_rx.try_recv(), Ok(DaemonMsg::Output(b)) if b == b"tail"));
         assert!(matches!(
             sub_rx.try_recv(),

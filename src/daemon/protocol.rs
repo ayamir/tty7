@@ -787,13 +787,16 @@ pub enum ClientMsg {
 pub enum DaemonMsg {
     /// Result of `Spawn`: the id of the freshly created pane.
     Spawned { pane_id: u64 },
-    /// The geometry the pane's ring was recorded under (the PTY's current
-    /// size), sent immediately before `Snapshot` so the client can size its
-    /// local grid to match before replaying. Replaying at any other width
-    /// mis-wraps history and lands relative cursor motion on the wrong rows.
+    /// The geometry the next `Snapshot`'s bytes were recorded under, sent
+    /// immediately before it so the client can size its local grid to match
+    /// before replaying. Replaying at any other width mis-wraps history and
+    /// lands relative cursor motion on the wrong rows. The attach replay is a
+    /// `Size` → `Snapshot` pair per geometry segment of the pane's ring
+    /// (oldest first); the last pair carries the PTY's current size.
     Size(WinSize),
-    /// One-shot replay of the pane's byte ring, sent right after `Attach`/`Spawn`
-    /// so the client's local emulator rebuilds the current screen + scrollback.
+    /// One segment of the pane's byte-ring replay, sent right after
+    /// `Attach`/`Spawn` (paired with its `Size`) so the client's local
+    /// emulator rebuilds the current screen + scrollback.
     Snapshot(Vec<u8>),
     /// Live PTY output tail. Hot path — payload is verbatim.
     Output(Vec<u8>),
