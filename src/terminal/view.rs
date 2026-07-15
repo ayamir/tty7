@@ -247,19 +247,13 @@ pub struct TerminalView {
     /// while this is true, so a result you've already seen stops nagging. Blue
     /// (working) / amber (waiting) are unaffected — they track live state.
     agent_result_unread: bool,
-    /// The pane's last-computed git snapshot (branch + working-tree diff size),
-    /// shown as the sidebar row's third line. Computed off-thread by
-    /// [`refresh_git_status`](Self::refresh_git_status) on a cwd change or a
-    /// command finishing; `None` outside a git work tree (or before the first
-    /// probe lands).
-    git_status: Option<crate::terminal::git_status::GitStatus>,
-    /// The cwd `git_status` was last computed (or scheduled) for, so the poll
-    /// loop only reprobes when the working directory actually changes.
+    /// The cwd this pane's git line reads from (and last scheduled a probe
+    /// for), so the poll loop only reprobes when the working directory
+    /// actually changes. The snapshot itself lives in the process-wide
+    /// [`GitStatusCache`](crate::terminal::git_status::GitStatusCache), keyed
+    /// by work-tree root — panes in one repo share one entry instead of each
+    /// computing (and staling) its own.
     git_status_cwd: Option<std::path::PathBuf>,
-    /// Monotonic tag bumped on every git reprobe; a background result is dropped
-    /// unless it still matches, so a slow probe from a since-changed cwd can't
-    /// overwrite a fresher one (same guard as `completion_generation`).
-    git_status_gen: u64,
     /// The inline command line editor. Live only while the shell sits idle
     /// at its prompt (`input_active`): there the terminal keeps keyboard focus and
     /// we run our own line editor (so we own Tab / ↑ / ↓ for completion and
@@ -950,9 +944,7 @@ impl TerminalView {
             agent_turn_started: None,
             agent_was_rich: false,
             agent_result_unread: false,
-            git_status: None,
             git_status_cwd: None,
-            git_status_gen: 0,
             cmd: CmdEditor::new(),
             typeahead: Typeahead::new(),
             hold: GapHold::new(),
@@ -1035,11 +1027,15 @@ impl TerminalView {
         self.agent_result_unread
     }
 
-    /// The pane's last-computed git snapshot (branch + working-tree diff), for
-    /// the sidebar row's branch line. `None` outside a git work tree or before
-    /// the first background probe lands.
-    pub fn git_status(&self) -> Option<crate::terminal::git_status::GitStatus> {
-        self.git_status.clone()
+    /// The git snapshot for this pane's cwd (branch + working-tree diff), for
+    /// the sidebar row's branch line — read from the shared per-repo
+    /// [`GitStatusCache`](crate::terminal::git_status::GitStatusCache), so
+    /// every pane in one work tree reports the same numbers. `None` outside a
+    /// git work tree or before the repo's first background probe lands.
+    pub fn git_status(&self, cx: &App) -> Option<crate::terminal::git_status::GitStatus> {
+        let cwd = self.git_status_cwd.as_ref()?;
+        cx.try_global::<crate::terminal::git_status::GitStatusCache>()?
+            .status_for(cwd)
     }
 
     /// The current grid selection as text, if any non-blank one exists — the
@@ -2456,33 +2452,48 @@ impl TerminalView {
         }
     }
 
-    /// Kick off an off-thread git probe for `cwd` and fold the result back on
-    /// the main thread, tagged with a generation so a stale probe (cwd changed
-    /// meanwhile) is dropped. Clears the status when there's no cwd (e.g. a
-    /// native-SSH pane pre-OSC-7, where a local `git` would be meaningless).
+    /// Kick off an off-thread git probe for `cwd` and fold the result into the
+    /// shared per-repo [`GitStatusCache`] on the main thread. The cache
+    /// brackets the flight (`begin_probe`/`finish_probe`): a probe already in
+    /// flight for the same cwd absorbs this trigger instead of spawning a
+    /// duplicate `git` shell-out, and reruns once when it lands. With no cwd
+    /// (e.g. a native-SSH pane pre-OSC-7, where a local `git` would be
+    /// meaningless) the pane simply stops reading a status.
+    ///
+    /// [`GitStatusCache`]: crate::terminal::git_status::GitStatusCache
     fn refresh_git_status(&mut self, cwd: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
+        use crate::terminal::git_status::GitStatusCache;
+
+        let changed = self.git_status_cwd != cwd;
         self.git_status_cwd = cwd.clone();
         let Some(cwd) = cwd else {
-            if self.git_status.take().is_some() {
+            if changed {
                 cx.notify();
             }
             return;
         };
-        self.git_status_gen += 1;
-        let generation = self.git_status_gen;
+        cx.default_global::<GitStatusCache>(); // first probe of the process creates it
+        if !cx.update_global::<GitStatusCache, _>(|cache, _| cache.begin_probe(&cwd)) {
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { crate::terminal::git_status::compute(&cwd) })
+                .spawn({
+                    let cwd = cwd.clone();
+                    async move { crate::terminal::git_status::probe(&cwd) }
+                })
                 .await;
             let _ = this.update(cx, |view, cx| {
-                // Drop a probe whose cwd has since been superseded.
-                if view.git_status_gen != generation {
-                    return;
-                }
-                if view.git_status != result {
-                    view.git_status = result;
-                    cx.notify();
+                // Landing through `update_global` wakes the sidebar's
+                // `observe_global`, so every pane in the repo repaints — not
+                // just this one.
+                let rerun = cx
+                    .update_global::<GitStatusCache, _>(|cache, _| cache.finish_probe(&cwd, result));
+                // A trigger arrived while we flew; go once more so its state
+                // is observed — unless this pane has since left that cwd.
+                if rerun && view.git_status_cwd.as_deref() == Some(&cwd) {
+                    view.refresh_git_status(Some(cwd), cx);
                 }
             });
         })

@@ -134,8 +134,9 @@ impl Tab {
     /// The git snapshot (branch + working-tree diff) of the tab's label-driving
     /// terminal — the focused leaf with a `window`, else the first — for the
     /// sidebar row's branch line (the branch and change count shown under the
-    /// title). `None` when that leaf isn't inside a git work tree, or before
-    /// its first probe lands.
+    /// title). Read through the shared per-repo cache, so tabs in one work
+    /// tree always agree. `None` when that leaf isn't inside a git work tree,
+    /// or before the repo's first probe lands.
     pub(crate) fn git_status(
         &self,
         window: Option<&Window>,
@@ -145,7 +146,7 @@ impl Tab {
             Some(window) => self.pane.focused_or_first(window, cx),
             None => self.pane.first_leaf(),
         }?;
-        leaf.read(cx).git_status()
+        leaf.read(cx).git_status(cx)
     }
 
     /// The coding agent running in this tab, or `None`. Any leaf counts (a
@@ -262,6 +263,11 @@ pub struct Tty7App {
     /// by then — this window never gets that `ModifiersChanged`, so without
     /// this the badges stuck on until some later keypress. Never read.
     _activation_watch: Subscription,
+    /// Keeps the `observe_global::<GitStatusCache>` subscription alive: a git
+    /// probe landing (from *any* pane) repaints the sidebar, so every row in
+    /// the same repo shows the just-refreshed branch/diff line, not a stale
+    /// per-row copy. Never read.
+    _git_status_watch: Subscription,
     /// `Some` while the command palette overlay is open; `None` when closed.
     /// The view owns its search input, filtered list and keyboard handling and
     /// emits a `PaletteEvent`; we build the catalog and run the chosen command.
@@ -436,6 +442,12 @@ impl Tty7App {
         // and colors are handled separately by `apply_theme`; here we cover the
         // font knobs that live on `Tty7App`/the panes.
         let config_watch = cx.observe_global::<Config>(|this, cx| this.reload_from_config(cx));
+        // Repaint when any pane's git probe lands in the shared cache — the
+        // sidebar's branch/diff lines read from it, and the probing pane's own
+        // notify wouldn't re-render rows belonging to *other* panes.
+        cx.default_global::<crate::terminal::git_status::GitStatusCache>();
+        let git_status_watch = cx
+            .observe_global::<crate::terminal::git_status::GitStatusCache>(|_, cx| cx.notify());
         // Any real keypress means "chord, not a bare hold": cancel the held-⌘
         // tab badges and whatever reveal is pending (see `ui::hints`).
         let this = cx.weak_entity();
@@ -497,6 +509,7 @@ impl Tty7App {
             _config_watch: config_watch,
             _keystroke_watch: keystroke_watch,
             _activation_watch: activation_watch,
+            _git_status_watch: git_status_watch,
             palette: None,
             palette_sub: None,
             closed: Vec::new(),
