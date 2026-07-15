@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-15
+
+### Added
+
+- **Click a sidebar git line to open a working-tree diff overlay** — the
+  branch/diff row in the sidebar is now clickable and opens an in-app overlay
+  showing the working-tree diff against `HEAD`, file by file with expandable
+  hunks. It rides the shared git-status signal: when fresh numbers land that
+  disagree with what it shows, it re-probes the full diff so the overlay stays
+  live. (#92)
+- **Window size and position are remembered across launches** — tty7 saves
+  the window geometry on quit and restores it next launch, re-centering if the
+  saved bounds no longer overlap any display. Can be toggled off with the
+  `remember_window_size` config key. (#94)
+
 ### Fixed
 
 - **Attach replay no longer duplicates TUI output into scrollback** — the
@@ -16,7 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   during a session (a pane split, a window drag) re-wrapped older output and
   a TUI's cursor-up redraws (Claude Code's inline renderer, most visibly)
   landed mid-frame, flooding the reattached pane's scrollback with stale
-  frame copies that never existed live.
+  frame copies that never existed live. The ring also caps its segment count
+  so a long-lived session with many resizes can't grow it without bound. (#91)
+- **Agent hooks no longer hang when stdin is a terminal** — the hook runner
+  skips the stdin read when fd 0 is a tty, so a hook invoked interactively
+  (rather than with a piped payload) emits the bare event instead of blocking
+  forever on a read that never returns. (#93)
 
 ## [0.15.0] - 2026-07-15
 
