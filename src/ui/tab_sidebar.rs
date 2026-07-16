@@ -80,74 +80,28 @@ impl Tty7App {
             .gap_0p5();
 
         // ── Repo grouping ─────────────────────────────────────────────────────
-        // Each tab's group key: the git work-tree root of its *first* pane's
-        // cwd, refreshed through the tab's *sticky* `sidebar_group` cell —
-        // only a landed probe answer moves a tab (see the field's doc), so the
-        // list never reshuffles on an in-flight cd. The first pane (not the
-        // focused one, which the branch line follows) so switching focus
-        // between splits in different repos never relocates the row — the
-        // group answers "where does this tab live", not "what am I touching".
-        // `None` = the Scratch group. With grouping configured off every key
-        // is `None`, which also makes the same-group drop check below a no-op.
-        let grouping = cx.global::<Config>().sidebar_grouping == SidebarGrouping::Repo;
-        let keys: Rc<Vec<Option<PathBuf>>> = Rc::new(
-            self.tabs
-                .iter()
-                .map(|tab| {
-                    if !grouping {
-                        return None;
-                    }
-                    let cwd = tab
-                        .pane
-                        .first_leaf()
-                        .and_then(|leaf| leaf.read(cx).git_status_cwd().map(|p| p.to_path_buf()));
-                    if let Some(cwd) = cwd {
-                        if let Some(known) = cx.global::<GitStatusCache>().known_root_for(&cwd) {
-                            *tab.sidebar_group.borrow_mut() = known;
-                        }
-                    }
-                    tab.sidebar_group.borrow().clone()
-                })
-                .collect(),
-        );
-        // Groups in first-appearance order (a new repo's group appends rather
-        // than reshuffling the existing ones), with the Scratch group pinned
-        // last. When no tab is in any repo the whole list renders flat —
-        // a lone "Scratch" header over everything would be noise.
-        let mut group_order: Vec<PathBuf> = Vec::new();
-        for k in keys.iter().flatten() {
-            if !group_order.iter().any(|g| g == k) {
-                group_order.push(k.clone());
-            }
-        }
-        let mut sections: Vec<(Option<String>, Vec<usize>)> = Vec::new();
-        if group_order.is_empty() {
-            sections.push((None, (0..self.tabs.len()).collect()));
-        } else {
-            for root in &group_order {
-                let name = root
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| root.display().to_string());
-                let idxs = (0..self.tabs.len())
-                    .filter(|&i| keys[i].as_deref() == Some(root.as_path()))
-                    .collect();
-                sections.push((Some(name), idxs));
-            }
-            let scratch: Vec<usize> = (0..self.tabs.len())
-                .filter(|&i| keys[i].is_none())
-                .collect();
-            if !scratch.is_empty() {
-                sections.push((Some("Scratch".into()), scratch));
-            }
-        }
+        // Per-tab sticky group keys and the sections derived from them (both
+        // documented on their functions). The same pair drives
+        // `visual_tab_order`, so the ⌘N digits painted below and the ⌘N
+        // actions always agree on which row is "tab 3".
+        let keys: Rc<Vec<Option<PathBuf>>> = Rc::new(self.sidebar_group_keys(cx));
+        let sections = sidebar_sections(&keys);
 
+        // Each row's position in display order — the digit its ⌘N badge
+        // shows. Advanced for every tab, filtered-out ones included, so the
+        // digits (and what ⌘N targets) don't shift while the search box
+        // narrows the list.
+        let mut visual_pos = 0usize;
         for (group_name, idxs) in sections {
             // Rows first: the search filter may empty a group, in which case
             // its header is skipped too (and the header's count reflects the
             // *visible* rows while a filter narrows the list).
             let mut rows: Vec<AnyElement> = Vec::new();
             for i in idxs {
+                // This row's display-order digit; claimed before the search
+                // filter can skip the row (see `visual_pos` above).
+                let badge_pos = visual_pos;
+                visual_pos += 1;
                 let tab = &self.tabs[i];
                 let is_active = i == active;
                 let label = self.tab_label(tab, i, Some(window), cx);
@@ -362,8 +316,11 @@ impl Tty7App {
                     // Trailing slot: while the shortcut hints are armed it shows the
                     // row's ⌘N switch digit; otherwise the close affordance —
                     // opacity-0-until-hover on every row, active or not, so a column
-                    // of tabs reads clean. Space is reserved either way.
-                    .child(if show_badges && i < 9 {
+                    // of tabs reads clean. Space is reserved either way. The digit
+                    // is the row's *display* position (`activate_visual` speaks the
+                    // same order), so under grouping the rail still reads 1…9 top
+                    // to bottom instead of scattering the tab-vector indices.
+                    .child(if show_badges && badge_pos < 9 {
                         // Bare digit, no keycap box — matches the chip badge exactly.
                         div()
                             .flex_shrink_0()
@@ -378,7 +335,7 @@ impl Tty7App {
                             } else {
                                 cx.theme().muted_foreground
                             })
-                            .child(tab_badge_label(i))
+                            .child(tab_badge_label(badge_pos))
                             .into_any_element()
                     } else {
                         div()
@@ -607,5 +564,204 @@ impl Tty7App {
                     .child(list),
             )
             .child(handle)
+    }
+
+    /// Each tab's sidebar group key, in tab order: the git work-tree root of
+    /// its *first* pane's cwd, resolved through the tab's sticky
+    /// `sidebar_group` cell — only a landed probe answer moves a tab (see the
+    /// field's doc), so an in-flight cd never reshuffles the list. The first
+    /// pane rather than the focused one (which the branch line follows), so
+    /// switching focus between splits in different repos never relocates the
+    /// row — the group answers "where does this tab live", not "what am I
+    /// touching". `None` = the Scratch group. With grouping configured off
+    /// every key is `None`, which collapses the list to one flat section and
+    /// makes the same-group drop check a no-op.
+    fn sidebar_group_keys(&self, cx: &gpui::App) -> Vec<Option<PathBuf>> {
+        let grouping = cx.global::<Config>().sidebar_grouping == SidebarGrouping::Repo;
+        self.tabs
+            .iter()
+            .map(|tab| {
+                if !grouping {
+                    return None;
+                }
+                let cwd = tab
+                    .pane
+                    .first_leaf()
+                    .and_then(|leaf| leaf.read(cx).git_status_cwd().map(|p| p.to_path_buf()));
+                if let Some(known) =
+                    cwd.and_then(|cwd| cx.global::<GitStatusCache>().known_root_for(&cwd))
+                {
+                    *tab.sidebar_group.borrow_mut() = known;
+                }
+                tab.sidebar_group.borrow().clone()
+            })
+            .collect()
+    }
+
+    /// Tab indices in the order the tab UI displays them: the grouped order
+    /// when the vertical sidebar is grouping by repo, plain tab order in
+    /// every other layout. ⌘N and the hint digits both go through this, so
+    /// "press 3 for the third row you see" stays true under grouping.
+    fn visual_tab_order(&self, cx: &gpui::App) -> Vec<usize> {
+        if cx.global::<Config>().tab_bar_position != crate::core::config::TabBarPosition::Left {
+            return (0..self.tabs.len()).collect();
+        }
+        let keys = self.sidebar_group_keys(cx);
+        sidebar_sections(&keys)
+            .into_iter()
+            .flat_map(|(_, idxs)| idxs)
+            .collect()
+    }
+
+    /// Activate the `n`-th tab *as displayed* (see
+    /// [`visual_tab_order`](Self::visual_tab_order)) — the ⌘N actions land
+    /// here so the shortcut always matches the digit badge on the row.
+    pub(crate) fn activate_visual(
+        &mut self,
+        n: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(&i) = self.visual_tab_order(cx).get(n) {
+            self.activate(i, window, cx);
+        }
+    }
+}
+
+/// Partition per-tab group keys into the sidebar's sections: `(header,
+/// indices)` with groups in first-appearance order (a new repo appends, the
+/// existing ones never reshuffle) and the Scratch group pinned last. A `None`
+/// header means "render flat, no headers" — used when no tab is in any repo,
+/// where a lone Scratch header over everything would be noise.
+fn sidebar_sections(keys: &[Option<PathBuf>]) -> Vec<(Option<String>, Vec<usize>)> {
+    let mut group_order: Vec<&PathBuf> = Vec::new();
+    for k in keys.iter().flatten() {
+        if !group_order.iter().any(|g| *g == k) {
+            group_order.push(k);
+        }
+    }
+    if group_order.is_empty() {
+        return vec![(None, (0..keys.len()).collect())];
+    }
+    let names = group_names(&group_order);
+    let mut sections: Vec<(Option<String>, Vec<usize>)> = group_order
+        .iter()
+        .zip(names)
+        .map(|(root, name)| {
+            let idxs = (0..keys.len())
+                .filter(|&i| keys[i].as_ref() == Some(*root))
+                .collect();
+            (Some(name), idxs)
+        })
+        .collect();
+    let scratch: Vec<usize> = (0..keys.len()).filter(|&i| keys[i].is_none()).collect();
+    if !scratch.is_empty() {
+        sections.push((Some("Scratch".into()), scratch));
+    }
+    sections
+}
+
+/// Display names for the group roots: each root's directory name, extended
+/// upward by parent components only while it collides with another root's
+/// (`app` stays `app` on its own; two checkouts both named `app` become
+/// `work/app` and `fork/app`). Distinct roots must differ somewhere, so the
+/// loop settles; a root that exhausts its components while still colliding
+/// just keeps its longest suffix.
+fn group_names(roots: &[&PathBuf]) -> Vec<String> {
+    // Only the normal components — no root-dir "/" entry, so a joined suffix
+    // never renders as "//work/app".
+    let comps: Vec<Vec<String>> = roots
+        .iter()
+        .map(|r| {
+            r.components()
+                .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .collect()
+        })
+        .collect();
+    let mut depth = vec![1usize; roots.len()];
+    loop {
+        let names: Vec<String> = comps
+            .iter()
+            .zip(&depth)
+            .enumerate()
+            .map(|(i, (c, &d))| {
+                if c.is_empty() {
+                    // Degenerate root with no normal components (e.g. "/").
+                    roots[i].display().to_string()
+                } else {
+                    c[c.len().saturating_sub(d)..].join("/")
+                }
+            })
+            .collect();
+        let mut grew = false;
+        for i in 0..names.len() {
+            let collides = names
+                .iter()
+                .enumerate()
+                .any(|(j, n)| j != i && *n == names[i]);
+            if collides && depth[i] < comps[i].len() {
+                depth[i] += 1;
+                grew = true;
+            }
+        }
+        if !grew {
+            return names;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    /// Groups appear in first-appearance order with Scratch pinned last, and
+    /// an all-`None` key set renders as one headerless flat section.
+    #[test]
+    fn sections_order_groups_by_first_appearance_scratch_last() {
+        let keys = vec![
+            Some(p("/w/beta")),
+            None,
+            Some(p("/w/alpha")),
+            Some(p("/w/beta")),
+        ];
+        let sections = sidebar_sections(&keys);
+        assert_eq!(
+            sections,
+            vec![
+                (Some("beta".into()), vec![0, 3]),
+                (Some("alpha".into()), vec![2]),
+                (Some("Scratch".into()), vec![1]),
+            ]
+        );
+
+        let flat = sidebar_sections(&[None, None]);
+        assert_eq!(flat, vec![(None, vec![0, 1])]);
+    }
+
+    /// Same-named roots grow a parent prefix until distinct; unrelated names
+    /// stay short even alongside the colliding pair.
+    #[test]
+    fn group_names_disambiguate_only_the_collisions() {
+        let (a, b, c) = (
+            p("/home/u/work/app"),
+            p("/home/u/fork/app"),
+            p("/home/u/tty7"),
+        );
+        let names = group_names(&[&a, &b, &c]);
+        assert_eq!(names, vec!["work/app", "fork/app", "tty7"]);
+    }
+
+    /// A root that runs out of components keeps its longest suffix instead of
+    /// looping forever, and the other side still grows past it to distinctness.
+    #[test]
+    fn group_names_handle_suffix_roots() {
+        let (short, long) = (p("/app"), p("/x/app"));
+        let names = group_names(&[&short, &long]);
+        assert_eq!(names, vec!["app", "x/app"]);
     }
 }
