@@ -2,7 +2,7 @@
 //! own SVG path only yields a tinted alpha mask, so the tray draws its own).
 //!
 //! Two states per platform:
-//! - macOS: the outline terminal glyph (`logo.svg`) as a *template* image —
+//! - macOS: the outline terminal glyph (`tray.svg`) as a *template* image —
 //!   the system recolors its alpha for light/dark menu bars. Attention swaps
 //!   to a non-template variant: the glyph recolored to a mid-grey that reads
 //!   on both bar appearances, plus an amber badge (template images can't
@@ -23,7 +23,7 @@ pub(super) struct RgbaImage {
 }
 
 #[cfg(target_os = "macos")]
-const GLYPH_SVG: &[u8] = include_bytes!("../../../assets/logo.svg");
+const GLYPH_SVG: &[u8] = include_bytes!("../../../assets/tray.svg");
 #[cfg(not(target_os = "macos"))]
 const GLYPH_SVG: &[u8] = include_bytes!("../../../assets/app-icon.svg");
 
