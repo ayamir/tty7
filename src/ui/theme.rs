@@ -117,10 +117,7 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     // Window opacity / blur: the global config override wins when set (so a
     // chosen translucency survives theme switches); otherwise the theme's own
     // values apply. Only an opacity below 1.0 makes the window translucent.
-    let opacity = config
-        .window_opacity
-        .or(theme.opacity)
-        .filter(|o| *o < 1.0);
+    let opacity = config.window_opacity.or(theme.opacity).filter(|o| *o < 1.0);
     let blur = config.window_blur.unwrap_or(theme.blur);
     // Force the native macOS chrome (traffic lights, system menus, scrollbars)
     // into the theme's own light/dark mode regardless of the OS setting.

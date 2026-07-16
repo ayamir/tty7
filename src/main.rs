@@ -137,8 +137,10 @@ fn spawn_config_watcher(cx: &mut App) {
                 // Re-paint theme + colors from the new config. We have no window
                 // handle in this global task, but `apply_theme` accepts `None`:
                 // it still updates the `Theme`/palette globals (what actually
-                // repaints); the only thing it skips is re-pinning the macOS
-                // traffic lights, which self-corrects on the next resize/activate.
+                // repaints). The window-bound effects — the Transparent↔Blurred
+                // background flip and traffic-light re-pinning — are covered by
+                // `Tty7App::reload_from_config`, which observes the `Config`
+                // global with its window and re-runs `apply_theme(Some(window))`.
                 crate::ui::theme::apply_theme(None, cx);
                 // Schedule every window to redraw so the new palette shows at once.
                 cx.refresh_windows();
@@ -380,8 +382,7 @@ fn main() {
                         WindowBounds::Fullscreen(bounds)
                     }
                 };
-                let window_background =
-                    cx.update(|cx| crate::ui::theme::background_appearance(cx));
+                let window_background = cx.update(|cx| crate::ui::theme::background_appearance(cx));
                 let options = WindowOptions {
                     window_bounds: Some(window_bounds),
                     // Start from the component defaults but nudge the traffic lights

@@ -1263,9 +1263,9 @@ impl Tty7App {
             .into_any_element();
         let blur_switch = Switch::new("window-blur")
             .checked(blur)
-            .on_click(cx.listener(|this, on: &bool, window, cx| {
-                this.set_window_blur(*on, window, cx)
-            }))
+            .on_click(
+                cx.listener(|this, on: &bool, window, cx| this.set_window_blur(*on, window, cx)),
+            )
             .into_any_element();
 
         v_flex()
@@ -1341,7 +1341,11 @@ impl Tty7App {
                 .w(px(240.))
                 .child(
                     Button::new("pick-theme-image")
-                        .label(if image.is_some() { "Change…" } else { "Choose…" })
+                        .label(if image.is_some() {
+                            "Change…"
+                        } else {
+                            "Choose…"
+                        })
                         .small()
                         .on_click(cx.listener(|this, _, _w, cx| this.pick_theme_image(cx))),
                 )

@@ -482,10 +482,13 @@ impl Tty7App {
         let mf_description = cx.new(|cx| InputState::new(window, cx).placeholder("description"));
         let sidebar_width = cx.global::<Config>().sidebar_width;
         // Live-apply hot-reloaded config: the watcher in `main.rs` swaps the
-        // `Config` global on every `config.json` change, which fires this. Theme
-        // and colors are handled separately by `apply_theme`; here we cover the
-        // font knobs that live on `Tty7App`/the panes.
-        let config_watch = cx.observe_global::<Config>(|this, cx| this.reload_from_config(cx));
+        // `Config` global on every `config.json` change, which fires this. The
+        // window-aware variant so the reload can re-run `apply_theme` with the
+        // window (blur flip, traffic-light pinning) and re-sync the Appearance
+        // opacity slider — the watcher task itself has no window handle.
+        let config_watch = cx.observe_global_in::<Config>(window, |this, window, cx| {
+            this.reload_from_config(window, cx)
+        });
         // Repaint when any pane's git probe lands in the shared cache — the
         // sidebar's branch/diff lines read from it, and the probing pane's own
         // notify wouldn't re-render rows belonging to *other* panes. The open
@@ -1014,7 +1017,12 @@ impl Tty7App {
     }
 
     /// Set the global window-blur override from the Appearance switch.
-    pub(crate) fn set_window_blur(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn set_window_blur(
+        &mut self,
+        on: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.global_mut::<Config>().window_blur = Some(on);
         apply_theme(Some(window), cx);
         cx.global::<Config>().save();
@@ -1038,7 +1046,11 @@ impl Tty7App {
     /// Snap the Appearance opacity slider's thumb to the value now in effect.
     /// Needed whenever that value changes for a reason other than the user
     /// dragging it (theme switch, "Follow theme" reset).
-    pub(crate) fn sync_window_opacity_slider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn sync_window_opacity_slider(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let eff = Self::effective_window_opacity(cx);
         if let Some(slider) = self
             .active_settings()
@@ -2969,15 +2981,13 @@ impl Tty7App {
                 .step(0.01)
                 .default_value(eff)
         });
-        subs.push(cx.subscribe_in(
-            &slider,
-            window,
-            |this, _s, ev: &SliderEvent, window, cx| {
+        subs.push(
+            cx.subscribe_in(&slider, window, |this, _s, ev: &SliderEvent, window, cx| {
                 if let SliderEvent::Change(v) = ev {
                     this.set_window_opacity(v.start(), window, cx);
                 }
-            },
-        ));
+            }),
+        );
         slider
     }
 
@@ -3135,7 +3145,14 @@ impl Tty7App {
     /// *our own* code mutated the global (every font setter and `set_preset`
     /// writes it), and — because we never write the global or `save()` from here
     /// — closes the save → watch → reload loop that would otherwise oscillate.
-    fn reload_from_config(&mut self, cx: &mut Context<Self>) {
+    fn reload_from_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Re-apply the theme with the window in hand: the watcher task calls
+        // `apply_theme(None)` (colors/palette), but the window-bound effects — the
+        // Transparent↔Blurred background flip and traffic-light re-pinning — only
+        // happen here. Also keeps the Appearance opacity slider's thumb on a value
+        // that was hand-edited in `config.json` or the theme file.
+        apply_theme(Some(window), cx);
+        self.sync_window_opacity_slider(window, cx);
         let config = cx.global::<Config>().clone();
         if config.cursor_style != self.terminal_cursor_style
             || config.scrollback_limit != self.terminal_scrollback_limit
@@ -3954,7 +3971,9 @@ impl Render for Tty7App {
                 // Same gradient-aware paint as the root, so a gradient theme's
                 // settings page doesn't snap to a flat color. A translucent
                 // theme's alpha rides along, letting the background image show
-                // through here too.
+                // through here too. This second layer compounds the alpha over
+                // the root's paint — deliberate: the overlay must occlude the
+                // terminal behind it to stay readable.
                 .bg(window_bg)
                 .child(self.render_settings(cx))
         });
