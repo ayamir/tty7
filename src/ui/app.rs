@@ -1968,12 +1968,26 @@ impl Tty7App {
     /// clean worktree gets a plain keep/remove prompt; one with uncommitted
     /// changes defaults to keeping and makes discarding explicit. Removal also
     /// deletes the branch when it carries no unmerged commits (`branch -d`).
+    /// No offer while any surviving pane still has its cwd inside the checkout
+    /// (new tabs inherit the current cwd, so shared worktrees are common) —
+    /// removal would yank the directory out from under a live shell.
     /// Detection, the dirty probe, and removal all run off the UI thread.
     fn offer_worktree_cleanup(&mut self, cwd: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
         let Some(cwd) = cwd else { return };
+        // Every leaf of every surviving tab, not just focused panes — a shell
+        // tucked away in a split occupies the worktree all the same.
+        let open_cwds: Vec<std::path::PathBuf> = self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.pane.leaves())
+            .filter_map(|leaf| leaf.read(cx).cwd())
+            .collect();
         cx.spawn(async move |this, cx| {
             let Some(wt) = cx
-                .background_spawn(async move { crate::core::worktree::managed(&cwd) })
+                .background_spawn(async move {
+                    crate::core::worktree::managed(&cwd)
+                        .filter(|wt| !crate::core::worktree::occupied(&wt.path, &open_cwds))
+                })
                 .await
             else {
                 return;

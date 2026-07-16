@@ -166,6 +166,16 @@ pub fn managed(cwd: &Path) -> Option<ManagedWorktree> {
     })
 }
 
+/// Whether any of `cwds` still lives inside the worktree at `path` — removing
+/// the checkout then would pull the directory out from under a live shell (new
+/// tabs inherit the current cwd, so two tabs sharing one worktree is common).
+/// Each cwd is canonicalized before the ancestor test to match the physical
+/// path git reported; a vanished cwd never counts as occupying.
+pub fn occupied(path: &Path, cwds: &[PathBuf]) -> bool {
+    cwds.iter()
+        .any(|c| std::fs::canonicalize(c).is_ok_and(|c| c.starts_with(path)))
+}
+
 /// Remove a managed worktree (`git worktree remove`, `--force` to discard
 /// uncommitted changes), then best-effort delete its branch with `-d` — so a
 /// branch carrying unmerged commits survives the cleanup.
@@ -479,6 +489,20 @@ mod tests {
         assert!(!branch_exists(&repo, &wt.branch));
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&own);
+    }
+
+    #[test]
+    fn occupied_detects_live_cwds_inside_the_worktree() {
+        let repo = temp_repo("occ");
+        let wt = create(&repo, &req("occ-wt")).unwrap();
+        let inside = wt.path.join("deep");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert!(occupied(&wt.path, &[repo.clone(), inside]));
+        // Cwds elsewhere in the repo don't count…
+        assert!(!occupied(&wt.path, &[repo.clone()]));
+        // …and neither does a cwd that no longer exists.
+        assert!(!occupied(&wt.path, &[wt.path.join("gone")]));
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
