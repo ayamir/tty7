@@ -629,6 +629,57 @@ fn clipboard_paste_text(item: &ClipboardItem) -> Option<String> {
     item.text()
 }
 
+/// Stage a clipboard image as a temp file so [`paste_clipboard_image`] can paste
+/// its path. Web-friendly formats a coding agent's vision accepts (PNG/JPEG/GIF/
+/// WebP) are written through untouched; anything else — notably the BMP that
+/// Windows screenshots (`CF_DIB`) arrive as — is transcoded to PNG, since agent
+/// vision rejects those. Returns the path, or `None` if decoding/writing failed.
+///
+/// The filename is keyed on gpui's content hash of the bytes, so re-pasting the
+/// same screenshot reuses one file instead of accumulating temp copies (this
+/// crate has no `Date`/random to mint a unique name with anyway).
+#[cfg(not(target_os = "macos"))]
+fn write_clipboard_image(img: &gpui::Image) -> Option<std::path::PathBuf> {
+    use gpui::ImageFormat;
+    let dir = std::env::temp_dir().join("tty7-clipboard");
+    std::fs::create_dir_all(&dir).ok()?;
+    let (ext, transcoded) = match img.format {
+        ImageFormat::Png => ("png", None),
+        ImageFormat::Jpeg => ("jpg", None),
+        ImageFormat::Gif => ("gif", None),
+        ImageFormat::Webp => ("webp", None),
+        other => ("png", Some(transcode_to_png(&img.bytes, other)?)),
+    };
+    let data: &[u8] = transcoded.as_deref().unwrap_or(&img.bytes);
+    let path = dir.join(format!("paste-{:016x}.{ext}", img.id));
+    std::fs::write(&path, data).ok()?;
+    Some(path)
+}
+
+/// Decode `bytes` (in `format`) and re-encode as PNG. SVG can't be rasterized by
+/// the `image` crate, so it — and any decode/encode failure — yields `None`.
+#[cfg(not(target_os = "macos"))]
+fn transcode_to_png(bytes: &[u8], format: gpui::ImageFormat) -> Option<Vec<u8>> {
+    use gpui::ImageFormat as G;
+    let src = match format {
+        G::Png => image::ImageFormat::Png,
+        G::Jpeg => image::ImageFormat::Jpeg,
+        G::Webp => image::ImageFormat::WebP,
+        G::Gif => image::ImageFormat::Gif,
+        G::Bmp => image::ImageFormat::Bmp,
+        G::Tiff => image::ImageFormat::Tiff,
+        G::Ico => image::ImageFormat::Ico,
+        G::Pnm => image::ImageFormat::Pnm,
+        G::Svg => return None,
+    };
+    let decoded = image::load_from_memory_with_format(bytes, src).ok()?;
+    let mut out = Vec::new();
+    decoded
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok()?;
+    Some(out)
+}
+
 /// The font fallback chain: the user's configured list with the bundled "Hack"
 /// pinned to the end. Hack ships inside the binary (`register_bundled_fonts`)
 /// and covers the symbols prompt themes lean on — `❯`, `➜`, box drawing, the
@@ -1431,21 +1482,15 @@ impl TerminalView {
                 if let Some(item) = cx.read_from_clipboard() {
                     if let Some(text) = clipboard_paste_text(&item) {
                         self.paste(text, cx);
-                    } else if !self.input_active()
-                        && item
-                            .entries()
-                            .iter()
-                            .any(|e| matches!(e, ClipboardEntry::Image(_)))
-                    {
-                        // Clipboard holds an image (e.g. a screenshot) with no text.
-                        // A foreground TUI like Claude Code reads the image from the OS
-                        // clipboard itself when it sees Ctrl+V (SYN, 0x16), so forward
-                        // that byte instead of trying to send image data — matching how
-                        // GUI terminals route Cmd+V image pastes to CLI agents.
-                        self.terminal.write(vec![0x16]);
-                        // PTY input consumes the selection, like `paste` (#111).
-                        self.terminal.term.lock().selection = None;
-                        cx.notify();
+                    } else if !self.input_active() {
+                        if let Some(img) = item.entries().iter().find_map(|e| match e {
+                            ClipboardEntry::Image(img) => Some(img),
+                            _ => None,
+                        }) {
+                            // Clipboard holds an image (e.g. a screenshot) with no text,
+                            // and a foreground TUI (a coding agent) owns the pane.
+                            self.paste_clipboard_image(img, cx);
+                        }
                     }
                 }
                 CmdKey::Consumed
@@ -2289,6 +2334,30 @@ impl TerminalView {
             return;
         }
         self.paste(format!("{text} "), cx);
+    }
+
+    /// Paste a clipboard image (e.g. a screenshot) into a foreground coding-agent
+    /// TUI. Agents like Claude Code attach an image typed as a *file path* at the
+    /// prompt — the same route drag-and-drop uses — so off macOS we stage the image
+    /// to a temp file and paste its shell-escaped path, mirroring [`drop_files`].
+    ///
+    /// On macOS the agent can instead read the image straight from the pasteboard
+    /// when it sees Ctrl+V, so we forward SYN (`0x16`) and let it do that
+    /// higher-fidelity read. That same read is unreliable off macOS — Claude Code on
+    /// Windows silently drops raw screenshots (anthropics/claude-code#26679) — which
+    /// is why we materialize a file there. If staging fails, we fall back to SYN.
+    fn paste_clipboard_image(&mut self, img: &gpui::Image, cx: &mut Context<Self>) {
+        #[cfg(not(target_os = "macos"))]
+        if let Some(path) = write_clipboard_image(img) {
+            let text = shell_escape_path(&path.to_string_lossy());
+            self.paste(format!("{text} "), cx);
+            return;
+        }
+        let _ = img;
+        self.terminal.write(vec![0x16]);
+        // PTY input consumes the selection, like `paste` (#111).
+        self.terminal.term.lock().selection = None;
+        cx.notify();
     }
 
     /// Clear the terminal (right-click "Clear"), like Cmd+K / the `clear`
@@ -5262,6 +5331,31 @@ mod tests {
     use gpui::{ClipboardEntry, ClipboardItem, ExternalPaths, Modifiers};
     use gpui_component::IconName;
     use std::path::PathBuf;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn clipboard_image_transcodes_bmp_to_png_and_passes_png_through() {
+        use gpui::{Image, ImageFormat};
+
+        // A BMP (what a Windows screenshot lands as) must be re-encoded to PNG,
+        // since agent vision rejects BMP. Build one with the image crate.
+        let pixel = image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]));
+        let mut bmp = Vec::new();
+        image::DynamicImage::ImageRgba8(pixel)
+            .write_to(&mut std::io::Cursor::new(&mut bmp), image::ImageFormat::Bmp)
+            .unwrap();
+        let path = super::write_clipboard_image(&Image::from_bytes(ImageFormat::Bmp, bmp)).unwrap();
+        assert_eq!(path.extension().unwrap(), "png");
+        // PNG magic number: the staged file is genuinely a PNG, not renamed BMP.
+        assert_eq!(&std::fs::read(&path).unwrap()[..8], b"\x89PNG\r\n\x1a\n");
+
+        // A format agents already accept is written through byte-for-byte.
+        let png = std::fs::read(&path).unwrap();
+        let out = super::write_clipboard_image(&Image::from_bytes(ImageFormat::Png, png.clone()))
+            .unwrap();
+        assert_eq!(out.extension().unwrap(), "png");
+        assert_eq!(std::fs::read(&out).unwrap(), png);
+    }
 
     /// The bundled Hack always anchors the fallback chain so prompt symbols
     /// (`➜`, `❯`, powerline wedges) never fall through to the OS cascade —
