@@ -1021,8 +1021,9 @@ impl TerminalView {
 
     /// Whether this pane's finished turn (the green `Done` dot) is unread — a
     /// turn ended that the user hasn't looked at since (see
-    /// [`agent_result_unread`](Self::agent_result_unread) field). Drives the
-    /// avatar dot's unread halo; the dot itself shows for any `Done`.
+    /// [`agent_result_unread`](Self::agent_result_unread) field). Feeds the
+    /// tab's unread count (the avatar dot's count badge); the dot itself shows
+    /// for any `Done`.
     pub fn agent_result_unread(&self) -> bool {
         self.agent_result_unread
     }

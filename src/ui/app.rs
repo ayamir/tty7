@@ -164,9 +164,9 @@ impl Tab {
     /// The tab's most urgent agent status across its leaves — waiting beats
     /// working beats done beats idle — or `None` when no leaf runs an agent.
     /// The green `Done` state always shows (a finished turn stays visible until
-    /// the next one); [`agent_result_unread`](Self::agent_result_unread) then
-    /// says whether to emphasize it as unread. Drives the avatar dot and the
-    /// sidebar counts.
+    /// the next one); [`agent_unread_count`](Self::agent_unread_count) then
+    /// says how many of those finished turns are unread. Drives the avatar dot
+    /// and the sidebar counts.
     pub(crate) fn agent_status(&self, cx: &App) -> Option<crate::core::cli_agent::AgentStatus> {
         use crate::core::cli_agent::AgentStatus;
         let urgency = |s: AgentStatus| match s {
@@ -188,18 +188,26 @@ impl Tab {
             .max_by_key(|s| urgency(*s))
     }
 
-    /// Whether the tab's shown status is an *unread* finished turn — a `Done`
-    /// the user hasn't looked at since. Drives the avatar dot's unread halo:
-    /// the green dot stays either way, the halo just says "new, come look."
-    /// Only meaningful when the shown status is `Done`.
-    pub(crate) fn agent_result_unread(&self, cx: &App) -> bool {
+    /// How many of the tab's panes hold an *unread* finished turn — a `Done`
+    /// the user hasn't looked at since. Drives the avatar dot's unread form:
+    /// the green dot swells into a count badge (a split tab can finish several
+    /// turns while you're away), and shrinks back to a plain dot once every
+    /// pane has been seen. Zero when the shown status isn't `Done` — a busier
+    /// pane (working/waiting) owns the corner until it settles.
+    pub(crate) fn agent_unread_count(&self, cx: &App) -> usize {
         use crate::core::cli_agent::AgentStatus;
-        self.agent_status(cx) == Some(AgentStatus::Done)
-            && self.pane.leaves().into_iter().any(|l| {
+        if self.agent_status(cx) != Some(AgentStatus::Done) {
+            return 0;
+        }
+        self.pane
+            .leaves()
+            .into_iter()
+            .filter(|l| {
                 let v = l.read(cx);
                 v.agent_session().map(|s| s.status) == Some(AgentStatus::Done)
                     && v.agent_result_unread()
             })
+            .count()
     }
 }
 

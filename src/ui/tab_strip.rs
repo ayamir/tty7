@@ -150,43 +150,38 @@ impl Tty7App {
     /// The status dot pinned to a tab avatar's bottom-right corner (an agent's
     /// live status, or an SSH pane's connection phase): a solid
     /// `rgb` disc with a surface-colored separator ring so it reads as sitting
-    /// on the badge. When `unread` (a finished turn you haven't looked at), the
-    /// dot gains a crisp outer ring of the same hue — the dot's separator ring
-    /// becomes the gap, so it reads as a clean target (core · gap · ring), a
-    /// sharper "come look" than a soft halo. `size` is the avatar edge.
-    fn status_dot(rgb: u32, unread: bool, size: f32, cx: &App) -> gpui::AnyElement {
+    /// on the badge. `unread` is how many panes hold a finished turn you
+    /// haven't looked at: when nonzero, the dot swells into a count badge —
+    /// the same disc grown just enough to speak its number — so read↔unread
+    /// stays one element opening its mouth, not a second indicator appearing.
+    /// `size` is the avatar edge.
+    fn status_dot(rgb: u32, unread: usize, size: f32, cx: &App) -> gpui::AnyElement {
         let d = (size * 0.42).max(7.);
         let bg = cx.theme().background;
-        // The read dot: a solid disc with a 2px surface-colored separator ring,
-        // so its *green core* is `d - 4`. The unread variant keeps that exact
-        // core and only wraps it in a hairline gap + ring — so switching read↔
-        // unread never changes the dot's apparent size, just adds a thin target
-        // rim. (The earlier version accidentally grew the core, which read as a
-        // much bigger dot.)
-        if unread {
-            let core = (d - 4.0).max(3.0); // identical green core to the read dot
-            let gap = 0.9; // hairline surface-colored gap
-            let ring = (d * 0.10).max(0.85); // ~0.9px same-hue outer rim
-            let inner = core + gap * 2.0; // green core + gap
-            let outer = inner + ring * 2.0; // + outer ring
-            let inner_dot = div()
-                .size(px(inner))
+        if unread > 0 {
+            // The count badge: sized to seat a digit legibly, centred on the
+            // read dot's centre (same corner point) so the swell reads as the
+            // dot growing in place rather than a new element popping up.
+            let nd = (size * 0.72).max(13.0);
+            // Panes per tab are single-digit in practice; clamp so an absurd
+            // split can never overflow the disc.
+            let label = unread.min(9).to_string();
+            div()
+                .absolute()
+                .right(px(-(nd - d) / 2.0 - d * 0.22))
+                .bottom(px(-(nd - d) / 2.0 - d * 0.22))
+                .size(px(nd))
                 .rounded_full()
                 .border_1()
                 .border_color(bg)
-                .bg(gpui::rgb(rgb));
-            // Center the outer disc on the read dot's center (same corner point).
-            div()
-                .absolute()
-                .right(px(-(outer - d) / 2.0 - d * 0.22))
-                .bottom(px(-(outer - d) / 2.0 - d * 0.22))
-                .size(px(outer))
-                .rounded_full()
+                .bg(gpui::rgb(rgb))
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(gpui::rgb(rgb))
-                .child(inner_dot)
+                .text_size(px((nd * 0.62).round()))
+                .font_weight(FontWeight::BOLD)
+                .text_color(gpui::white())
+                .child(label)
                 .into_any_element()
         } else {
             div()
@@ -214,7 +209,7 @@ impl Tty7App {
         &self,
         agent: Option<crate::core::cli_agent::CLIAgent>,
         status: Option<crate::core::cli_agent::AgentStatus>,
-        unread: bool,
+        unread: usize,
         ssh: Option<u32>,
         size: f32,
         cx: &App,
@@ -233,10 +228,10 @@ impl Tty7App {
                 // bottom-right corner (blue working / amber waiting / green
                 // done), ringed in the surface color so it reads as sitting on
                 // the badge rather than clipped by it. Idle (or unknown) draws
-                // no dot — a resting agent is just its brand mark. An *unread*
-                // finished turn adds a translucent same-hue halo around the dot
-                // — a soft "come look" that clears (back to a plain dot) once
-                // you view the pane, without ever hiding the done state.
+                // no dot — a resting agent is just its brand mark. *Unread*
+                // finished turns swell the dot into a count badge ("2 results
+                // waiting") that shrinks back to a plain dot once you view the
+                // panes, without ever hiding the done state.
                 let dot = status
                     .and_then(|s| s.dot_rgb())
                     .map(|rgb| Self::status_dot(rgb, unread, size, cx));
@@ -269,9 +264,7 @@ impl Tty7App {
                 // SSH connection phase as a corner status dot — the same
                 // element as an agent's, not a border ring around the badge
                 // (a ring read as a second, differently-shaped avatar style).
-                .when_some(ssh, |b, rgb| {
-                    b.child(Self::status_dot(rgb, false, size, cx))
-                })
+                .when_some(ssh, |b, rgb| b.child(Self::status_dot(rgb, 0, size, cx)))
                 .into_any_element(),
         }
     }
@@ -564,7 +557,7 @@ impl Tty7App {
             // glance across a crowded strip.
             let agent = tab.agent(cx);
             let agent_status = tab.agent_status(cx);
-            let agent_unread = tab.agent_result_unread(cx);
+            let agent_unread = tab.agent_unread_count(cx);
 
             // Inline rename input for this tab, if it's the one being renamed.
             let rename_input = self
