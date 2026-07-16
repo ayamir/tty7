@@ -30,6 +30,7 @@ Aider、Amp、OpenCode 等约 17 个）并在其外围加功能 —— 绝不包
 - **一眼看分支** —— 侧栏每行显示该 pane 的 git 分支和工作区改动（`+N −M`），`cd` 或命令跑完时自动刷新
 - **会话恢复** —— 重启后无法重连的 pane 会自动续上 agent 对话（`claude --resume …`；`restore_agent_sessions`，默认开启）
 - **上下文回填** —— 面板命令把当前选区或仓库 `git diff` 打包成 prompt 直接喂给正在跑的 agent
+- **托盘图标** —— 系统托盘 / 菜单栏常驻图标，任何 agent 等你输入时立即切换为提醒态；菜单列出所有 agent pane（品牌头像 + 状态点，点击直达）、可切换通知策略，并在保留会话的普通退出之外提供 *Quit and Stop Daemon*（`show_tray_icon`，默认开启）
 
 ## SSH
 

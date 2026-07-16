@@ -252,6 +252,11 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: WindowTabs,
+            title: "Show tray icon",
+            keywords: "tray menu bar status item agent attention system icon",
+        },
+        SearchEntry {
+            section: WindowTabs,
             title: "New tab position",
             keywords: "tabs order end after",
         },
@@ -2891,6 +2896,7 @@ impl Tty7App {
         };
         let restore_session = cfg.restore_session;
         let remember_window_size = cfg.remember_window_size;
+        let show_tray_icon = cfg.show_tray_icon;
         let tab_bar_idx = match cfg.tab_bar_position {
             TabBarPosition::Top => 0,
             TabBarPosition::Left => 1,
@@ -2903,6 +2909,10 @@ impl Tty7App {
         let remember_window_switch = Switch::new("wt-remember-window")
             .checked(remember_window_size)
             .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_remember_window_size(*on, cx)))
+            .into_any_element();
+        let tray_switch = Switch::new("wt-tray-icon")
+            .checked(show_tray_icon)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_show_tray_icon(*on, cx)))
             .into_any_element();
         let startup_radio = self.segmented(
             "wt-startup",
@@ -2965,6 +2975,13 @@ impl Tty7App {
                 "Restore previous session",
                 "Reopen the last window's tabs, splits, and directories on launch. Off starts with a single fresh terminal.",
                 restore_switch,
+                cx,
+            ))
+            .child(self.settings_row(
+                "Show tray icon",
+                "Keep a status item in the system tray / menu bar: it signals when a \
+                 coding agent needs your input, and its menu jumps to agent panes.",
+                tray_switch,
                 cx,
             ))
             .child(self.section_rule(cx))

@@ -594,6 +594,12 @@ impl Tty7App {
             ssh_close_confirm: None,
             window_bounds: window.window_bounds().get_bounds(),
         };
+        // Bring the system tray up (icon + agent menu + poll loop). Skipped in
+        // tests: the headless harness has no native status bar to register
+        // with, and the poll task would just spin against the mocked clock.
+        if !cfg!(test) {
+            crate::ui::tray::init(cx);
+        }
         // Discover this machine's shells for the "+" dropdown off the UI thread
         // (the WSL probe on Windows spawns a process, and /etc/shells hits the
         // filesystem). Until it lands the dropdown offers just the default entry.
@@ -733,6 +739,162 @@ impl Tty7App {
         self.focus_active(window, cx);
         self.save_session(cx);
         cx.notify();
+    }
+
+    // ── System tray (`ui::tray`) ────────────────────────────────────────────
+
+    /// Snapshot every agent pane for the tray menu: brand name, status, and a
+    /// "where" line (cwd directory name + git branch). Most urgent first, so
+    /// the pane that needs the user tops the menu. Called by the tray's poll
+    /// loop once a second; the walk is a handful of entity reads.
+    pub(crate) fn tray_snapshot(&self, cx: &App) -> crate::ui::tray::TraySnapshot {
+        use crate::core::cli_agent::AgentStatus;
+        let urgency = |s: AgentStatus| match s {
+            AgentStatus::Waiting => 3,
+            AgentStatus::Working => 2,
+            AgentStatus::Done => 1,
+            AgentStatus::Idle => 0,
+        };
+        let mut agents = Vec::new();
+        for tab in &self.tabs {
+            for leaf in tab.pane.leaves() {
+                let view = leaf.read(cx);
+                let Some(agent) = view.agent() else { continue };
+                let status = view
+                    .agent_session()
+                    .map(|s| s.status)
+                    .unwrap_or(AgentStatus::Idle);
+                let dir = view
+                    .cwd()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+                let branch = view.git_status(cx).map(|g| g.branch);
+                let detail = match (dir, branch) {
+                    (Some(dir), Some(branch)) => format!("{dir} @ {branch}"),
+                    (Some(dir), None) => dir,
+                    // No cwd yet (pane still spawning) — the agent name alone
+                    // still identifies the row.
+                    (None, _) => String::new(),
+                };
+                agents.push(crate::ui::tray::AgentRow {
+                    leaf_id: leaf.entity_id().as_u64(),
+                    agent,
+                    status,
+                    detail,
+                });
+            }
+        }
+        agents.sort_by_key(|a| std::cmp::Reverse(urgency(a.status)));
+        crate::ui::tray::TraySnapshot {
+            agents,
+            notify_mode: cx.global::<Config>().notify_on_command_finish,
+        }
+    }
+
+    /// Apply a tray menu click. Runs on the foreground executor with the
+    /// window in hand (see `tray::init`'s action pump).
+    pub(crate) fn handle_tray_action(
+        &mut self,
+        action: crate::ui::tray::TrayAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::ui::tray::TrayAction;
+        // Tray clicks arrive while another app is frontmost — that's the
+        // tray's whole premise. `activate_window` alone only orders our
+        // window front within the app (macOS: `makeKeyAndOrderFront:`); the
+        // *application* must also be activated or the reveal — and any
+        // window-modal prompt we show next — stays buried behind the app the
+        // user clicked from.
+        fn surface_window(window: &mut Window, cx: &mut App) {
+            cx.activate(true);
+            window.activate_window();
+        }
+        match action {
+            TrayAction::ShowWindow => surface_window(window, cx),
+            TrayAction::RevealPane { leaf_id } => {
+                // Resolve the leaf against the *live* tree — the menu the user
+                // clicked may predate a tab close; a vanished pane is a no-op
+                // (the window still comes forward).
+                let tab_ix = self.tabs.iter().position(|t| {
+                    t.pane
+                        .leaves()
+                        .iter()
+                        .any(|l| l.entity_id().as_u64() == leaf_id)
+                });
+                if let Some(ix) = tab_ix {
+                    self.activate(ix, window, cx);
+                    // The reveal must actually show the pane: a sibling leaf
+                    // maximized in this tab would otherwise keep the target
+                    // off-screen while we hand it keyboard focus (every other
+                    // focus-moving path clears this too).
+                    self.maximized = None;
+                    if let Some(leaf) = self.tabs[ix]
+                        .pane
+                        .leaves()
+                        .into_iter()
+                        .find(|l| l.entity_id().as_u64() == leaf_id)
+                    {
+                        self.tabs[ix].last_focused = Some(leaf.entity_id());
+                        self.focus_leaf(&leaf, window, cx);
+                    }
+                    cx.notify();
+                }
+                surface_window(window, cx);
+            }
+            TrayAction::SetNotifyMode(mode) => self.set_notify_mode(mode, cx),
+            TrayAction::OpenSettings => {
+                surface_window(window, cx);
+                if self.settings.is_none() {
+                    self.toggle_settings(window, cx);
+                }
+            }
+            TrayAction::CheckForUpdates => {
+                surface_window(window, cx);
+                // Forced: a manual "check now" should work even when the
+                // startup check is disabled. The result lands in the About
+                // panel we open next (via the `UpdateStatus` global).
+                crate::core::update::spawn_check_forced(cx);
+                self.open_settings_section(SettingsSection::About, window, cx);
+            }
+            // Same as ⌘Q: sessions keep running in the daemon.
+            TrayAction::Quit => cx.quit(),
+            TrayAction::QuitStopSessions => self.quit_stop_sessions(window, cx),
+        }
+    }
+
+    /// Tray "Quit and Stop Daemon": confirm, shut the daemon down (which
+    /// hangs up every shell — the whole point of picking this over plain
+    /// quit), then quit. The stop runs off the UI thread; like
+    /// `--stop-daemon` it can take a beat while children get their grace
+    /// period.
+    fn quit_stop_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The prompt is window-modal and the click came from the tray with
+        // another app frontmost — activate the app AND the window, or the
+        // user never sees the question.
+        cx.activate(true);
+        window.activate_window();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Quit and Stop Daemon?",
+            Some(
+                "This quits tty7 and stops the background daemon — anything \
+                 still running in your sessions is terminated. Your tabs and \
+                 layout are kept and reopen with fresh shells next launch. \
+                 (Plain Quit keeps sessions running.)",
+            ),
+            &["Cancel", "Quit and Stop"],
+            cx,
+        );
+        cx.spawn(async move |_this, cx| {
+            // Index 1 == "Shut Down"; Cancel or a dismissed prompt do nothing.
+            if !matches!(answer.await, Ok(1)) {
+                return;
+            }
+            cx.background_spawn(async { crate::daemon::spawn::stop() })
+                .await;
+            let _ = cx.update(|cx| cx.quit());
+        })
+        .detach();
     }
 
     /// Restart the persistent background daemon: shut the running one down (which
@@ -1456,6 +1618,12 @@ impl Tty7App {
     /// persists the preference); the current window is untouched.
     pub(crate) fn set_restore_session(&mut self, on: bool, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.restore_session = on);
+    }
+
+    /// Toggle the system tray icon. The tray's poll loop re-reads the flag
+    /// every second, so the icon appears/disappears without a restart.
+    pub(crate) fn set_show_tray_icon(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.show_tray_icon = on);
     }
 
     // ── Input / Mouse setters ───────────────────────────────────────────────

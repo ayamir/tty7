@@ -31,6 +31,7 @@ it never wraps or replaces the agent.
 - **Branch at a glance** — each sidebar row shows its pane's git branch and working-tree diff (`+N −M`), refreshed on `cd` and when a command finishes
 - **Session resume** — panes lost to a reboot re-launch their agent conversation (`claude --resume …`) on restore (`restore_agent_sessions`, on by default)
 - **Context feed** — palette commands send the current selection or the repo's `git diff` to the running agent as a ready-made prompt
+- **Tray icon** — a system tray / menu bar item that flips to an attention state the moment any agent needs your input; its menu lists every agent pane (brand avatar + status dot, click to reveal), switches the notification policy, and offers *Quit and Stop Daemon* alongside the plain session-keeping quit (`show_tray_icon`, on by default)
 
 ## SSH
 
