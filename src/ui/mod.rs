@@ -23,3 +23,4 @@ pub mod ssh_prompt;
 pub mod tab_sidebar;
 pub mod tab_strip;
 pub mod theme;
+pub mod worktree_prompt;

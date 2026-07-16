@@ -16,6 +16,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
+use gpui_component::menu::ContextMenuExt as _;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -318,7 +319,13 @@ impl Tty7App {
                         .into_any_element()
                 });
 
-            list = list.child(row);
+            // Per-tab right-click menu, shared with the strip's chips;
+            // `below_wording` flips the trailing close to "Close Tabs Below"
+            // to match the vertical layout.
+            let menu_app = cx.entity().downgrade();
+            list = list.child(row.context_menu(move |menu, window, cx| {
+                Tty7App::tab_context_menu(menu, i, true, &menu_app, window, cx)
+            }));
         }
 
         // Top control bar: a right-aligned "+" new-tab button (the same shell
