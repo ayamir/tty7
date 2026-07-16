@@ -1835,8 +1835,9 @@ impl OscSniffer {
             if let Some(path) = parse_osc7(payload) {
                 signals.cwd = Some(path);
             } else if let Some(rest) = payload.strip_prefix(b"133;") {
-                handle_osc133(shell, rest);
-                signals.shell = Some(shell.clone());
+                if handle_osc133(shell, rest) {
+                    signals.shell = Some(shell.clone());
+                }
             } else if let Some(event) = crate::core::cli_agent::parse_agent_event(payload) {
                 signals.agent_events.push(event);
             } else if let Some((title, body)) = crate::core::osc::parse_notification(payload) {
@@ -1852,7 +1853,7 @@ impl OscSniffer {
 }
 
 /// Fold one OSC 133 marker into the running shell state.
-fn handle_osc133(shell: &mut ShellState, rest: &[u8]) {
+fn handle_osc133(shell: &mut ShellState, rest: &[u8]) -> bool {
     shell.active = true;
     // `at_prompt` means "no foreground command is running" — i.e. the shell is
     // drawing or sitting at its prompt, so tty7's local line editor should own
@@ -1877,8 +1878,9 @@ fn handle_osc133(shell: &mut ShellState, rest: &[u8]) {
                 .and_then(|c| std::str::from_utf8(c).ok())
                 .and_then(|s| s.trim().parse::<i32>().ok());
         }
-        _ => {}
+        _ => return false,
     }
+    true
 }
 
 /// Build a `PathBuf` from raw OSC-7 path bytes. On Unix paths are arbitrary bytes,
@@ -2402,6 +2404,20 @@ mod tests {
         let d = s.feed(b"\x1b]133;D;130\x07");
         assert!(d.shell.as_ref().unwrap().at_prompt);
         assert_eq!(d.shell.as_ref().unwrap().last_exit_code, Some(130));
+    }
+
+    #[test]
+    fn sniff_osc133_edit_mode_does_not_emit_prompt_state() {
+        let mut s = OscSniffer::new();
+        let sig = s.feed(b"\x1b]133;V;1\x07");
+        assert!(
+            sig.shell.is_none(),
+            "edit-mode metadata must not bump prompt state or prompt sequence"
+        );
+
+        let b = s.feed(b"\x1b]133;B\x07");
+        assert!(b.shell.as_ref().unwrap().active);
+        assert!(b.shell.as_ref().unwrap().at_prompt);
     }
 
     /// The foreground-command predicate: only a process group *other* than the
