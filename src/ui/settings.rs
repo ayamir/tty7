@@ -214,11 +214,16 @@ fn settings_search_entries() -> &'static [SearchEntry] {
             title: "Verify host keys",
             keywords: "ssh security known_hosts fingerprint mitm host key verification",
         },
+        SearchEntry {
+            section: Ssh,
+            title: "Warn before closing",
+            keywords: "ssh confirm close tab pane live session security",
+        },
         // Agents
         SearchEntry {
             section: Agents,
             title: "Claude Code hooks",
-            keywords: "agent integration install uninstall status rich session working waiting sidebar badge claude",
+            keywords: "agent integration install uninstall status rich session working waiting tab bar sidebar badge claude",
         },
         SearchEntry {
             section: Agents,
@@ -1627,7 +1632,8 @@ impl Tty7App {
             .child(self.settings_row(
                 "Verify host keys",
                 "Check each server's key against known_hosts and confirm unknown or \
-                 changed keys before connecting.",
+                 changed keys before connecting. Off connects without checking, so a \
+                 spoofed server would go unnoticed.",
                 verify_switch,
                 cx,
             ))
@@ -2405,7 +2411,7 @@ impl Tty7App {
                 cx,
             ))
             .child(self.settings_row(
-                "Warn on close",
+                "Warn before closing",
                 "Override the global confirm-before-closing for this profile.",
                 self.segmented(
                     "ssh-form-woc",
