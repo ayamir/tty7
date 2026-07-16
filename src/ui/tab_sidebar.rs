@@ -88,7 +88,7 @@ impl Tty7App {
             let ssh_dot = self.tab_ssh_dot(tab, cx);
             let agent = tab.agent(cx);
             let agent_status = tab.agent_status(cx);
-            let agent_unread = tab.agent_result_unread(cx);
+            let agent_unread = tab.agent_unread_count(cx);
             // Third line (when the pane's cwd is inside a git work tree): the
             // branch, then the working-tree diff as green `+N` / red `−N`
             // badges — a per-session branch row. Built here so the row can
