@@ -393,8 +393,9 @@ impl Tty7App {
         let has_cwd = cwd.is_some();
         let mut menu = menu.min_w(px(200.));
 
-        // Rename — the same inline edit a label double-click starts, given a
-        // discoverable entry point.
+        // Rename — the inline label edit's only entry point (a label
+        // double-click zooms the window instead, like the rest of the
+        // titlebar).
         menu = menu.item(PopupMenuItem::new("Rename Tab").on_click({
             let app = app.clone();
             move |_, window, cx| {
@@ -593,16 +594,18 @@ impl Tty7App {
                     // from the type, not from colour alone.
                     .when(is_active, |d| d.font_weight(FontWeight::MEDIUM))
                     .child(label)
-                    // Single click activates; double click starts a rename.
+                    // Single click activates; double click zooms the window,
+                    // same as the rest of the titlebar. (Renaming lives in the
+                    // context menu.)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                            // Swallow the event so it never reaches the enclosing
-                            // TitleBar, whose double-click handler would otherwise
-                            // zoom/maximize the window on a rename double-click.
+                            // Swallow the event — on Windows the chip's `occlude()`
+                            // means it would never reach the TitleBar anyway, so we
+                            // forward the double-click zoom explicitly instead.
                             cx.stop_propagation();
                             if ev.click_count >= 2 {
-                                this.start_rename(i, window, cx);
+                                window.titlebar_double_click();
                             } else {
                                 this.activate(i, window, cx);
                             }

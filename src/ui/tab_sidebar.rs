@@ -209,16 +209,13 @@ impl Tty7App {
                     )
                     // Branch + diff line, when the pane sits in a git repo.
                     .children(git_line)
-                    // Single click activates; double click starts a rename.
+                    // Click activates. (Renaming lives in the context menu,
+                    // matching the strip — no double-click rename.)
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
-                            if ev.click_count >= 2 {
-                                this.start_rename(i, window, cx);
-                            } else {
-                                this.activate(i, window, cx);
-                            }
+                            this.activate(i, window, cx);
                         }),
                     )
                     // Drag the row by its label to reorder it (shared `DragTab`).
