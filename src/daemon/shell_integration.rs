@@ -9,6 +9,7 @@
 //!   - `OSC 133 ; B ST`            prompt end / command input begins
 //!   - `OSC 133 ; C ST`            command output begins (command executing)
 //!   - `OSC 133 ; D ; <exit> ST`   command finished, with its exit code
+//!   - `OSC 133 ; V ; 0/1 ST`      tty7 extension: shell edit mode
 //! plus `OSC 7` to report the cwd precisely (many login shells don't emit it
 //! unless they think they're in Terminal.app).
 //!
@@ -54,6 +55,14 @@ if [[ -o interactive ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
 
   __tty7_osc() { builtin printf '\e]%s\a' "$1"; }
 
+  __tty7_report_edit_mode() {
+    if [[ "$(builtin bindkey '^[')" == *"vi-cmd-mode"* ]]; then
+      __tty7_osc "133;V;1"
+    else
+      __tty7_osc "133;V;0"
+    fi
+  }
+
   # OSC 7: report the working directory so the app tracks it precisely (used for
   # opening new tabs / splits in the same place). The daemon percent-DECODES the
   # payload (OSC 7 carries a file: URI), so a literal `%` in the path must be
@@ -79,6 +88,7 @@ if [[ -o interactive ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
   # *after* the user's hooks: report cwd, then open a fresh prompt (A).
   __tty7_precmd() {
     __tty7_report_cwd
+    __tty7_report_edit_mode
     __tty7_osc "133;A"
     # Prompt-end marker (B): emitted at the very end of the prompt — exactly where
     # input begins — by living in PS1 (wrapped in %{...%} so zsh excludes it from
@@ -148,6 +158,15 @@ if status is-interactive; and test -z "$TTY7_SHELL_INTEGRATION"
     printf '\e]%s\a' $argv[1]
   end
 
+  function __tty7_report_edit_mode
+    switch $fish_key_bindings
+      case '*vi*'
+        __tty7_osc "133;V;1"
+      case '*'
+        __tty7_osc "133;V;0"
+    end
+  end
+
   # The daemon percent-decodes the OSC 7 payload; escape literal `%` as %25 so
   # a path like /tmp/a%20b round-trips instead of decoding to /tmp/a b.
   function __tty7_report_cwd
@@ -169,6 +188,7 @@ if status is-interactive; and test -z "$TTY7_SHELL_INTEGRATION"
       set -e __tty7_cmd_active
     end
     __tty7_report_cwd
+    __tty7_report_edit_mode
     __tty7_osc "133;A"
   end
 
@@ -204,6 +224,13 @@ if [[ $- == *i* ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
   export TTY7_SHELL_INTEGRATION=1
 
   __tty7_osc() { builtin printf '\e]%s\a' "$1"; }
+  __tty7_report_edit_mode() {
+    if [[ -o vi ]]; then
+      __tty7_osc "133;V;1"
+    else
+      __tty7_osc "133;V;0"
+    fi
+  }
   # Escape literal `%` as %25 — the daemon percent-decodes the OSC 7 payload.
   __tty7_report_cwd() { builtin printf '\e]7;file://%s%s\a' "${HOSTNAME:-localhost}" "${PWD//\%/%25}"; }
 
@@ -222,6 +249,7 @@ if [[ $- == *i* ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
   __tty7_precmd() {
     local ret=$?
     __tty7_report_cwd
+    __tty7_report_edit_mode
     __tty7_osc "133;A"
     # Prompt-end marker (B), wrapped in \[...\] so readline excludes it from the
     # prompt's on-screen width. Re-appended every precmd (like the zsh path)

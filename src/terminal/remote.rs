@@ -111,6 +111,7 @@ struct ReaderSignals {
     exited: Arc<AtomicBool>,
     child_exited: Arc<AtomicBool>,
     zle_reading: Arc<AtomicBool>,
+    shell_vi_mode: Arc<AtomicBool>,
     /// FIFO of pending native-SSH auth/host-key prompts (and banners, id 0)
     /// pushed by the reader as `DaemonMsg::AuthPrompt` frames arrive. The view
     /// drains these into the in-pane auth sheet (`ui::ssh_prompt`). Keyed per
@@ -169,6 +170,10 @@ pub struct RemoteTerminal {
     /// touch it (a historical `B` says nothing about now). Gates the typeahead
     /// wipe: a `^U` written before zle reads is kernel-echoed as literal junk.
     zle_reading: Arc<AtomicBool>,
+    /// Whether the shell reports vi editing mode for the current prompt. Sniffed
+    /// client-side from tty7's shell integration marker (`OSC 133;V;0/1`) so the
+    /// daemon/client wire protocol stays compatible across versions.
+    shell_vi_mode: Arc<AtomicBool>,
     /// Pending native-SSH auth/host-key prompts, filled by the reader thread. The
     /// view drains these each event batch (`take_auth_prompt`) into the in-pane
     /// sheet. Shared with the reader thread.
@@ -317,6 +322,7 @@ impl RemoteTerminal {
         let exited_flag = Arc::new(AtomicBool::new(false));
         let child_exited = Arc::new(AtomicBool::new(false));
         let zle_reading = Arc::new(AtomicBool::new(false));
+        let shell_vi_mode = Arc::new(AtomicBool::new(false));
         let auth_prompts: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>> =
             Arc::new(Mutex::new(VecDeque::new()));
         let ssh_phase: Arc<Mutex<Option<SshPhase>>> = Arc::new(Mutex::new(None));
@@ -334,6 +340,7 @@ impl RemoteTerminal {
                 exited: exited_flag.clone(),
                 child_exited: child_exited.clone(),
                 zle_reading: zle_reading.clone(),
+                shell_vi_mode: shell_vi_mode.clone(),
                 auth: auth_prompts.clone(),
                 phase: ssh_phase.clone(),
             },
@@ -353,6 +360,7 @@ impl RemoteTerminal {
             exited_flag,
             child_exited,
             zle_reading,
+            shell_vi_mode,
             auth_prompts,
             ssh_phase,
             ssh_endpoint: None,
@@ -393,6 +401,7 @@ impl RemoteTerminal {
                     exited: exited_flag,
                     child_exited,
                     zle_reading,
+                    shell_vi_mode,
                     auth,
                     phase,
                 } = signals;
@@ -411,10 +420,14 @@ impl RemoteTerminal {
                 // view-channel plumbing needed. Its state persists across frames so a
                 // sequence split over two `Output` reads is still recognized.
                 let mut osc = OscNotifyScanner::default();
-                // Sniffs OSC 133 marks out of the same live stream to track
-                // whether zle is reading (see the `zle_reading` field docs).
-                // Client-side on purpose: the daemon protocol stays untouched,
-                // so mixed client/daemon versions keep working.
+                // Sniffs tty7's OSC 133;V edit-mode metadata from both replayed
+                // snapshots and live output. Unlike zle_reading, this is durable
+                // prompt state: an attached client should inherit the last mode
+                // marker already present in the replay ring.
+                let mut mode_tok = OscTokenizer::new(&[b"133"]);
+                // Sniffs OSC 133 marks out of the live stream to track whether
+                // zle is reading (see the `zle_reading` field docs). Historical
+                // Snapshot replays deliberately do not feed this tokenizer.
                 let mut zle_tok = OscTokenizer::new(&[b"133"]);
                 // Bytes read but not yet framed, plus the recorded geometry
                 // waiting for its paired Snapshot: the attach replay is a
@@ -490,16 +503,33 @@ impl RemoteTerminal {
                                 for (title, body) in notes {
                                     notify_desktop(title.as_deref(), &body);
                                 }
+                                mode_tok.feed(&out_batch, |payload| {
+                                    if let Some(mode) = payload.strip_prefix(b"133;V;") {
+                                        shell_vi_mode.store(
+                                            mode.first() == Some(&b'1'),
+                                            Ordering::Relaxed,
+                                        );
+                                    }
+                                });
                                 // Live 133 marks: `B` = prompt fully printed, zle
                                 // takes the keyboard right after; anything else
                                 // (C command start, D precmd, A prompt start)
                                 // means it isn't reading.
                                 zle_tok.feed(&out_batch, |payload| {
                                     if let Some(mark) = payload.strip_prefix(b"133;") {
-                                        zle_reading.store(
-                                            mark.first() == Some(&b'B'),
-                                            Ordering::Relaxed,
-                                        );
+                                        match mark.first() {
+                                            Some(b'B') => {
+                                                zle_reading.store(true, Ordering::Relaxed)
+                                            }
+                                            Some(b'V') => {
+                                                shell_vi_mode.store(
+                                                    mark.strip_prefix(b"V;")
+                                                        .is_some_and(|v| v.first() == Some(&b'1')),
+                                                    Ordering::Relaxed,
+                                                );
+                                            }
+                                            _ => zle_reading.store(false, Ordering::Relaxed),
+                                        }
                                     }
                                 });
                                 proxy.send_event(AlacEvent::Wakeup);
@@ -566,6 +596,14 @@ impl RemoteTerminal {
                                         processor.stop_sync(&mut *term);
                                     }
                                 }
+                                mode_tok.feed(&bytes, |payload| {
+                                    if let Some(mode) = payload.strip_prefix(b"133;V;") {
+                                        shell_vi_mode.store(
+                                            mode.first() == Some(&b'1'),
+                                            Ordering::Relaxed,
+                                        );
+                                    }
+                                });
                                 proxy.replaying.store(false, Ordering::Relaxed);
                                 proxy.send_event(AlacEvent::Wakeup);
                             }
@@ -891,6 +929,10 @@ impl RemoteTerminal {
 
     pub fn zle_reading(&self) -> bool {
         self.zle_reading.load(Ordering::Relaxed)
+    }
+
+    pub fn shell_vi_mode(&self) -> bool {
+        self.shell_vi_mode.load(Ordering::Relaxed)
     }
 
     pub fn size(&self) -> TermSize {
@@ -2298,6 +2340,88 @@ mod tests {
             .unwrap();
         daemon_side.flush().unwrap();
         assert!(poll(false), "C (command start) should disarm zle_reading");
+    }
+
+    #[test]
+    fn shell_vi_mode_follows_live_prompt_mode_marks_without_disarming_zle() {
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let poll = |vi: bool, zle: bool| {
+            for _ in 0..200 {
+                if term.shell_vi_mode() == vi && term.zle_reading() == zle {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        };
+
+        assert!(!term.shell_vi_mode(), "conservative false before any mark");
+        assert!(!term.zle_reading(), "zle also starts false");
+
+        DaemonMsg::Output(b"\x1b]133;B\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(poll(false, true), "B should arm zle only");
+
+        DaemonMsg::Output(b"\x1b]133;V;1\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(
+            poll(true, true),
+            "V;1 should set shell vi-mode without disarming zle"
+        );
+
+        DaemonMsg::Output(b"\x1b]133;V;0\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(
+            poll(false, true),
+            "V;0 should clear shell vi-mode without disarming zle"
+        );
+
+        DaemonMsg::Output(b"\x1b]133;C\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(poll(false, false), "C still disarms zle");
+    }
+
+    #[test]
+    fn shell_vi_mode_is_restored_from_snapshot_replay() {
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let poll = |vi: bool| {
+            for _ in 0..200 {
+                if term.shell_vi_mode() == vi {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        };
+
+        DaemonMsg::Snapshot(b"\x1b]133;V;1\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(
+            poll(true),
+            "attached clients should inherit the prompt's vi-mode state"
+        );
+        assert!(
+            !term.zle_reading(),
+            "historical replay must not imply zle is currently reading"
+        );
+
+        DaemonMsg::Snapshot(b"\x1b]133;V;0\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(poll(false), "a replayed V;0 should clear vi-mode state");
     }
 
     /// Everything in the grid — screen rows plus scrollback — flattened to one

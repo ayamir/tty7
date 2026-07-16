@@ -1316,6 +1316,7 @@ impl TerminalView {
         let kitty = self.kitty_flags();
         if let Some(bytes) = super::input::keystroke_to_bytes(ks, kitty) {
             let plain = !m.control && !m.alt && !m.platform;
+            let shell_vi_prompt = self.shell_vi_prompt();
             // A plain Backspace is reconstructable gap input: offer it to the
             // hold, so a fast command's typeahead never touches the PTY (see
             // `hold`). Anything else releases the hold first — FIFO order on
@@ -1323,6 +1324,7 @@ impl TerminalView {
             // for the deferred wipe.
             let held = plain
                 && ks.key == "backspace"
+                && !shell_vi_prompt
                 && self.gap_holdable()
                 && match self.hold.hold_backspace(&bytes) {
                     Verdict::Held(arm) => {
@@ -1336,13 +1338,15 @@ impl TerminalView {
             if !held {
                 self.release_hold();
                 self.terminal.write(bytes);
-                self.typeahead.observe(
-                    RawInput::Key {
-                        key: ks.key.as_str(),
-                        plain,
-                    },
-                    self.on_alt_screen(),
-                );
+                if !shell_vi_prompt {
+                    self.typeahead.observe(
+                        RawInput::Key {
+                            key: ks.key.as_str(),
+                            plain,
+                        },
+                        self.on_alt_screen(),
+                    );
+                }
             }
             // Keep the cursor solid while typing (resets the blink phase).
             self.cursor_visible = true;
@@ -1737,17 +1741,11 @@ impl TerminalView {
             }
             "escape" => {
                 // Esc carries no local-editor meaning, so pass it straight to the
-                // shell — its own zle bindings act on it (vi command mode from
-                // `bindkey -v`, `\e`-prefixed widgets, menu-select cancel). Encode
-                // through the shared path so Alt-prefixing and the Kitty `CSI 27 u`
-                // form stay identical to the raw path; `escape` always encodes, the
-                // fallback is just belt-and-braces.
-                //
-                // Unlike printable text — which the editor mirrors locally and only
-                // ships on Enter — a bare control byte leaves nothing on zle's line
-                // to reconcile, so it is deliberately NOT fed to `typeahead.observe`:
-                // a non-text key taints the record, firing a spurious `^U` on the
-                // next flush.
+                // shell — its own zle/readline bindings act on it (vi command
+                // mode from bindkey/readline vi mode, `\e`-prefixed widgets,
+                // menu-select cancel). Shell vi-mode itself disables the local
+                // editor from prompt start, so this is only the emacs-mode
+                // fallback path.
                 let bytes = super::input::keystroke_to_bytes(ks, self.kitty_flags())
                     .unwrap_or_else(|| vec![0x1b]);
                 self.terminal.write(bytes);
@@ -2773,7 +2771,14 @@ impl TerminalView {
         if self.on_alt_screen() {
             return false;
         }
+        if self.shell_vi_prompt() {
+            return false;
+        }
         self.at_shell_prompt()
+    }
+
+    fn shell_vi_prompt(&self) -> bool {
+        self.terminal.shell_vi_mode() && self.terminal.at_prompt() && !self.on_alt_screen()
     }
 
     /// True while the emulator is on the alternate screen — a full-screen TUI
@@ -2825,7 +2830,7 @@ impl TerminalView {
     /// pane. Only consulted on the raw path, so "the editor is disengaged" is
     /// already implied.
     fn gap_holdable(&self) -> bool {
-        self.terminal.shell_active() && !self.on_alt_screen()
+        self.terminal.shell_active() && !self.on_alt_screen() && !self.shell_vi_prompt()
     }
 
     /// Write printable gap text (IME commit, paste) toward the shell: offered
@@ -2833,6 +2838,11 @@ impl TerminalView {
     /// written raw and recorded for the deferred wipe. `bytes` is the exact
     /// PTY encoding (paste may be bracketed-wrapped).
     fn write_gap_text(&mut self, text: &str, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        if self.shell_vi_prompt() {
+            self.release_hold();
+            self.terminal.write(bytes);
+            return;
+        }
         if self.gap_holdable() && !text.chars().any(char::is_control) {
             match self.hold.hold_text(text, &bytes) {
                 Verdict::Held(arm) => {
@@ -5912,6 +5922,153 @@ mod gpui_tests {
             .unwrap();
 
         assert_eq!(next_input_until_timeout(&mut daemon), Some(vec![0x0c]));
+    }
+
+    #[gpui::test]
+    fn shell_vi_mode_prompt_bypasses_the_local_editor(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: None,
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        DaemonMsg::Output(b"\x1b]133;V;1\x07\x1b]133;B\x07".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let ready = window
+                .update(cx, |view, _, _| {
+                    view.terminal.shell_vi_mode() && view.terminal.zle_reading()
+                })
+                .unwrap();
+            if ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        window
+            .update(cx, |view, window, cx| {
+                assert!(
+                    !view.input_active(),
+                    "shell vi-mode lets the shell line editor own prompt input"
+                );
+                let a = KeyDownEvent {
+                    keystroke: gpui::Keystroke {
+                        modifiers: gpui::Modifiers::default(),
+                        key: "a".to_string(),
+                        key_char: Some("a".to_string()),
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                view.on_key_down(&a, window, cx);
+                assert_eq!(
+                    view.cmd.text(),
+                    "",
+                    "vi-mode prompt input must not draw through the local overlay"
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            next_input_until_timeout(&mut daemon),
+            Some(b"a".to_vec()),
+            "shell vi-mode prompt input must reach the shell directly"
+        );
+
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: Some(0),
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        DaemonMsg::Output(b"\x1b]133;V;0\x07\x1b]133;B\x07".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let active = window.update(cx, |view, _, _| view.input_active()).unwrap();
+            if active {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("an emacs-mode prompt should re-enable tty7's local editor");
+    }
+
+    #[gpui::test]
+    fn shell_vi_mode_prompt_input_is_not_typeahead(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: None,
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        DaemonMsg::Output(b"\x1b]133;V;1\x07\x1b]133;B\x07".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let ready = window
+                .update(cx, |view, _, _| {
+                    !view.input_active()
+                        && view.terminal.shell_vi_mode()
+                        && view.terminal.zle_reading()
+                })
+                .unwrap();
+            if ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        window
+            .update(cx, |view, window, cx| {
+                let i = KeyDownEvent {
+                    keystroke: gpui::Keystroke {
+                        modifiers: gpui::Modifiers::default(),
+                        key: "i".to_string(),
+                        key_char: Some("i".to_string()),
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                view.on_key_down(&i, window, cx);
+            })
+            .unwrap();
+        assert_eq!(
+            next_input_until_timeout(&mut daemon),
+            Some(b"i".to_vec()),
+            "vi prompt input is normal shell input, not deferred gap typeahead"
+        );
+
+        DaemonMsg::Output(b"\x1b]133;V;0\x07\x1b]133;B\x07".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let active = window.update(cx, |view, _, _| view.input_active()).unwrap();
+            if active {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        window
+            .update(cx, |view, _, _| assert!(view.input_active()))
+            .unwrap();
+        assert_eq!(
+            next_input_until_timeout(&mut daemon),
+            None,
+            "leaving shell vi-mode must not flush a stale typeahead wipe"
+        );
     }
 
     fn key(spec: &str) -> gpui::Keystroke {
