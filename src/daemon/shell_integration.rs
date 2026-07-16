@@ -55,8 +55,12 @@ if [[ -o interactive ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
 
   __tty7_osc() { builtin printf '\e]%s\a' "$1"; }
 
+  # Vi mode links the `main` keymap to `viins` (`bindkey -A viins main`);
+  # emacs mode links it to `emacs`. The link survives plugins like
+  # zsh-vi-mode that rebind `^[` to their own widgets, so it beats sniffing
+  # the Esc widget name.
   __tty7_report_edit_mode() {
-    if [[ "$(builtin bindkey '^[')" == *"vi-cmd-mode"* ]]; then
+    if [[ "$(builtin bindkey -lL main)" == *viins* ]]; then
       __tty7_osc "133;V;1"
     else
       __tty7_osc "133;V;0"
@@ -224,8 +228,11 @@ if [[ $- == *i* ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
   export TTY7_SHELL_INTEGRATION=1
 
   __tty7_osc() { builtin printf '\e]%s\a' "$1"; }
+  # `bind -v` reports readline's actual editing mode; `[[ -o vi ]]` misses
+  # vi mode configured only in ~/.inputrc (`set editing-mode vi` flips
+  # readline without setting the shell option).
   __tty7_report_edit_mode() {
-    if [[ -o vi ]]; then
+    if [[ "$(builtin bind -v 2>/dev/null)" == *"set editing-mode vi"* ]]; then
       __tty7_osc "133;V;1"
     else
       __tty7_osc "133;V;0"
@@ -886,6 +893,27 @@ pub fn setup(program: Option<&str>, has_custom_args: bool) -> Option<Injection> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_mode_detection_survives_rebound_escape_and_inputrc() {
+        // zsh: plugins like zsh-vi-mode rebind `^[` to their own widgets
+        // (`zvm_readkeys_handler`), so sniffing the Esc widget for
+        // `vi-cmd-mode` misses them. The `main` keymap link is durable: both
+        // plain `bindkey -v` and zsh-vi-mode link main to viins, and emacs
+        // mode links it to emacs (`bindkey -A viins main` vs `-A emacs main`).
+        assert!(
+            ZSH_INTEGRATION.contains("bindkey -lL main"),
+            "zsh edit-mode detection must key off the main keymap link"
+        );
+        assert!(ZSH_INTEGRATION.contains("viins"));
+        // bash: `[[ -o vi ]]` misses vi mode set only via ~/.inputrc
+        // (`set editing-mode vi` flips readline but not the shell option);
+        // `bind -v` reports readline's actual mode either way.
+        assert!(
+            BASH_INTEGRATION.contains("editing-mode vi"),
+            "bash edit-mode detection must read readline's mode via bind -v"
+        );
+    }
 
     #[test]
     fn is_our_zdotdir_matches_only_our_prefix() {
