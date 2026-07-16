@@ -156,9 +156,116 @@ fn ancestor_tty_device() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Windows: the hook has no `/dev/tty`. It runs as a descendant of the agent
+/// inside tty7's ConPTY, but agents (Claude Code, a Node app) spawn hooks with
+/// `CREATE_NO_WINDOW`, which gives the hook its *own hidden console* — so a
+/// naive write to `CONOUT$` succeeds into a throwaway buffer that isn't the
+/// pane's PTY, and nothing reaches the daemon.
+///
+/// So mirror the Unix "write the agent's tty" strategy at the console layer:
+/// walk up the parent chain and, for the nearest ancestor whose console we can
+/// borrow, `FreeConsole` off our hidden one, `AttachConsole` to theirs (the
+/// shell / agent are attached to tty7's ConPTY), and write `CONOUT$` there —
+/// the OSC bytes then flow through ConPTY to the daemon, exactly like the
+/// shell-integration marks. Best-effort: `false` if no ancestor console works.
 #[cfg(not(unix))]
-fn write_to_controlling_tty(_bytes: &[u8]) -> bool {
-    false
+fn write_to_controlling_tty(bytes: &[u8]) -> bool {
+    let procs = crate::daemon::winproc::snapshot();
+    let ancestors = ancestor_pids(&procs);
+
+    // The shell tty7 spawned is the process on the pane's ConPTY. Agents wrap
+    // hooks in extra hidden-console layers (Node's `shell:true` → a
+    // `cmd.exe` launched with `windowsHide`), so the *nearest* attachable
+    // console is a dead-end buffer. Identify the shell deterministically: the
+    // ancestor whose parent is the `tty7.exe` daemon. Attach to *that* console.
+    let name_of = |pid: u32| {
+        procs
+            .iter()
+            .find(|p| p.pid == pid)
+            .map(|p| p.name.to_ascii_lowercase())
+    };
+    let shell = ancestors.iter().copied().find(|&pid| {
+        procs
+            .iter()
+            .find(|p| p.pid == pid)
+            .and_then(|p| name_of(p.parent))
+            .is_some_and(|n| n == "tty7.exe")
+    });
+
+    if let Some(pid) = shell {
+        if attach_and_write(pid, bytes) {
+            return true;
+        }
+    }
+
+    // Fallback: no shell pinned down (nested/unusual tree) — spray every
+    // ancestor console. The ConPTY one gets the bytes; the hidden dead-ends
+    // swallow harmless duplicates.
+    let mut any = false;
+    for pid in ancestors {
+        any |= attach_and_write(pid, bytes);
+    }
+    any
+}
+
+/// Detach from the current (possibly hidden) console, attach to `pid`'s console,
+/// write `bytes` to its `CONOUT$`, then detach. Returns whether the write
+/// itself succeeded.
+#[cfg(not(unix))]
+fn attach_and_write(pid: u32, bytes: &[u8]) -> bool {
+    use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole};
+    // SAFETY: FreeConsole/AttachConsole take no memory and simply return 0 when
+    // there is nothing to detach / no attachable console for `pid`.
+    unsafe {
+        FreeConsole();
+        if AttachConsole(pid) == 0 {
+            return false;
+        }
+    }
+    let ok = write_conout(bytes);
+    // SAFETY: leave no lingering attachment (the hook process exits right after).
+    unsafe {
+        FreeConsole();
+    }
+    ok
+}
+
+/// Open the currently-attached console's output buffer and write `bytes`.
+/// `read(true).write(true)` is what the console driver expects for a `CONOUT$`
+/// handle; the name is resolved by the Win32 layer regardless of cwd.
+#[cfg(not(unix))]
+fn write_conout(bytes: &[u8]) -> bool {
+    use std::io::Write as _;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("CONOUT$")
+    {
+        Ok(mut out) => out.write_all(bytes).and_then(|_| out.flush()).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// The hook's ancestor pids, nearest first, from the Windows process table —
+/// the chain `agent-hook → agent → shell` up which one process owns tty7's
+/// ConPTY console. Bounded walk; robust to pid-reuse cycles via a seen set.
+#[cfg(not(unix))]
+fn ancestor_pids(procs: &[crate::daemon::winproc::Proc]) -> Vec<u32> {
+    let parent_of = |pid: u32| procs.iter().find(|p| p.pid == pid).map(|p| p.parent);
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut cur = std::process::id();
+    seen.insert(cur);
+    for _ in 0..16 {
+        match parent_of(cur) {
+            Some(parent) if parent != 0 && seen.insert(parent) => {
+                out.push(parent);
+                cur = parent;
+            }
+            _ => break,
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
