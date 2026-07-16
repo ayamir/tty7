@@ -6,12 +6,15 @@
 //! deliberately *not* tty7's own agent: it only observes and enriches whatever
 //! agent the user launched.
 //!
-//! Detection is command-based: the daemon already
+//! Detection is command-based: on macOS/Linux the daemon already
 //! reads the foreground process's `argv` for SSH-context sniffing, so we reuse
 //! that to match the invoked command against a known agent. Matching is a pure
 //! function over `argv` — [`CLIAgent::detect_from_argv`] — kept here in `core`
 //! (framework-light, unit-tested) and called daemon-side, with the resulting
-//! `Option<CLIAgent>` streamed to the client for the UI.
+//! `Option<CLIAgent>` streamed to the client for the UI. On Windows ConPTY
+//! exposes no foreground process group, so the input is the *typed command
+//! line* the shell integration captures at preexec and carries on the `133;C`
+//! mark — [`CLIAgent::detect_from_command_with`] matches it the same way.
 //!
 //! The enum is serialized across the daemon↔client protocol, so its variants
 //! are the wire contract; add new agents at the end.
@@ -25,7 +28,6 @@
 //! the client.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -310,7 +312,7 @@ impl CLIAgent {
                 if arg.starts_with('-') {
                     continue;
                 }
-                for segment in arg.split('/') {
+                for segment in arg.split(['/', '\\']) {
                     if let Some(agent) =
                         CLIAgent::match_token(&base_stem(segment).to_ascii_lowercase())
                     {
@@ -321,6 +323,37 @@ impl CLIAgent {
         }
 
         None
+    }
+
+    /// [`detect_from_argv_with`](Self::detect_from_argv_with) over a *typed
+    /// command line* rather than a live process `argv` — the Windows detection
+    /// input. ConPTY has no foreground process group to resolve to an argv, so
+    /// there the daemon learns what runs from the shell integration instead:
+    /// PowerShell's `PSConsoleHostReadLine` wrapper reports the submitted line
+    /// on the `133;C` mark (the same capture Warp's Windows integration uses),
+    /// and this matches it like an argv.
+    ///
+    /// The tokenization is deliberately naive — whitespace split, surrounding
+    /// quotes trimmed, a leading PowerShell call operator (`&`) dropped, and
+    /// everything lowercased (Windows commands are case-insensitive). A quoted
+    /// launcher path containing spaces splits wrong and misses — notably
+    /// PSReadLine tab-completion's `& 'C:\Program Files\…\claude.exe'` — the
+    /// accepted trade-off for not writing a shell parser; the dominant shapes
+    /// (a bare shim on PATH, `npx …`) tokenize fine, and `agent_commands`
+    /// rules cover personal wrappers.
+    pub fn detect_from_command_with(
+        command: &str,
+        custom: &HashMap<String, String>,
+    ) -> Option<CLIAgent> {
+        let mut argv: Vec<String> = command
+            .split_whitespace()
+            .map(|t| t.trim_matches(['"', '\'']).to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if argv.first().is_some_and(|t| t == "&") {
+            argv.remove(0);
+        }
+        Self::detect_from_argv_with(&argv, custom)
     }
 }
 
@@ -345,14 +378,24 @@ fn is_env_assignment(token: &str) -> bool {
 /// The final path component with a leading dir and a trailing script extension
 /// stripped, lowercased-ready but case preserved (callers lowercase when they
 /// match interpreter args). `/usr/bin/claude` → `claude`, `cli.js` → `cli`.
+/// Splits on both separators by hand (not [`Path`]) so a Windows path in a
+/// captured command line (`C:\…\claude.cmd`) resolves the same on every
+/// platform — including in tests run on Unix.
 fn base_stem(token: &str) -> &str {
-    let name = Path::new(token)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(token);
-    // Strip one known script extension; leave unknown suffixes intact so
-    // `claude-code` stays whole.
-    for ext in [".js", ".mjs", ".cjs", ".ts", ".py", ".rb", ".sh"] {
+    // Trailing separators are dropped first (`claude/` → `claude`, matching
+    // the old `Path::file_name` behavior), then everything up to the last
+    // separator.
+    let trimmed = token.trim_end_matches(['/', '\\']);
+    let name = match trimmed.rfind(['/', '\\']) {
+        Some(i) => &trimmed[i + 1..],
+        None => trimmed,
+    };
+    // Strip one known script/launcher extension; leave unknown suffixes intact
+    // so `claude-code` stays whole. The Windows set covers npm's shim trio
+    // (`claude.cmd` / `claude.ps1` / `claude.exe`).
+    for ext in [
+        ".js", ".mjs", ".cjs", ".ts", ".py", ".rb", ".sh", ".exe", ".cmd", ".bat", ".ps1",
+    ] {
         if let Some(stem) = name.strip_suffix(ext) {
             return stem;
         }
@@ -617,6 +660,11 @@ mod tests {
             CLIAgent::detect_from_argv(&argv(&["cursor-agent"])),
             Some(CLIAgent::Cursor)
         );
+        // A trailing separator is tolerated, matching Path::file_name.
+        assert_eq!(
+            CLIAgent::detect_from_argv(&argv(&["claude/"])),
+            Some(CLIAgent::Claude)
+        );
     }
 
     #[test]
@@ -734,6 +782,66 @@ mod tests {
         assert_eq!(
             CLIAgent::detect_from_argv_with(&argv(&["codex"]), &shadow),
             Some(CLIAgent::Codex)
+        );
+    }
+
+    #[test]
+    fn detects_from_typed_command_lines() {
+        let none = HashMap::new();
+        // Plain invocations, flags in tow.
+        assert_eq!(
+            CLIAgent::detect_from_command_with("claude --resume abc", &none),
+            Some(CLIAgent::Claude)
+        );
+        // Windows launcher shapes: npm shims, absolute backslash paths, and
+        // case-insensitive names.
+        assert_eq!(
+            CLIAgent::detect_from_command_with("claude.exe", &none),
+            Some(CLIAgent::Claude)
+        );
+        assert_eq!(
+            CLIAgent::detect_from_command_with(
+                r"C:\Users\x\AppData\Roaming\npm\claude.cmd --model opus",
+                &none
+            ),
+            Some(CLIAgent::Claude)
+        );
+        assert_eq!(
+            CLIAgent::detect_from_command_with("CLAUDE", &none),
+            Some(CLIAgent::Claude)
+        );
+        // PowerShell call operator + a quoted (space-free) path.
+        assert_eq!(
+            CLIAgent::detect_from_command_with(r#"& "C:\tools\codex.exe""#, &none),
+            Some(CLIAgent::Codex)
+        );
+        // Interpreter-wrapped, Windows separators in the script path.
+        assert_eq!(
+            CLIAgent::detect_from_command_with(
+                r"node C:\x\node_modules\@anthropic-ai\claude-code\cli.js",
+                &none
+            ),
+            Some(CLIAgent::Claude)
+        );
+        assert_eq!(
+            CLIAgent::detect_from_command_with("npx.cmd @google/gemini-cli", &none),
+            Some(CLIAgent::Gemini)
+        );
+        // Non-interpreter launchers never match on their arguments.
+        assert_eq!(
+            CLIAgent::detect_from_command_with("notepad claude.txt", &none),
+            None
+        );
+        assert_eq!(
+            CLIAgent::detect_from_command_with("cat codex.md", &none),
+            None
+        );
+        assert_eq!(CLIAgent::detect_from_command_with("", &none), None);
+        // Custom rules apply to the typed launcher too.
+        let custom: HashMap<String, String> = [("cc".to_string(), "claude".to_string())].into();
+        assert_eq!(
+            CLIAgent::detect_from_command_with("cc -c", &custom),
+            Some(CLIAgent::Claude)
         );
     }
 

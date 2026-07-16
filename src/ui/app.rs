@@ -101,6 +101,18 @@ pub struct Tab {
     /// switching back restores it; closing the tab drops it. Only the active
     /// tab's overlay is rendered. See [`crate::ui::diff_overlay`].
     pub(crate) diff_overlay: Option<crate::ui::diff_overlay::DiffOverlayState>,
+    /// The sidebar group this tab last *definitively* belonged to: the git
+    /// work-tree root of its first pane's cwd (deliberately not the focused
+    /// pane's — switching focus between splits must not relocate the row), or
+    /// `None` for outside any repo (the "Scratch" group). Sticky on purpose:
+    /// it only moves when
+    /// the git cache has a landed answer for the current cwd
+    /// ([`GitStatusCache::known_root_for`](crate::terminal::git_status::GitStatusCache::known_root_for)
+    /// returns `Some`), so a cd whose probe is still in flight — or a pane
+    /// with no cwd reported yet — keeps the row where it was instead of
+    /// flickering through the Scratch group and back. A `RefCell` because the
+    /// sidebar refreshes it during render, which only has `&Tab`.
+    pub(crate) sidebar_group: std::cell::RefCell<Option<std::path::PathBuf>>,
 }
 
 impl Tab {
@@ -110,6 +122,7 @@ impl Tab {
             name: None,
             last_focused: None,
             diff_overlay: None,
+            sidebar_group: std::cell::RefCell::new(None),
         }
     }
 
@@ -736,6 +749,9 @@ impl Tty7App {
                 name: st.name,
                 last_focused: None,
                 diff_overlay: None,
+                // Keep the group it had when closed — the row reappears where
+                // it lived instead of flashing through Scratch.
+                sidebar_group: std::cell::RefCell::new(st.sidebar_group),
             },
         );
         self.active = insert_at;
@@ -1752,6 +1768,17 @@ impl Tty7App {
     /// choice; the layout re-derives from the `Config` global on the next render.
     pub(crate) fn set_tab_bar_position(&mut self, pos: TabBarPosition, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.tab_bar_position = pos);
+    }
+
+    /// Set how the vertical tab sidebar arranges its rows (Settings → Window &
+    /// Tabs): grouped per git repo or one flat list. Persists the choice; the
+    /// sidebar re-derives from the `Config` global on the next render.
+    pub(crate) fn set_sidebar_grouping(
+        &mut self,
+        grouping: crate::core::config::SidebarGrouping,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_config(cx, |cfg| cfg.sidebar_grouping = grouping);
     }
 
     /// `ToggleTabSidebar`: flip the tab bar between the horizontal title-bar strip
@@ -4220,31 +4247,49 @@ impl Render for Tty7App {
                 cx.listener(|this, _: &PrevTab, window, cx| this.cycle_tab(false, window, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab1, window, cx| this.activate(0, window, cx)),
+                cx.listener(|this, _: &ActivateTab1, window, cx| {
+                    this.activate_visual(0, window, cx)
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab2, window, cx| this.activate(1, window, cx)),
+                cx.listener(|this, _: &ActivateTab2, window, cx| {
+                    this.activate_visual(1, window, cx)
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab3, window, cx| this.activate(2, window, cx)),
+                cx.listener(|this, _: &ActivateTab3, window, cx| {
+                    this.activate_visual(2, window, cx)
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab4, window, cx| this.activate(3, window, cx)),
+                cx.listener(|this, _: &ActivateTab4, window, cx| {
+                    this.activate_visual(3, window, cx)
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab5, window, cx| this.activate(4, window, cx)),
+                cx.listener(|this, _: &ActivateTab5, window, cx| {
+                    this.activate_visual(4, window, cx)
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab6, window, cx| this.activate(5, window, cx)),
+                cx.listener(|this, _: &ActivateTab6, window, cx| {
+                    this.activate_visual(5, window, cx)
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab7, window, cx| this.activate(6, window, cx)),
+                cx.listener(|this, _: &ActivateTab7, window, cx| {
+                    this.activate_visual(6, window, cx)
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab8, window, cx| this.activate(7, window, cx)),
+                cx.listener(|this, _: &ActivateTab8, window, cx| {
+                    this.activate_visual(7, window, cx)
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab9, window, cx| this.activate(8, window, cx)),
+                cx.listener(|this, _: &ActivateTab9, window, cx| {
+                    this.activate_visual(8, window, cx)
+                }),
             )
             .on_action(cx.listener(|this, _: &IncreaseFontSize, _window, cx| {
                 this.change_font_size(FONT_SIZE_STEP, cx)
@@ -4321,6 +4366,7 @@ fn tab_to_session(tab: &Tab, cx: &App) -> SessionTab {
     SessionTab {
         name: tab.name.clone(),
         pane: pane_to_session(&tab.pane, cx),
+        sidebar_group: tab.sidebar_group.borrow().clone(),
     }
 }
 
@@ -4403,6 +4449,10 @@ fn tabs_from_session(
             name: st.name.clone(),
             last_focused: None,
             diff_overlay: None,
+            // Seed the sticky group from the saved session so the sidebar
+            // renders grouped on the first frame; the first landed probe
+            // corrects it if the tab's repo changed while we were gone.
+            sidebar_group: std::cell::RefCell::new(st.sidebar_group.clone()),
         });
     }
     // Clamp the saved active index into the rebuilt range.

@@ -3096,6 +3096,10 @@ impl Tty7App {
             TabBarPosition::Top => 0,
             TabBarPosition::Left => 1,
         };
+        let sidebar_grouping_idx = match cfg.sidebar_grouping {
+            crate::core::config::SidebarGrouping::Repo => 0,
+            crate::core::config::SidebarGrouping::None => 1,
+        };
 
         let restore_switch = Switch::new("wt-restore-session")
             .checked(restore_session)
@@ -3151,6 +3155,20 @@ impl Tty7App {
                 this.set_tab_bar_position(pos, cx);
             },
         );
+        let sidebar_grouping_radio = self.segmented(
+            "wt-sidebar-grouping",
+            &["By repo", "Flat"],
+            sidebar_grouping_idx,
+            cx,
+            |this, ix, _w, cx| {
+                let grouping = if ix == 0 {
+                    crate::core::config::SidebarGrouping::Repo
+                } else {
+                    crate::core::config::SidebarGrouping::None
+                };
+                this.set_sidebar_grouping(grouping, cx);
+            },
+        );
 
         v_flex()
             .child(self.section_header("Window", cx))
@@ -3191,6 +3209,13 @@ impl Tty7App {
                 "Tab bar position",
                 "Show tabs as a horizontal strip on top or a vertical sidebar on the left.",
                 tab_bar_radio,
+                cx,
+            ))
+            .child(self.settings_row(
+                "Sidebar grouping",
+                "Group sidebar tabs under a header per git repository, with non-repo tabs \
+                 in a Scratch section. Only applies to the left sidebar.",
+                sidebar_grouping_radio,
                 cx,
             ))
             .into_any_element()

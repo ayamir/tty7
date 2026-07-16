@@ -1435,6 +1435,14 @@ impl TerminalView {
                 if self.input_active() {
                     if let Some(text) = self.cmd.selected_text() {
                         cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        // Same dual-purpose rule as the terminal selection
+                        // below: a Ctrl+C copy consumes the editor selection,
+                        // so the next press reaches the editor's ^C (abort
+                        // line) instead of copying forever (#111).
+                        if m.control {
+                            self.cmd.clear_selection();
+                            cx.notify();
+                        }
                         return CmdKey::Consumed;
                     }
                 }
@@ -1442,6 +1450,15 @@ impl TerminalView {
                 // (Ctrl+C handles SIGINT).
                 if self.has_selection() {
                     self.copy_selection(cx);
+                    // Ctrl+C is dual-purpose — copy with a selection, ^C
+                    // (SIGINT) without — so the copy must consume the selection
+                    // or the next press copies again instead of interrupting
+                    // (#111). Cmd+C never doubles as SIGINT, so there the
+                    // selection stays highlighted (the macOS convention).
+                    if m.control {
+                        self.terminal.term.lock().selection = None;
+                        cx.notify();
+                    }
                     return CmdKey::Consumed;
                 }
                 CmdKey::FallThrough
@@ -2105,6 +2122,11 @@ impl TerminalView {
         // auto-executing) and strips any ESC so clipboard text can't smuggle
         // its own `ESC[201~` end-marker to break out.
         self.write_gap_text(&text, paste_bytes(&text, bracketed), cx);
+        // Pasting to the PTY is input like typing: it consumes the selection,
+        // so a following Ctrl+C means ^C again (#111). The editor branch above
+        // leaves the selection alone, matching `commit_text`.
+        self.terminal.term.lock().selection = None;
+        cx.notify();
     }
 
     // ---- Mouse tracking (so vim / tmux / zellij get clicks & drags) ----
@@ -2331,8 +2353,11 @@ impl TerminalView {
             self.paste(format!("{text} "), cx);
             return;
         }
-        let _ = (img, cx);
+        let _ = img;
         self.terminal.write(vec![0x16]);
+        // PTY input consumes the selection, like `paste` (#111).
+        self.terminal.term.lock().selection = None;
+        cx.notify();
     }
 
     /// Clear the terminal (right-click "Clear"), like Cmd+K / the `clear`
@@ -6862,6 +6887,145 @@ mod gpui_tests {
         drag_hello(cx);
         let text = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
         assert_eq!(text.as_deref(), Some("hello"));
+
+        // The mouse-up copy must NOT consume the selection: copy-on-select
+        // keeps the highlight, like every terminal with the feature.
+        let selected = window
+            .update(cx, |view, _, _| {
+                view.terminal.term.lock().selection.is_some()
+            })
+            .unwrap();
+        assert!(
+            selected,
+            "copy-on-select must keep the selection highlighted"
+        );
+    }
+
+    /// Ctrl+C means "copy the selection, else ^C (SIGINT)" — so the copy must
+    /// consume the selection, or a second Ctrl+C copies again forever and the
+    /// user can't interrupt the foreground command (#111). Cmd+C keeps the
+    /// selection (macOS convention), covered by the copy-on-select test above.
+    #[gpui::test]
+    fn ctrl_c_copy_consumes_the_selection_so_the_next_press_is_sigint(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+
+        DaemonMsg::Output(b"hello world".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        // Bounded poll for the reader thread, as in the pump test above.
+        for _ in 0..400 {
+            cx.run_until_parked();
+            let row: String = window
+                .update(cx, |view, _, _| {
+                    let term = view.terminal.term.clone();
+                    let term = term.lock();
+                    (0..11)
+                        .map(|c| term.grid()[alacritty_terminal::index::Line(0)][Column(c)].c)
+                        .collect()
+                })
+                .unwrap();
+            if row == "hello world" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        window
+            .update(cx, |view, window, cx| {
+                // Mouse-select "hello" (copy-on-select is off by default, so
+                // the selection survives mouse-up).
+                view.on_select_start(0, 0, true, 1, cx);
+                view.on_select_update(4, 0, false, cx);
+                view.on_select_end(cx);
+                assert!(view.has_selection(), "the drag must leave a selection");
+
+                // First Ctrl+C: copies and consumes the selection.
+                let consumed = view.handle_cmd_shortcut(&key("ctrl-c"), window, cx);
+                assert!(matches!(consumed, CmdKey::Consumed));
+                assert!(
+                    !view.has_selection(),
+                    "the Ctrl+C copy must consume the selection"
+                );
+
+                // Second Ctrl+C: no selection left, so the chord falls through
+                // to the raw ^C (SIGINT) path.
+                let fell_through = view.handle_cmd_shortcut(&key("ctrl-c"), window, cx);
+                assert!(matches!(fell_through, CmdKey::FallThrough));
+            })
+            .unwrap();
+        let text = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(text.as_deref(), Some("hello"));
+    }
+
+    /// Pasting to the PTY consumes the selection like typing does, so the
+    /// reported select → copy → paste → Ctrl+C sequence ends in SIGINT (#111).
+    #[gpui::test]
+    fn paste_to_the_pty_consumes_the_selection(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.select_all(cx);
+                assert!(view.has_selection());
+                view.paste("echo hi".into(), cx);
+                assert!(
+                    !view.has_selection(),
+                    "a PTY paste must consume the selection"
+                );
+            })
+            .unwrap();
+        // The pasted bytes still reach the PTY.
+        assert_eq!(next_input(&mut daemon), b"echo hi".to_vec());
+    }
+
+    /// Same dual-purpose rule at the prompt: Ctrl+A selects the edited line,
+    /// Ctrl+C copies it — and must consume the editor selection so the next
+    /// Ctrl+C reaches the editor's ^C (abort line) instead of copying again
+    /// (#111, editor-selection variant).
+    #[gpui::test]
+    fn ctrl_c_copy_consumes_the_editor_selection_at_the_prompt(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+
+        // Shell reports it is idle at its prompt: this is what flips
+        // `input_active()` true and puts the inline editor in charge.
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: Some(0),
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        // Poll until the prompt report has applied.
+        for _ in 0..400 {
+            cx.run_until_parked();
+            let active = window.update(cx, |view, _, _| view.input_active()).unwrap();
+            if active {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        window
+            .update(cx, |view, window, cx| {
+                assert!(view.input_active(), "the inline editor must be active");
+                view.cmd.insert_str("echo hi");
+                view.cmd.select_all();
+
+                // First Ctrl+C: copies the line and consumes the selection.
+                let consumed = view.handle_cmd_shortcut(&key("ctrl-c"), window, cx);
+                assert!(matches!(consumed, CmdKey::Consumed));
+                assert!(
+                    view.cmd.selection().is_none(),
+                    "the Ctrl+C copy must consume the editor selection"
+                );
+
+                // Second Ctrl+C: nothing selected anywhere, so the chord falls
+                // through to the editor's ^C (abort line) handling.
+                let fell_through = view.handle_cmd_shortcut(&key("ctrl-c"), window, cx);
+                assert!(matches!(fell_through, CmdKey::FallThrough));
+            })
+            .unwrap();
+        let text = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(text.as_deref(), Some("echo hi"));
     }
 
     /// Reproduces the "orange caret jumps to the top-left corner after Claude

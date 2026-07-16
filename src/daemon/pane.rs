@@ -404,7 +404,13 @@ enum PaneBackend {
 /// keeps the reader's signature readable.
 struct ForegroundProbes {
     remote: Box<dyn Fn() -> Option<RemoteContext> + Send>,
-    agent: Box<dyn Fn() -> Option<crate::core::cli_agent::CLIAgent> + Send>,
+    /// Outer `None` means this backend has no process-table view of the PTY
+    /// foreground at all (native SSH; Windows, where ConPTY has no foreground
+    /// process group) — "no opinion", never applied, so it can't wipe an agent
+    /// identified another way (sentinel events, the Windows `133;C;<cmd>`
+    /// mark). `Some(answer)` is a real poll result; its inner `None` ("polled,
+    /// no agent") clears the chip.
+    agent: Box<dyn Fn() -> Option<Option<crate::core::cli_agent::CLIAgent>> + Send>,
 }
 
 /// The local-PTY backend: the same handles `DaemonPane` has always owned.
@@ -715,6 +721,9 @@ impl DaemonPane {
         // gate closures answer "nothing local": OSC 133 marks from the remote
         // shell are trusted verbatim (correct — the remote shell *is* the session),
         // and no process-table SSH detection runs (this pane already *is* SSH).
+        // The agent probe's `None` is "no opinion" (never applied), so an agent
+        // identified from its sentinel events keeps its chip — the poll used to
+        // wipe it within half a second.
         let reader = Self::spawn_reader(
             state,
             shutting_down,
@@ -895,7 +904,11 @@ impl DaemonPane {
                             } else {
                                 None
                             };
-                            let agent = poll_now.then(&foreground_agent_fn);
+                            // Flattened: a fired poll whose probe has no
+                            // process-table view (native SSH, Windows) folds to
+                            // "no opinion" and is never applied — see
+                            // [`ForegroundProbes::agent`].
+                            let agent = poll_now.then(&foreground_agent_fn).flatten();
 
                             let tr1 = trace.then(std::time::Instant::now);
                             let mut st = state.lock().unwrap();
@@ -1604,6 +1617,26 @@ fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
         }
     }
     if let Some(shell) = signals.shell {
+        // Windows: agent identity rides the C mark's command capture — ConPTY
+        // has no foreground process group for the Unix 0.5 s poll to read an
+        // argv from. `C;<cmd>` detects, `D` cleared `command` so it applies
+        // `None` and clears the chip. Unix keeps the poll (it sees through
+        // scripts and wrappers) and never consults the mark. Applied before
+        // the sentinel events below so an event naming the agent can still
+        // re-brand within the same chunk.
+        //
+        // Gated on the capture *changing*: a stray foreign mark mid-command
+        // (nested/remote shell, issue #26) re-delivers the same unchanged
+        // capture, and when that capture names no agent (a wrapper script the
+        // matcher can't see through), re-applying its `None` would wipe an
+        // identity the sentinel events established.
+        #[cfg(windows)]
+        if shell_mark_capture_changed(&st.shell, &shell) {
+            apply_agent(
+                st,
+                agent_from_shell_mark(&shell, crate::core::config::agent_commands_cached()),
+            );
+        }
         st.shell = shell.clone();
         if let Some(sub) = &st.subscriber {
             let _ = sub.send(DaemonMsg::Prompt {
@@ -1614,6 +1647,35 @@ fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
         }
     }
     apply_agent_signals(st, signals.agent_events, signals.notification);
+}
+
+/// The coding agent named by the shell's last `133;C;<command>` capture — the
+/// Windows detection input ([`apply_signals`] applies it there whenever the
+/// capture changes). `None` both at the prompt (`D` cleared `command`) and for
+/// an unrecognized command, so applying the answer verbatim also clears
+/// the chip when the command ends. Compiled on every platform so the unit
+/// tests cover it from Unix dev machines; only the Windows build calls it.
+/// Whether a shell-mark change should (re-)run mark-derived agent detection
+/// on Windows: only when the capture itself changed. `C` (new capture) and `D`
+/// (capture cleared) qualify; a stray foreign A/B mark re-delivers the same
+/// capture, and when that capture names no agent (a wrapper script the matcher
+/// can't see through) re-applying its `None` would wipe an identity the
+/// sentinel events established. Compiled on every platform for the unit tests;
+/// only the Windows build calls it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn shell_mark_capture_changed(prev: &ShellState, next: &ShellState) -> bool {
+    prev.command != next.command
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn agent_from_shell_mark(
+    shell: &ShellState,
+    custom: &std::collections::HashMap<String, String>,
+) -> Option<crate::core::cli_agent::CLIAgent> {
+    shell
+        .command
+        .as_deref()
+        .and_then(|cmd| crate::core::cli_agent::CLIAgent::detect_from_command_with(cmd, custom))
 }
 
 /// Fold the chunk's agent signals into the pane's session state and push any
@@ -1758,22 +1820,32 @@ fn foreground_remote_context(_master: &Mutex<Box<dyn MasterPty + Send>>) -> Opti
 /// Identify the third-party CLI coding agent (Claude Code, Codex, …) owning the
 /// PTY foreground, from its `argv`. Same process-table read as
 /// [`foreground_remote_context`]; runs off the hot path on the 0.5 s poll.
+/// Always `Some(answer)` — this platform *has* the process-table view, so even
+/// "no agent" is a real answer that must apply (it clears the chip when the
+/// agent exits). See [`ForegroundProbes::agent`] for the outer option's contract.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn foreground_agent(
     master: &Mutex<Box<dyn MasterPty + Send>>,
-) -> Option<crate::core::cli_agent::CLIAgent> {
-    let pid = master.lock().ok().and_then(|m| m.process_group_leader())?;
-    let argv = crate::daemon::remote::foreground_argv(pid)?;
-    crate::core::cli_agent::CLIAgent::detect_from_argv_with(
-        &argv,
-        crate::core::config::agent_commands_cached(),
-    )
+) -> Option<Option<crate::core::cli_agent::CLIAgent>> {
+    let detect = || {
+        let pid = master.lock().ok().and_then(|m| m.process_group_leader())?;
+        let argv = crate::daemon::remote::foreground_argv(pid)?;
+        crate::core::cli_agent::CLIAgent::detect_from_argv_with(
+            &argv,
+            crate::core::config::agent_commands_cached(),
+        )
+    };
+    Some(detect())
 }
 
+/// Windows: ConPTY has no foreground process group, so there is no process
+/// table to poll — "no opinion" (`None`), never applied. Agent identity comes
+/// from the shell integration's `133;C;<command>` capture instead, applied in
+/// [`apply_signals`] via [`agent_from_shell_mark`].
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn foreground_agent(
     _master: &Mutex<Box<dyn MasterPty + Send>>,
-) -> Option<crate::core::cli_agent::CLIAgent> {
+) -> Option<Option<crate::core::cli_agent::CLIAgent>> {
     None
 }
 
@@ -1791,6 +1863,11 @@ struct ShellState {
     active: bool,
     at_prompt: bool,
     last_exit_code: Option<i32>,
+    /// The command line the shell reported on its last `133;C;<cmd>` mark
+    /// (percent-decoded), cleared when the command finishes (`D`). All of
+    /// tty7's shell integrations carry the payload; it is the Windows
+    /// coding-agent detection input (see [`agent_from_shell_mark`]).
+    command: Option<String>,
 }
 
 /// Changes a `feed` call produced, if any.
@@ -1869,10 +1946,30 @@ fn handle_osc133(shell: &mut ShellState, rest: &[u8]) -> bool {
     // grid) instead of the editor — the "un-deletable char / doubled prompt"
     // glitch. Setting it as early as `D`/`A` closes that window.
     match rest.first() {
+        // A/B deliberately leave `command` alone: every tty7 integration emits
+        // D *before* A at a real prompt (so it's already cleared there), while
+        // a stray A/B from a foreign integration mid-command (a nested or
+        // remote shell drawing its own prompt — Windows has no pgid gate to
+        // reject it with, cf. issue #26) must not wipe the agent chip.
         Some(b'A') | Some(b'B') => shell.at_prompt = true,
-        Some(b'C') => shell.at_prompt = false,
+        Some(b'C') => {
+            shell.at_prompt = false;
+            // tty7 extension: our shell integrations append the submitted
+            // command line, percent-encoded — the Windows agent-detection
+            // input (see [`agent_from_shell_mark`]). A bare `C` overwrites the
+            // capture with `None` — deliberately, even though a *foreign* bare
+            // `C` mid-command then clears the chip: our own PowerShell body
+            // falls back to a bare `C` when escaping throws (lone surrogate on
+            // PS 5.1), and there a new command *has* started, so keeping the
+            // previous capture would misattribute it.
+            shell.command = rest
+                .strip_prefix(b"C;")
+                .map(|c| String::from_utf8_lossy(&percent_decode(c)).into_owned())
+                .filter(|s| !s.trim().is_empty());
+        }
         Some(b'D') => {
             shell.at_prompt = true;
+            shell.command = None;
             shell.last_exit_code = rest
                 .strip_prefix(b"D;")
                 .and_then(|c| std::str::from_utf8(c).ok())
@@ -2041,7 +2138,9 @@ mod tests {
         // hanging CI.
         let mut detected = None;
         for _ in 0..200 {
-            if let Some(agent) = foreground_agent(&master) {
+            // Flatten: the outer Some is just "this platform has a process
+            // table"; the poll keeps going until detection actually answers.
+            if let Some(agent) = foreground_agent(&master).flatten() {
                 detected = Some(agent);
                 break;
             }
@@ -2404,6 +2503,96 @@ mod tests {
         let d = s.feed(b"\x1b]133;D;130\x07");
         assert!(d.shell.as_ref().unwrap().at_prompt);
         assert_eq!(d.shell.as_ref().unwrap().last_exit_code, Some(130));
+    }
+
+    /// The C mark's command capture (tty7 extension, PowerShell integration) —
+    /// the Windows agent-detection input: `C;<cmd>` records the submitted line
+    /// percent-decoded, every prompt mark clears it, and
+    /// [`agent_from_shell_mark`] turns it into the chip's agent.
+    #[test]
+    fn sniff_osc133_command_capture_drives_agent_detection() {
+        let custom = std::collections::HashMap::new();
+        let mut s = OscSniffer::new();
+
+        // A submitted `claude --help` (space percent-encoded, as the
+        // PowerShell body emits it).
+        let c = s.feed(b"\x1b]133;C;claude%20--help\x07");
+        let shell = c.shell.as_ref().unwrap();
+        assert!(!shell.at_prompt);
+        assert_eq!(shell.command.as_deref(), Some("claude --help"));
+        assert_eq!(
+            agent_from_shell_mark(shell, &custom),
+            Some(crate::core::cli_agent::CLIAgent::Claude)
+        );
+
+        // The command finishing (D) clears the capture → the agent clears.
+        let d = s.feed(b"\x1b]133;D;0\x07");
+        let shell = d.shell.as_ref().unwrap();
+        assert_eq!(shell.command, None);
+        assert_eq!(agent_from_shell_mark(shell, &custom), None);
+
+        // A non-agent command sets the capture but detects nothing.
+        let c = s.feed(b"\x1b]133;C;git%20status\x07");
+        let shell = c.shell.as_ref().unwrap();
+        assert_eq!(shell.command.as_deref(), Some("git status"));
+        assert_eq!(agent_from_shell_mark(shell, &custom), None);
+
+        // A bare `C` (a foreign shell integration) leaves no capture.
+        let c = s.feed(b"\x1b]133;C\x07");
+        assert_eq!(c.shell.as_ref().unwrap().command, None);
+
+        // A stray A/B mid-command (a nested/remote shell drawing its own
+        // prompt) must NOT wipe the capture — only D (command finished) does.
+        // Windows has no pgid gate to reject foreign marks with, so this is
+        // what keeps the agent chip alive while the agent runs.
+        let _ = s.feed(b"\x1b]133;C;codex\x07");
+        let a = s.feed(b"\x1b]133;A\x1b]133;B\x07");
+        assert_eq!(a.shell.as_ref().unwrap().command.as_deref(), Some("codex"));
+        let d = s.feed(b"\x1b]133;D;0\x07");
+        assert_eq!(d.shell.as_ref().unwrap().command, None);
+
+        // A multi-line command arrives %0A-joined (fish re-joins the split
+        // list with it) and decodes back to real newlines.
+        let c = s.feed(b"\x1b]133;C;echo%20a%0Aecho%20b\x07");
+        assert_eq!(
+            c.shell.as_ref().unwrap().command.as_deref(),
+            Some("echo a\necho b")
+        );
+
+        // An all-whitespace payload is no capture, like a bare `C`.
+        let c = s.feed(b"\x1b]133;C;%20%20\x07");
+        assert_eq!(c.shell.as_ref().unwrap().command, None);
+    }
+
+    /// The Windows apply gate ([`shell_mark_capture_changed`]): detection
+    /// re-runs only when the capture changes, so a stray foreign A/B mark
+    /// mid-command — which re-delivers the same capture — can't wipe a
+    /// sentinel-established agent identity by re-applying the capture's `None`
+    /// (a wrapper script the matcher can't see through detects nothing).
+    #[test]
+    fn sniff_osc133_stray_marks_do_not_reapply_mark_detection() {
+        let mut s = OscSniffer::new();
+
+        // A wrapper launch: capture set, but detection has no answer.
+        let mut prev = ShellState::default();
+        let c = s.feed(b"\x1b]133;C;.%5Cdev.ps1\x07").shell.unwrap();
+        assert!(shell_mark_capture_changed(&prev, &c));
+        assert_eq!(
+            agent_from_shell_mark(&c, &std::collections::HashMap::new()),
+            None
+        );
+        prev = c;
+
+        // Stray foreign prompt marks mid-command: same capture, no re-apply —
+        // an agent branded by sentinel events keeps its chip.
+        let ab = s.feed(b"\x1b]133;A\x1b]133;B\x07").shell.unwrap();
+        assert!(!shell_mark_capture_changed(&prev, &ab));
+        prev = ab;
+
+        // The command finishing clears the capture: that change applies (its
+        // `None` is what clears the chip at the prompt).
+        let d = s.feed(b"\x1b]133;D;0\x07").shell.unwrap();
+        assert!(shell_mark_capture_changed(&prev, &d));
     }
 
     #[test]
@@ -3034,6 +3223,7 @@ mod tests {
                     active: true,
                     at_prompt: true,
                     last_exit_code: Some(0),
+                    command: None,
                 }),
                 ..SniffSignals::default()
             },
