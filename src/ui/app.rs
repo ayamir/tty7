@@ -94,6 +94,11 @@ pub struct Tab {
     /// first leaf. `None` for a tab never left, or after its focused pane closed
     /// — both fall back to `first_leaf()`.
     last_focused: Option<gpui::EntityId>,
+    /// `Some` while this tab has the working-tree diff overlay open (clicked
+    /// from a sidebar row's git line). Per-tab so switching away hides it and
+    /// switching back restores it; closing the tab drops it. Only the active
+    /// tab's overlay is rendered. See [`crate::ui::diff_overlay`].
+    pub(crate) diff_overlay: Option<crate::ui::diff_overlay::DiffOverlayState>,
 }
 
 impl Tab {
@@ -102,6 +107,7 @@ impl Tab {
             pane,
             name: None,
             last_focused: None,
+            diff_overlay: None,
         }
     }
 
@@ -339,11 +345,6 @@ pub struct Tty7App {
     /// (not a tab), so it covers the tab rail / title bar and never clutters the
     /// tab list. Holds all the settings widget state + its subscriptions.
     settings: Option<SettingsState>,
-    /// `Some` while the working-tree diff overlay is open (clicked from a
-    /// sidebar row's git line). Covers the terminal body only — the sidebar
-    /// stays visible so other repos' git lines remain one click away. See
-    /// [`crate::ui::diff_overlay`].
-    pub(crate) diff_overlay: Option<crate::ui::diff_overlay::DiffOverlayState>,
     /// In-pane native-SSH auth / host-key sheet state (WS3). Holds the active
     /// prompt (keyed to the pane that raised it), its input widgets, and
     /// dismissable banners. Empty when no prompt is pending.
@@ -565,7 +566,6 @@ impl Tty7App {
             sidebar_search,
             _sidebar_search_sub: sidebar_search_sub,
             settings: None,
-            diff_overlay: None,
             ssh_prompt: crate::ui::ssh_prompt::SshPromptState::new(cx),
             ssh_close_confirm: None,
             window_bounds: window.window_bounds().get_bounds(),
@@ -702,6 +702,7 @@ impl Tty7App {
                 pane,
                 name: st.name,
                 last_focused: None,
+                diff_overlay: None,
             },
         );
         self.active = insert_at;
@@ -1497,6 +1498,13 @@ impl Tty7App {
             window.focus(&self.home_focus, cx);
             return;
         };
+        // A tab showing its diff overlay gives the overlay focus (Esc-to-close
+        // must keep working when switching back to it); `close_diff_overlay`
+        // re-runs this after clearing the slot to land on the terminal.
+        if let Some(overlay) = tab.diff_overlay.as_ref() {
+            window.focus(&overlay.focus_handle, cx);
+            return;
+        }
         if let Some(leaf) = tab.focus_target() {
             let handle = leaf.read(cx).focus_handle.clone();
             window.focus(&handle, cx);
@@ -1880,6 +1888,10 @@ impl Tty7App {
             self.remember_active_pane(window, cx);
             self.maximized = None;
             self.active = index;
+            // The incoming tab may have a diff overlay that went stale while
+            // hidden (its repo changed underneath); re-probe if the status
+            // cache disagrees with the shown snapshot.
+            self.maybe_refresh_diff_overlay(cx);
             // In sidebar mode, pull the newly active row into view (a no-op when
             // the strip is horizontal — the handle tracks no painted list then).
             self.sidebar_scroll.scroll_to_item(index);
@@ -3936,6 +3948,7 @@ fn tabs_from_session(
             pane,
             name: st.name.clone(),
             last_focused: None,
+            diff_overlay: None,
         });
     }
     // Clamp the saved active index into the rebuilt range.
