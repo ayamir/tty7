@@ -172,7 +172,7 @@ impl Tty7App {
             let drag_label: SharedString = label.clone().into();
 
             // Inline rename input for this tab, if it's the one being renamed —
-            // the same `self.renaming` branch the strip uses, so a double-click
+            // the same `self.renaming` branch the strip uses, so a context-menu
             // rename works identically in either layout.
             let rename_input = self
                 .renaming

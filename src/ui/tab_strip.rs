@@ -603,6 +603,9 @@ impl Tty7App {
                             // Swallow the event — on Windows the chip's `occlude()`
                             // means it would never reach the TitleBar anyway, so we
                             // forward the double-click zoom explicitly instead.
+                            // Caveat: gpui only implements `titlebar_double_click`
+                            // on macOS; on Windows/Linux it's a no-op, so the chip
+                            // doesn't zoom there until upstream adds support.
                             cx.stop_propagation();
                             if ev.click_count >= 2 {
                                 window.titlebar_double_click();
