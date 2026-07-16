@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [26.7.0] - 2026-07-16
+
+First CalVer release: versions are now `YY.M.PATCH`, so the number says when
+it shipped rather than what changed.
+
+### Added
+
+- **Coding-agent detection on Windows** — the agent status dot now works on
+  Windows: agents are detected from the shell-integration command capture
+  (no `/proc` there), hook status events reach the daemon via the agent's
+  ancestor console, and mark-derived detection only re-fires when the
+  command capture actually changes. (#115)
+- **Clipboard image paste for agents off macOS** — pasting a screenshot into
+  a coding-agent pane on Windows/Linux stages the image to a temp file and
+  pastes its shell-escaped path (the same route drag-and-drop uses); Windows
+  BMP screenshots are transcoded to PNG since agent vision rejects BMP.
+  macOS keeps the higher-fidelity pasteboard read. (#117)
+- **Nightly build channel** — `main` is built every night into a rolling
+  `nightly` prerelease with all six platform artifacts; the in-app update
+  check is prerelease-aware so nightly users ride the channel while stable
+  users never see it. (#114, #116)
+- **Sidebar groups tabs by git repository** — vertical tabs cluster under a
+  repo header, groups persist across restarts, ⌘N numbering follows visual
+  order, and same-named repos are disambiguated by their parent directory.
+  (#110)
+- **System tray icon with agent status menu** — a tray/menu-bar icon
+  summarizes agent activity across sessions and jumps to a pane from its
+  menu. (#105, #109)
+- **Gradient and image theme backgrounds** — themes can render gradient or
+  image backgrounds with global window opacity and blur, hot-reloaded like
+  the rest of the theme. (#106)
+- **Double-click a tab to zoom the window** — matching titlebar behavior;
+  rename moved to the context menu. (#103)
+
+### Changed
+
+- **Settings sheet refinements** — controls right-align in their rows with
+  hover feedback, the column is tighter, and the theme card is richer.
+  (#108)
+- **Settings copy polish** — clearer wording throughout, and the SSH
+  security defaults stay visible instead of hiding behind a toggle. (#104)
+
+### Fixed
+
+- **Ctrl+C after a copy sends SIGINT again** — copying with Ctrl+C and
+  pasting to the PTY now consume the selection, so the next Ctrl+C reaches
+  the program instead of copying the same text twice. (#113)
+- **Shell vi mode is supported** — vi-mode prompts are detected via durable
+  signals and no longer confuse the prompt gap hold. (#102, thanks @ayamir)
+- **App cursor shape is respected** — programs that set the cursor shape
+  (e.g. vim) see it honored. (#101, thanks @ayamir)
+
 ## [0.17.0] - 2026-07-16
 
 ### Added
