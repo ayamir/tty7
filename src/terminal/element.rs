@@ -8,7 +8,7 @@ use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::index::{Column as AlacColumn, Line as AlacLine, Point as AlacPoint};
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Rgb};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 use gpui::{
     App, BorderStyle, Bounds, ContentMask, CursorStyle, Element, ElementId, Font, FontStyle,
     FontWeight, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, Hsla, IntoElement, LayoutId,
@@ -841,7 +841,7 @@ struct GridCursor {
     row: usize,
     col: usize,
     hidden: bool,
-    /// The shape to draw (from `Config::cursor_style`).
+    /// The shape to draw after resolving terminal DECSCUSR/default state.
     style: crate::core::config::CursorStyle,
 }
 
@@ -890,6 +890,14 @@ fn paint_cursor(
             let line = Bounds::new(point(rect.origin.x, y), size(rect.size.width, h));
             window.paint_quad(fill(line, c));
         }
+    }
+}
+
+fn cursor_style_from_shape(shape: CursorShape) -> crate::core::config::CursorStyle {
+    match shape {
+        CursorShape::Beam => crate::core::config::CursorStyle::Bar,
+        CursorShape::Underline => crate::core::config::CursorStyle::Underline,
+        _ => crate::core::config::CursorStyle::Block,
     }
 }
 
@@ -1046,13 +1054,8 @@ impl TerminalElement {
                 cursor = Some(GridCursor {
                     row: row as usize,
                     col,
-                    hidden: matches!(
-                        cur.shape,
-                        alacritty_terminal::vte::ansi::CursorShape::Hidden
-                    ),
-                    // Shape is a user preference, not app-driven: the config style
-                    // wins regardless of what DECSCUSR requested.
-                    style: cx.global::<Config>().cursor_style,
+                    hidden: matches!(cur.shape, CursorShape::Hidden),
+                    style: cursor_style_from_shape(cur.shape),
                 });
             }
         }
@@ -1776,6 +1779,25 @@ mod tests {
         assert_eq!(drag_overshoot(px(80.), bounds, px(10.)), 2.);
         // 30px below the bottom → 3 lines down.
         assert_eq!(drag_overshoot(px(230.), bounds, px(10.)), -3.);
+    }
+
+    #[test]
+    fn terminal_cursor_shape_maps_to_painted_cursor_style() {
+        use crate::core::config::CursorStyle;
+
+        assert_eq!(cursor_style_from_shape(CursorShape::Beam), CursorStyle::Bar);
+        assert_eq!(
+            cursor_style_from_shape(CursorShape::Underline),
+            CursorStyle::Underline
+        );
+        assert_eq!(
+            cursor_style_from_shape(CursorShape::Block),
+            CursorStyle::Block
+        );
+        assert_eq!(
+            cursor_style_from_shape(CursorShape::HollowBlock),
+            CursorStyle::Block
+        );
     }
 
     // ---- segment_row ----

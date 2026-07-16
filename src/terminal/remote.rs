@@ -31,11 +31,12 @@ use std::thread::JoinHandle;
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi;
+use alacritty_terminal::vte::ansi::{self, CursorShape, CursorStyle};
 
 use std::collections::VecDeque;
 
 use crate::core::cli_agent::{AgentSessionState, CLIAgent};
+use crate::core::config::CursorStyle as ConfigCursorStyle;
 use crate::core::osc::OscTokenizer;
 use crate::daemon::protocol::{
     AuthPromptKind, AuthResponse, ClientMsg, DaemonMsg, KnownHostEntry, KnownHostId,
@@ -302,10 +303,8 @@ impl RemoteTerminal {
         // Scrollback depth comes from user config (clamped in `Config::sanitize`
         // to alacritty's ceiling). Read fresh from disk here: a pane spawn/attach
         // is rare, and this runs on the daemon side too, which has no GPUI global.
-        let config = Config {
-            scrolling_history: crate::core::config::Config::load().scrollback_limit,
-            ..Config::default()
-        };
+        let user_config = crate::core::config::Config::load();
+        let config = terminal_config_from_user(&user_config);
         let term = Term::new(config, &size, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
 
@@ -361,6 +360,11 @@ impl RemoteTerminal {
             agent_session,
             reader_thread: Some(reader_thread),
         })
+    }
+
+    pub fn apply_user_config(&self, user_config: &crate::core::config::Config) {
+        let mut term = self.term.lock();
+        term.set_options(terminal_config_from_user(user_config));
     }
 
     /// The reader thread: decodes framed `DaemonMsg`s off the socket and applies
@@ -1461,6 +1465,26 @@ fn connect() -> anyhow::Result<Stream> {
     })
 }
 
+fn terminal_config_from_user(user_config: &crate::core::config::Config) -> Config {
+    Config {
+        scrolling_history: user_config.scrollback_limit,
+        default_cursor_style: alacritty_cursor_style(user_config.cursor_style),
+        ..Config::default()
+    }
+}
+
+fn alacritty_cursor_style(style: ConfigCursorStyle) -> CursorStyle {
+    let shape = match style {
+        ConfigCursorStyle::Block => CursorShape::Block,
+        ConfigCursorStyle::Bar => CursorShape::Beam,
+        ConfigCursorStyle::Underline => CursorShape::Underline,
+    };
+    CursorStyle {
+        shape,
+        blinking: false,
+    }
+}
+
 /// Build the protocol `WinSize` from our `TermSize` + cell pixel size.
 fn win_size(size: TermSize, cell_w: u16, cell_h: u16) -> WinSize {
     WinSize {
@@ -1555,6 +1579,49 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(term.exited_flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cursor_style_sequence_overrides_and_resets_to_user_default() {
+        use alacritty_terminal::vte::ansi::CursorShape;
+
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let mut user_config = crate::core::config::Config::default();
+        user_config.cursor_style = ConfigCursorStyle::Underline;
+        term.apply_user_config(&user_config);
+
+        let mut shape = term.term.lock().cursor_style().shape;
+        assert_eq!(shape, CursorShape::Underline);
+
+        // DECSCUSR 6 = steady beam, the sequence nvim uses for insert mode.
+        DaemonMsg::Output(b"\x1b[6 q".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        for _ in 0..200 {
+            shape = term.term.lock().cursor_style().shape;
+            if shape == CursorShape::Beam {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(shape, CursorShape::Beam);
+
+        // DECSCUSR 0 clears the application override, so the configured
+        // terminal default is visible again.
+        DaemonMsg::Output(b"\x1b[0 q".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        for _ in 0..200 {
+            shape = term.term.lock().cursor_style().shape;
+            if shape == CursorShape::Underline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(shape, CursorShape::Underline);
     }
 
     /// Native-SSH `AuthPrompt` and `SshStatus` frames must surface through the
