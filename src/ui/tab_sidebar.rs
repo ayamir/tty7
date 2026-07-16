@@ -80,12 +80,15 @@ impl Tty7App {
             .gap_0p5();
 
         // ── Repo grouping ─────────────────────────────────────────────────────
-        // Each tab's group key: the git work-tree root of its label-driving
-        // pane, refreshed through the tab's *sticky* `sidebar_group` cell —
+        // Each tab's group key: the git work-tree root of its *first* pane's
+        // cwd, refreshed through the tab's *sticky* `sidebar_group` cell —
         // only a landed probe answer moves a tab (see the field's doc), so the
-        // list never reshuffles on an in-flight cd. `None` = the Scratch group.
-        // With grouping configured off every key is `None`, which also makes
-        // the same-group drop check below a no-op.
+        // list never reshuffles on an in-flight cd. The first pane (not the
+        // focused one, which the branch line follows) so switching focus
+        // between splits in different repos never relocates the row — the
+        // group answers "where does this tab live", not "what am I touching".
+        // `None` = the Scratch group. With grouping configured off every key
+        // is `None`, which also makes the same-group drop check below a no-op.
         let grouping = cx.global::<Config>().sidebar_grouping == SidebarGrouping::Repo;
         let keys: Rc<Vec<Option<PathBuf>>> = Rc::new(
             self.tabs
@@ -96,7 +99,7 @@ impl Tty7App {
                     }
                     let cwd = tab
                         .pane
-                        .focused_or_first(window, cx)
+                        .first_leaf()
                         .and_then(|leaf| leaf.read(cx).git_status_cwd().map(|p| p.to_path_buf()));
                     if let Some(cwd) = cwd {
                         if let Some(known) = cx.global::<GitStatusCache>().known_root_for(&cwd) {

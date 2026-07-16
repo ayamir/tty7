@@ -102,8 +102,10 @@ pub struct Tab {
     /// tab's overlay is rendered. See [`crate::ui::diff_overlay`].
     pub(crate) diff_overlay: Option<crate::ui::diff_overlay::DiffOverlayState>,
     /// The sidebar group this tab last *definitively* belonged to: the git
-    /// work-tree root of its label-driving pane's cwd, or `None` for outside
-    /// any repo (the "Scratch" group). Sticky on purpose: it only moves when
+    /// work-tree root of its first pane's cwd (deliberately not the focused
+    /// pane's — switching focus between splits must not relocate the row), or
+    /// `None` for outside any repo (the "Scratch" group). Sticky on purpose:
+    /// it only moves when
     /// the git cache has a landed answer for the current cwd
     /// ([`GitStatusCache::known_root_for`](crate::terminal::git_status::GitStatusCache::known_root_for)
     /// returns `Some`), so a cd whose probe is still in flight — or a pane
