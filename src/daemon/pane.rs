@@ -1619,16 +1619,24 @@ fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
     if let Some(shell) = signals.shell {
         // Windows: agent identity rides the C mark's command capture — ConPTY
         // has no foreground process group for the Unix 0.5 s poll to read an
-        // argv from. `C;<cmd>` detects, the prompt marks (`A`/`B`/`D`) cleared
-        // `command` so they apply `None` and clear the chip. Unix keeps the
-        // poll (it sees through scripts and wrappers) and never consults the
-        // mark. Applied before the sentinel events below so an event naming
-        // the agent can still re-brand within the same chunk.
+        // argv from. `C;<cmd>` detects, `D` cleared `command` so it applies
+        // `None` and clears the chip. Unix keeps the poll (it sees through
+        // scripts and wrappers) and never consults the mark. Applied before
+        // the sentinel events below so an event naming the agent can still
+        // re-brand within the same chunk.
+        //
+        // Gated on the capture *changing*: a stray foreign mark mid-command
+        // (nested/remote shell, issue #26) re-delivers the same unchanged
+        // capture, and when that capture names no agent (a wrapper script the
+        // matcher can't see through), re-applying its `None` would wipe an
+        // identity the sentinel events established.
         #[cfg(windows)]
-        apply_agent(
-            st,
-            agent_from_shell_mark(&shell, crate::core::config::agent_commands_cached()),
-        );
+        if shell_mark_capture_changed(&st.shell, &shell) {
+            apply_agent(
+                st,
+                agent_from_shell_mark(&shell, crate::core::config::agent_commands_cached()),
+            );
+        }
         st.shell = shell.clone();
         if let Some(sub) = &st.subscriber {
             let _ = sub.send(DaemonMsg::Prompt {
@@ -1642,11 +1650,23 @@ fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
 }
 
 /// The coding agent named by the shell's last `133;C;<command>` capture — the
-/// Windows detection input ([`apply_signals`] applies it there on every shell
-/// mark). `None` both at the prompt (`D` cleared `command`) and for an
-/// unrecognized command, so applying the answer verbatim also clears
+/// Windows detection input ([`apply_signals`] applies it there whenever the
+/// capture changes). `None` both at the prompt (`D` cleared `command`) and for
+/// an unrecognized command, so applying the answer verbatim also clears
 /// the chip when the command ends. Compiled on every platform so the unit
 /// tests cover it from Unix dev machines; only the Windows build calls it.
+/// Whether a shell-mark change should (re-)run mark-derived agent detection
+/// on Windows: only when the capture itself changed. `C` (new capture) and `D`
+/// (capture cleared) qualify; a stray foreign A/B mark re-delivers the same
+/// capture, and when that capture names no agent (a wrapper script the matcher
+/// can't see through) re-applying its `None` would wipe an identity the
+/// sentinel events established. Compiled on every platform for the unit tests;
+/// only the Windows build calls it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn shell_mark_capture_changed(prev: &ShellState, next: &ShellState) -> bool {
+    prev.command != next.command
+}
+
 #[cfg_attr(not(windows), allow(dead_code))]
 fn agent_from_shell_mark(
     shell: &ShellState,
@@ -1936,8 +1956,12 @@ fn handle_osc133(shell: &mut ShellState, rest: &[u8]) -> bool {
             shell.at_prompt = false;
             // tty7 extension: our shell integrations append the submitted
             // command line, percent-encoded — the Windows agent-detection
-            // input (see [`agent_from_shell_mark`]). Bare `C` (a foreign
-            // shell's own integration) leaves it `None`.
+            // input (see [`agent_from_shell_mark`]). A bare `C` overwrites the
+            // capture with `None` — deliberately, even though a *foreign* bare
+            // `C` mid-command then clears the chip: our own PowerShell body
+            // falls back to a bare `C` when escaping throws (lone surrogate on
+            // PS 5.1), and there a new command *has* started, so keeping the
+            // previous capture would misattribute it.
             shell.command = rest
                 .strip_prefix(b"C;")
                 .map(|c| String::from_utf8_lossy(&percent_decode(c)).into_owned())
@@ -2526,6 +2550,49 @@ mod tests {
         assert_eq!(a.shell.as_ref().unwrap().command.as_deref(), Some("codex"));
         let d = s.feed(b"\x1b]133;D;0\x07");
         assert_eq!(d.shell.as_ref().unwrap().command, None);
+
+        // A multi-line command arrives %0A-joined (fish re-joins the split
+        // list with it) and decodes back to real newlines.
+        let c = s.feed(b"\x1b]133;C;echo%20a%0Aecho%20b\x07");
+        assert_eq!(
+            c.shell.as_ref().unwrap().command.as_deref(),
+            Some("echo a\necho b")
+        );
+
+        // An all-whitespace payload is no capture, like a bare `C`.
+        let c = s.feed(b"\x1b]133;C;%20%20\x07");
+        assert_eq!(c.shell.as_ref().unwrap().command, None);
+    }
+
+    /// The Windows apply gate ([`shell_mark_capture_changed`]): detection
+    /// re-runs only when the capture changes, so a stray foreign A/B mark
+    /// mid-command — which re-delivers the same capture — can't wipe a
+    /// sentinel-established agent identity by re-applying the capture's `None`
+    /// (a wrapper script the matcher can't see through detects nothing).
+    #[test]
+    fn sniff_osc133_stray_marks_do_not_reapply_mark_detection() {
+        let mut s = OscSniffer::new();
+
+        // A wrapper launch: capture set, but detection has no answer.
+        let mut prev = ShellState::default();
+        let c = s.feed(b"\x1b]133;C;.%5Cdev.ps1\x07").shell.unwrap();
+        assert!(shell_mark_capture_changed(&prev, &c));
+        assert_eq!(
+            agent_from_shell_mark(&c, &std::collections::HashMap::new()),
+            None
+        );
+        prev = c;
+
+        // Stray foreign prompt marks mid-command: same capture, no re-apply —
+        // an agent branded by sentinel events keeps its chip.
+        let ab = s.feed(b"\x1b]133;A\x1b]133;B\x07").shell.unwrap();
+        assert!(!shell_mark_capture_changed(&prev, &ab));
+        prev = ab;
+
+        // The command finishing clears the capture: that change applies (its
+        // `None` is what clears the chip at the prompt).
+        let d = s.feed(b"\x1b]133;D;0\x07").shell.unwrap();
+        assert!(shell_mark_capture_changed(&prev, &d));
     }
 
     #[test]
