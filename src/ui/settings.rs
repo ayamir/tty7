@@ -935,9 +935,11 @@ impl Tty7App {
     }
 
     /// One labelled settings row, shared by every section: title + description
-    /// on the left, control right-aligned. Space-between is safe here because
-    /// the content column is capped (640px), so the two never stretch apart
-    /// into a dead gap the way they did on an uncapped pane. A soft full-row
+    /// on the left, control right-aligned. Space-between is safe here only
+    /// because both hosting columns are capped — the main content column at
+    /// 640px and the SSH detail pane at 720px — so the two never stretch apart
+    /// into a dead gap the way they did on an uncapped pane; widen either cap
+    /// and every row inside it stretches with it. A soft full-row
     /// hover fill makes each row read as one scannable unit — the same quiet
     /// highlight the sidebar and menus use; negative side margins let that fill
     /// bleed past the text edge while labels stay aligned with the section
@@ -3092,7 +3094,8 @@ impl Tty7App {
     }
 
     /// The compact "Current theme" card on the Appearance page: a preview of the
-    /// active theme beside its name and light/dark mode, the whole row a click
+    /// active theme beside its kind (built-in vs custom) and light/dark mode,
+    /// its name, and its six chromatic ANSI swatches; the whole row a click
     /// target that opens the picker panel on the right.
     fn render_current_theme(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
