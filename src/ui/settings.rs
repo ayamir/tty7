@@ -2205,18 +2205,20 @@ impl Tty7App {
 
         let core = v_flex()
             .gap_3()
-            .child(self.settings_row(
-                "Name",
-                "A label for this connection.",
-                // Explicit widths on every text control: `settings_row` right-aligns
-                // the control in a shrink-to-fit slot, so a bare Input has no
-                // definite width to fill. 260px matches the Shell section's inputs.
-                div()
-                    .w(px(260.))
-                    .child(Input::new(&form.name).small())
-                    .into_any_element(),
-                cx,
-            ))
+            .child(
+                self.settings_row(
+                    "Name",
+                    "A label for this connection.",
+                    // Explicit widths on every text control: `settings_row` right-aligns
+                    // the control in a shrink-to-fit slot, so a bare Input has no
+                    // definite width to fill. 260px matches the Shell section's inputs.
+                    div()
+                        .w(px(260.))
+                        .child(Input::new(&form.name).small())
+                        .into_any_element(),
+                    cx,
+                ),
+            )
             .child(
                 self.settings_row(
                     "Host",
@@ -2230,15 +2232,17 @@ impl Tty7App {
                     cx,
                 ),
             )
-            .child(self.settings_row(
-                "User",
-                "Login user (blank = resolve at connect).",
-                div()
-                    .w(px(260.))
-                    .child(Input::new(&form.user).small())
-                    .into_any_element(),
-                cx,
-            ))
+            .child(
+                self.settings_row(
+                    "User",
+                    "Login user (blank = resolve at connect).",
+                    div()
+                        .w(px(260.))
+                        .child(Input::new(&form.user).small())
+                        .into_any_element(),
+                    cx,
+                ),
+            )
             .child(self.settings_row(
                 "Auth",
                 "Authentication method. Auto tries every applicable method.",
@@ -2333,15 +2337,17 @@ impl Tty7App {
             },
         ));
         if form.show_jump {
-            section = section.child(self.settings_row(
-                "Jump host",
-                "Name of another profile to tunnel through (blank = direct).",
-                div()
-                    .w(px(260.))
-                    .child(Input::new(&form.jump).small())
-                    .into_any_element(),
-                cx,
-            ));
+            section = section.child(
+                self.settings_row(
+                    "Jump host",
+                    "Name of another profile to tunnel through (blank = direct).",
+                    div()
+                        .w(px(260.))
+                        .child(Input::new(&form.jump).small())
+                        .into_any_element(),
+                    cx,
+                ),
+            );
         }
         section.into_any_element()
     }
