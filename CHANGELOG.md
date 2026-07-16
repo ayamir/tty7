@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-16
+
+### Added
+
+- **Per-tab context menu with worktree tabs** — right-clicking a tab chip or
+  sidebar row opens a menu: rename, splits, copy working directory, and a
+  close group. *New Worktree Tab* creates a git worktree under the repo's own
+  `.tty7/worktrees/<name>` (kept out of `git status` by a self-ignoring
+  `.gitignore`), with editable name / branch / start point and a live path
+  preview. Closing a tab that sat in a managed worktree offers to remove the
+  checkout — unless another pane still lives in it, and dirty checkouts
+  default to keeping. (#96)
+- **Unread pane count in the tab status dot** — a split tab can finish
+  several agent turns while you're away; the green Done dot now swells into
+  a badge counting the unread panes (clamped at 9) and shrinks back once
+  every pane has been seen. (#98)
+
+### Changed
+
+- **The sidebar diff overlay is per-tab and side-by-side** — the overlay now
+  lives on its tab: switching away hides it, switching back restores it
+  (re-probing when the status cache disagrees), closing the tab drops it,
+  and Esc keeps working. The body switches from a unified diff to a
+  GitHub-PR-style side-by-side view with positionally aligned
+  removed / added columns. (#100)
+- **macOS-style popup panels** — menus get a rounded pill highlight, inset
+  hairline separators, a 10px panel radius, and a floatier shadow;
+  searchable lists get a taller Spotlight-style search row, and the palette
+  viewport holds a whole number of rows so the last visible row is never
+  cut mid-height. (#97)
+- **README rewritten as a minimal index** — feature details, keybindings,
+  and performance notes moved to `docs/features.md` (en + zh-CN); the
+  tagline now positions tty7 as a terminal workbench.
+
+### Fixed
+
+- **The agent dot no longer sticks on Waiting after you approve a
+  permission** — Claude Code has no "permission replied" hook, so a new
+  PostToolUse hook emits a tool-complete event and the first tool that
+  finishes after approval flips the dot back to Working. Existing hook
+  installs surface as Outdated in Settings → Agents with an Update
+  button. (#99)
+
 ## [0.16.1] - 2026-07-15
 
 ### Fixed
