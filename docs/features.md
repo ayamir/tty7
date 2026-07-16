@@ -17,7 +17,9 @@
 - **Tabs & splits** — always open in the current directory
 - **Command palette** <kbd>⌘ P</kbd> · scrollback search <kbd>⌘ F</kbd>
 - **⌘-click links** · desktop notifications · copy on select (opt-in, Settings → Terminal → Clipboard)
-- **Eight themes** · CJK / IME input
+- **Eight themes, plus your own** — YAML seed themes with solid, gradient, or image backgrounds; iTerm2 `.itermcolors` import; in-app color editor with a background-image picker
+- **Window opacity & blur** — Settings → Appearance → Window; applies to every theme, *Follow theme* returns to the theme's own `opacity` / `blur`
+- **CJK / IME input**
 
 ## Coding agents
 

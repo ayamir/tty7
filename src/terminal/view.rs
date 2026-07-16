@@ -4601,7 +4601,11 @@ impl Render for TerminalView {
             .overflow_hidden()
             .px(px(GRID_PAD_X))
             .py(px(GRID_PAD_Y))
-            .bg(cx.theme().background)
+            // No background of its own: the window root paints the theme's
+            // background (solid, gradient, or image — see `Tty7App::render`),
+            // and default-background cells don't paint either, so it shows
+            // through every pane. A surface-level fill here would both hide
+            // gradients/images and double-composite a translucent theme's alpha.
             .text_color(cx.theme().foreground)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll))

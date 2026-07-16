@@ -42,6 +42,12 @@ pub struct Config {
     /// `~/.config/tty7/themes/*`); unknown ids fall back to the default theme. The
     /// native chrome is forced to match the theme's light/dark brightness.
     pub theme_preset: String,
+    /// Global window-opacity override, 0.2–1.0. `None` (the default) follows the
+    /// active theme's own `opacity`; when set it applies to every theme, so a
+    /// chosen translucency survives theme switches.
+    pub window_opacity: Option<f32>,
+    /// Global window-blur override. `None` follows the active theme's `blur`.
+    pub window_blur: Option<bool>,
     /// Optional keybinding overrides: action name (e.g. "NewTab") → keystroke
     /// (e.g. "secondary-t", which is ⌘ on macOS and Ctrl elsewhere). Unknown
     /// actions and unparseable keystrokes are ignored (with a warning) so a bad
@@ -405,6 +411,8 @@ impl Default for Config {
             // The default theme id (mirrors `ui::presets::DEFAULT_ID`; core can't
             // depend on ui). Unknown ids fall back to it anyway.
             theme_preset: "light".to_string(),
+            window_opacity: None,
+            window_blur: None,
             keybindings: HashMap::new(),
             keybinding_preset: default_preset(),
             prefix: default_prefix(),
@@ -515,6 +523,13 @@ impl Config {
         // on every trivial command, and a 1-hour ceiling above which "long
         // command" stops meaning anything.
         self.notify_threshold_secs = self.notify_threshold_secs.clamp(1, 3600);
+        // A NaN override would make the whole window invisible or poison the
+        // alpha math; drop it. The floor keeps a hand-edited value from hiding
+        // the window entirely.
+        self.window_opacity = self
+            .window_opacity
+            .filter(|o| o.is_finite())
+            .map(|o| o.clamp(0.2, 1.0));
         // A corrupt/NaN width would poison `w(px(..))`; keep it in a broad safe
         // band (the live layout enforces the real `[180, window/2]` bounds).
         if !self.sidebar_width.is_finite() || self.sidebar_width <= 0.0 {
@@ -953,6 +968,25 @@ mod tests {
         assert_eq!(clamp(-3.0), 1.0);
         assert_eq!(clamp(100.0), 10.0); // ceiling
         assert_eq!(clamp(0.01), 0.1); // floor
+    }
+
+    /// The window-opacity override is clamped into its usable band; a NaN is
+    /// dropped back to "follow theme" rather than poisoning the alpha math.
+    #[test]
+    fn sanitize_clamps_window_opacity_override() {
+        let clamp = |o: Option<f32>| {
+            let mut cfg = Config {
+                window_opacity: o,
+                ..Config::default()
+            };
+            cfg.sanitize();
+            cfg.window_opacity
+        };
+        assert_eq!(clamp(None), None);
+        assert_eq!(clamp(Some(0.8)), Some(0.8));
+        assert_eq!(clamp(Some(0.0)), Some(0.2)); // floor: never invisible
+        assert_eq!(clamp(Some(2.0)), Some(1.0)); // ceiling
+        assert_eq!(clamp(Some(f32::NAN)), None); // NaN → follow theme
     }
 
     #[test]

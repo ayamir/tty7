@@ -328,6 +328,9 @@ pub(crate) struct ThemeEditor {
     pub(crate) seed: Vec<(ThemeEdit, String, Entity<ColorPickerState>)>,
     /// One picker per ANSI slot 0–15.
     pub(crate) ansi: Vec<(ThemeEdit, String, Entity<ColorPickerState>)>,
+    /// Background-image opacity slider; present only while the theme has an
+    /// image (wired to `Tty7App::set_theme_image_opacity`).
+    pub(crate) image_opacity_slider: Option<Entity<SliderState>>,
     pub(crate) _subs: Vec<Subscription>,
 }
 
@@ -354,6 +357,9 @@ pub(crate) struct SettingsState {
     pub(crate) wd_path_input: Entity<InputState>,
     /// Mouse-scroll multiplier slider (Terminal section).
     pub(crate) scroll_slider: Entity<SliderState>,
+    /// Global window-opacity slider (Appearance's Window section). Shows the
+    /// effective value; dragging sets the config override.
+    pub(crate) window_opacity_slider: Entity<SliderState>,
     /// The color editor for the active editable theme, or `None` when the active
     /// theme is read-only (a built-in / import) or the system is being followed.
     pub(crate) theme_editor: Option<ThemeEditor>,
@@ -1180,6 +1186,8 @@ impl Tty7App {
             // the foot of the page after Cursor.
             .child(self.render_custom_themes(cx))
             .child(self.section_rule(cx))
+            .child(self.render_window_section(cx))
+            .child(self.section_rule(cx))
             .child(self.section_header("Typography", cx))
             .child(self.settings_row(
                 "Font size",
@@ -1234,6 +1242,75 @@ impl Tty7App {
             .into_any_element()
     }
 
+    /// Window section (Appearance): global opacity slider + blur switch that
+    /// apply to every theme. Both are config *overrides* — until touched they
+    /// follow the active theme's own `opacity`/`blur`, and "Follow theme"
+    /// clears them back to that state.
+    fn render_window_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(slider) = self
+            .active_settings()
+            .map(|s| s.window_opacity_slider.clone())
+        else {
+            return div().into_any_element();
+        };
+        let config = cx.global::<Config>();
+        let overridden = config.window_opacity.is_some() || config.window_blur.is_some();
+        let theme = presets::by_id(cx, &config.theme_preset.clone());
+        let opacity = Tty7App::effective_window_opacity(cx);
+        let blur = cx.global::<Config>().window_blur.unwrap_or(theme.blur);
+
+        let opacity_control = h_flex()
+            .items_center()
+            .gap_3()
+            .w(px(240.))
+            .child(div().flex_1().child(Slider::new(&slider)))
+            .child(
+                div()
+                    .w(px(36.))
+                    .text_sm()
+                    .text_color(cx.theme().foreground)
+                    .child(format!("{:.0}%", opacity * 100.)),
+            )
+            .into_any_element();
+        let blur_switch = Switch::new("window-blur")
+            .checked(blur)
+            .on_click(
+                cx.listener(|this, on: &bool, window, cx| this.set_window_blur(*on, window, cx)),
+            )
+            .into_any_element();
+
+        v_flex()
+            .child(self.section_header("Window", cx))
+            .child(self.settings_row(
+                "Opacity",
+                "How opaque the window background is, for every theme. Below \
+                 100% the desktop shows through.",
+                opacity_control,
+                cx,
+            ))
+            .child(self.settings_row(
+                "Blur",
+                "Blur whatever is behind a translucent window (macOS).",
+                blur_switch,
+                cx,
+            ))
+            // Only offered while an override is active; otherwise the values
+            // already follow the theme and the button would be a no-op.
+            .when(overridden, |this| {
+                this.child(
+                    h_flex().mt_2().child(
+                        Button::new("follow-theme-window")
+                            .label("Follow theme")
+                            .small()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.reset_window_overrides(window, cx)
+                            })),
+                    ),
+                )
+            })
+            .into_any_element()
+    }
+
     /// Custom themes section. On an editable theme, the color editor; on a
     /// read-only built-in / import, a "Duplicate to edit" button that forks it
     /// into an editable file. The folder button is always available.
@@ -1257,6 +1334,75 @@ impl Tty7App {
                 .iter()
                 .map(|(_, label, state)| (label.clone(), state.clone()))
                 .collect();
+            let image_opacity_slider = editor.image_opacity_slider.clone();
+
+            // The theme's current image, for the filename label and the
+            // opacity readout (the slider owns its own thumb position).
+            let theme = presets::by_id(cx, &cx.global::<Config>().theme_preset.clone());
+            let image = theme.image.clone();
+            let image_name = image.as_ref().map(|i| {
+                i.path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| i.path.display().to_string())
+            });
+            let image_control = h_flex()
+                .items_center()
+                .gap_2()
+                .w(px(240.))
+                .child(
+                    Button::new("pick-theme-image")
+                        .label(if image.is_some() {
+                            "Change…"
+                        } else {
+                            "Choose…"
+                        })
+                        .small()
+                        .on_click(cx.listener(|this, _, _w, cx| this.pick_theme_image(cx))),
+                )
+                .when_some(image_name, |this, name| {
+                    this.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(name),
+                    )
+                    .child(
+                        Button::new("remove-theme-image")
+                            .label("Remove")
+                            .small()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.remove_theme_image(window, cx)
+                            })),
+                    )
+                })
+                .into_any_element();
+            let image_opacity_row = image_opacity_slider.map(|slider| {
+                let readout = image.as_ref().map(|i| i.opacity).unwrap_or(0.3);
+                let control = h_flex()
+                    .items_center()
+                    .gap_3()
+                    .w(px(240.))
+                    .child(div().flex_1().child(Slider::new(&slider)))
+                    .child(
+                        div()
+                            .w(px(36.))
+                            .text_sm()
+                            .text_color(cx.theme().foreground)
+                            .child(format!("{:.0}%", readout * 100.)),
+                    )
+                    .into_any_element();
+                self.settings_row(
+                    "Image opacity",
+                    "How strongly the image shows over the background color.",
+                    control,
+                    cx,
+                )
+            });
+
             return v_flex()
                 .mt_5()
                 .child(self.section_intro(
@@ -1269,6 +1415,13 @@ impl Tty7App {
                     seed.into_iter()
                         .map(|(label, state)| self.render_theme_color_row(label, state, cx)),
                 )
+                .child(self.settings_row(
+                    "Background image",
+                    "Composited over the background color, under the text.",
+                    image_control,
+                    cx,
+                ))
+                .children(image_opacity_row)
                 .child(self.section_header("ANSI colors", cx))
                 .children(
                     ansi.into_iter()

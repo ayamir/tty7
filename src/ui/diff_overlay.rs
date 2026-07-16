@@ -219,7 +219,17 @@ impl Tty7App {
                 .inset_0()
                 // Blocks mouse from reaching the terminal underneath.
                 .occlude()
-                .bg(cx.theme().background)
+                // Same gradient/opacity-aware paint as the root and the settings
+                // overlay, so a gradient or image theme doesn't snap to a flat
+                // color here. On a translucent theme this second layer compounds
+                // the alpha a little — deliberate: the overlay must occlude the
+                // terminal behind it to stay readable.
+                .bg(
+                    match cx.try_global::<crate::ui::presets::ActiveBackground>() {
+                        Some(bg) => crate::ui::theme::window_background(bg),
+                        None => cx.theme().background.into(),
+                    },
+                )
                 .text_color(cx.theme().foreground)
                 .track_focus(&overlay.focus_handle)
                 .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {

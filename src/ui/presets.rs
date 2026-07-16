@@ -24,9 +24,9 @@ use serde::Deserialize;
 
 use crate::terminal::palette::ActivePalette;
 
-/// A background (or accent) paint: a flat color or a two-stop gradient. Only
-/// solids render today; gradients are carried through the model so themes can
-/// declare them and the renderer can grow to honor them without a schema change.
+/// A background (or accent) paint: a flat color or a two-stop gradient. The
+/// window background renders gradients for real (see `theme::window_background`);
+/// every other consumer works from the representative [`Fill::color`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Fill {
     Solid(u32),
@@ -36,8 +36,8 @@ pub enum Fill {
 
 impl Fill {
     /// The single representative color used wherever one flat color is needed
-    /// (chrome derivation, the current solid-only renderer): the solid itself, or
-    /// a gradient's first stop.
+    /// (chrome derivation, the terminal's default cell background): the solid
+    /// itself, or a gradient's first stop.
     pub fn color(&self) -> u32 {
         match *self {
             Fill::Solid(c) => c,
@@ -75,9 +75,8 @@ pub struct Theme {
     pub opacity: Option<f32>,
     /// Blur the window background behind a translucent theme. Carried.
     pub blur: bool,
-    /// Optional background image. Carried through the model; the renderer does not
-    /// composite it yet (solid/opacity/blur backgrounds render today).
-    #[allow(dead_code)]
+    /// Optional background image, composited over the background fill at its own
+    /// opacity (the terminal and chrome paint on top).
     pub image: Option<Image>,
     pub ansi16: [(u8, u8, u8); 16],
     /// The file this theme was loaded from, or `None` for a compiled-in built-in.
@@ -240,6 +239,19 @@ fn legible_foreground(bg: u32, fg: u32) -> u32 {
     }
 }
 
+/// The render-facing slice of the active theme's window background — fill,
+/// window opacity, and optional image — published as a GPUI global by
+/// `apply_theme` so the root view can paint gradients/images every frame
+/// without re-resolving (and cloning) the whole theme registry.
+pub struct ActiveBackground {
+    pub fill: Fill,
+    /// Window opacity, already filtered to `Some` only when < 1.0.
+    pub opacity: Option<f32>,
+    pub image: Option<Image>,
+}
+
+impl Global for ActiveBackground {}
+
 // ── Registry ────────────────────────────────────────────────────────────────
 
 /// The id of the app's default theme. Mirrors `Config`'s default `theme_preset`
@@ -331,6 +343,16 @@ pub fn to_yaml(t: &Theme) -> String {
     }
     if t.blur {
         s.push_str("blur: true\n");
+    }
+    // Written back as the (expanded) absolute path: `expand_path` already
+    // resolved `~`/relative forms on load, and dropping the field here would
+    // silently delete a theme's image on the first in-app color edit.
+    if let Some(img) = &t.image {
+        s.push_str(&format!(
+            "background_image:\n  path: {:?}\n  opacity: {}\n",
+            img.path.display().to_string(),
+            img.opacity
+        ));
     }
     let row = |range: std::ops::Range<usize>| {
         range
@@ -1021,6 +1043,35 @@ ansi:
             }
         );
         assert_eq!(fill.color(), 0x001122);
+    }
+
+    /// Window fields and the background image must survive a serialize → parse
+    /// round trip, or an in-app color edit would silently strip them from the
+    /// user's file.
+    #[test]
+    fn to_yaml_round_trips_window_and_image_fields() {
+        let mut theme = builtins().into_iter().next().unwrap();
+        theme.background = Fill::Vertical {
+            top: 0x001122,
+            bottom: 0x334455,
+        };
+        theme.opacity = Some(0.85);
+        theme.blur = true;
+        theme.image = Some(Image {
+            path: PathBuf::from("/pictures/koi.jpg"),
+            opacity: 0.4,
+        });
+        let file: ThemeFile = serde_yaml::from_str(&to_yaml(&theme)).unwrap();
+        assert_eq!(
+            file.background.into_fill().unwrap(),
+            theme.background,
+            "gradient background lost"
+        );
+        assert_eq!(file.opacity, Some(0.85));
+        assert!(file.blur);
+        let img = file.background_image.expect("image field lost");
+        assert_eq!(img.path, "/pictures/koi.jpg");
+        assert_eq!(img.opacity, 0.4);
     }
 
     #[test]
