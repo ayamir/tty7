@@ -448,11 +448,15 @@ const OWNED_FILE_STEM_JS: &str = "tty7.js";
 
 /// Claude Code's hook events and the sentinel event each maps onto.
 /// `Notification` covers both "needs permission" and "waiting for input" —
-/// exactly the Waiting state.
+/// exactly the Waiting state. `PostToolUse` is the way *back*: Claude has no
+/// "permission replied" hook, so the first tool that completes after the user
+/// approves is the signal that the turn is moving again (state machine flips
+/// Waiting → Working on it, and ignores it otherwise).
 const CLAUDE_HOOK_EVENTS: &[(&str, &str)] = &[
     ("SessionStart", "session-start"),
     ("UserPromptSubmit", "prompt-submit"),
     ("Notification", "notification"),
+    ("PostToolUse", "tool-complete"),
     ("Stop", "stop"),
     ("SessionEnd", "session-end"),
 ];
