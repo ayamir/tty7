@@ -15,7 +15,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::core::actions::*;
-use crate::core::config::{Config, NewTabPosition, ShellConfig, TabBarPosition};
+use crate::core::config::{
+    Config, CursorStyle as ConfigCursorStyle, NewTabPosition, ShellConfig, TabBarPosition,
+};
 use crate::core::session::{Session, SessionAxis, SessionPane, SessionTab};
 use crate::core::shells::DetectedShell;
 use crate::core::ssh_config;
@@ -262,6 +264,10 @@ pub struct Tty7App {
     /// Currently-applied OpenType features for terminal fonts. `None` means the
     /// terminal-safe default (ligatures disabled).
     pub(crate) font_features: Option<gpui::FontFeatures>,
+    /// Currently-applied terminal-emulator defaults. Tracked so hot-reload can
+    /// push only the alacritty-backed options that actually changed.
+    terminal_cursor_style: ConfigCursorStyle,
+    terminal_scrollback_limit: usize,
     /// Keeps the `observe_global::<Config>` subscription alive for the app's
     /// lifetime so external edits to `config.json` (swapped in by the watcher in
     /// `main.rs`) live-apply font size / line height / family. Never read.
@@ -445,12 +451,28 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) -> Self {
         // Font size from config (borrow ends before the mutable theme apply).
-        let font_size = cx.global::<Config>().font_size;
-        let line_height = cx.global::<Config>().line_height;
-        let font_family = cx.global::<Config>().font_family.clone();
-        let font_family_bold = cx.global::<Config>().font_family_bold.clone();
-        let font_family_italic = cx.global::<Config>().font_family_italic.clone();
-        let font_features = cx.global::<Config>().font_features.clone();
+        let (
+            font_size,
+            line_height,
+            font_family,
+            font_family_bold,
+            font_family_italic,
+            font_features,
+            terminal_cursor_style,
+            terminal_scrollback_limit,
+        ) = {
+            let cfg = cx.global::<Config>();
+            (
+                cfg.font_size,
+                cfg.line_height,
+                cfg.font_family.clone(),
+                cfg.font_family_bold.clone(),
+                cfg.font_family_italic.clone(),
+                cfg.font_features.clone(),
+                cfg.cursor_style,
+                cfg.scrollback_limit,
+            )
+        };
         let sftp_panel = crate::ui::sftp::SftpPanelState::new(window, cx);
         // Managed-forward add-form inputs (native-SSH panes).
         let mf_bind_host = cx.new(|cx| InputState::new(window, cx).default_value("127.0.0.1"));
@@ -533,6 +555,8 @@ impl Tty7App {
             font_family_bold,
             font_family_italic,
             font_features,
+            terminal_cursor_style,
+            terminal_scrollback_limit,
             _config_watch: config_watch,
             _keystroke_watch: keystroke_watch,
             _activation_watch: activation_watch,
@@ -1054,19 +1078,25 @@ impl Tty7App {
         cx.notify();
     }
 
-    /// Switch the cursor shape and repaint. The element reads `cursor_style` from
-    /// the global each frame, so we just persist and nudge every pane to redraw.
-    pub(crate) fn set_cursor_style(
-        &mut self,
-        style: crate::core::config::CursorStyle,
-        cx: &mut Context<Self>,
-    ) {
-        self.update_config(cx, |cfg| cfg.cursor_style = style);
+    fn apply_terminal_config_to_panes(&self, config: &Config, cx: &mut Context<Self>) {
         for tab in &self.tabs {
             for leaf in tab.pane.leaves() {
-                leaf.update(cx, |_v, cx| cx.notify());
+                leaf.update(cx, |v, cx| {
+                    v.terminal.apply_user_config(config);
+                    cx.notify();
+                });
             }
         }
+    }
+
+    /// Switch the default cursor shape, update each pane's terminal defaults,
+    /// and repaint. App-requested DECSCUSR shapes still override this at runtime.
+    pub(crate) fn set_cursor_style(&mut self, style: ConfigCursorStyle, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.cursor_style = style);
+        let cfg = cx.global::<Config>().clone();
+        self.terminal_cursor_style = cfg.cursor_style;
+        self.terminal_scrollback_limit = cfg.scrollback_limit;
+        self.apply_terminal_config_to_panes(&cfg, cx);
     }
 
     // ── Config setters (Terminal / Window & Tabs / Cursor settings) ─────────
@@ -1371,6 +1401,10 @@ impl Tty7App {
         self.update_config(cx, |cfg| {
             cfg.scrollback_limit = lines.clamp(100, crate::core::config::MAX_SCROLLBACK)
         });
+        let cfg = cx.global::<Config>().clone();
+        self.terminal_cursor_style = cfg.cursor_style;
+        self.terminal_scrollback_limit = cfg.scrollback_limit;
+        self.apply_terminal_config_to_panes(&cfg, cx);
     }
 
     pub(crate) fn set_new_tab_position(&mut self, pos: NewTabPosition, cx: &mut Context<Self>) {
@@ -2915,6 +2949,14 @@ impl Tty7App {
     /// writes it), and — because we never write the global or `save()` from here
     /// — closes the save → watch → reload loop that would otherwise oscillate.
     fn reload_from_config(&mut self, cx: &mut Context<Self>) {
+        let config = cx.global::<Config>().clone();
+        if config.cursor_style != self.terminal_cursor_style
+            || config.scrollback_limit != self.terminal_scrollback_limit
+        {
+            self.terminal_cursor_style = config.cursor_style;
+            self.terminal_scrollback_limit = config.scrollback_limit;
+            self.apply_terminal_config_to_panes(&config, cx);
+        }
         let (font_size, line_height, font_family, font_features) = {
             let cfg = cx.global::<Config>();
             (
