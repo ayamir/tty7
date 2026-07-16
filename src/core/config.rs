@@ -112,6 +112,12 @@ pub struct Config {
     /// on quit — it's just ignored at startup.
     #[serde(default = "default_true")]
     pub restore_session: bool,
+    /// Show the system tray / menu bar status item: the icon flips to an
+    /// attention state when a coding agent needs input, and its menu lists the
+    /// agent panes. On by default; the tray's poll loop re-reads this every
+    /// second, so toggling it (Settings or a `config.json` edit) applies live.
+    #[serde(default = "default_true")]
+    pub show_tray_icon: bool,
     /// How the terminal bell (BEL / `^G`) is signalled. Defaults to a brief
     /// visual flash (the current behavior).
     #[serde(default, deserialize_with = "de_lenient")]
@@ -425,6 +431,7 @@ impl Default for Config {
             check_for_updates: true,
             notify_threshold_secs: default_notify_threshold_secs(),
             restore_session: true,
+            show_tray_icon: true,
             // Visual flash preserves the pre-config behavior (the bell always
             // flashed); opting into None/Audible is a deliberate change.
             bell: BellMode::Visual,

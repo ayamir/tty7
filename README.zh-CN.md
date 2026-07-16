@@ -42,7 +42,7 @@
 |---|---|
 | **输入** | 历史影子建议 · 带说明的 Tab 补全 · 语法高亮 · 多行编辑 · 点击定位光标 · <kbd>⌃ R</kbd> 模糊历史搜索 |
 | **窗口** | 标签页与分屏 · <kbd>⌘ P</kbd> 命令面板 · <kbd>⌘ F</kbd> 回滚搜索 · 8 套主题 · 输入法 |
-| **Coding agent** | 按 pane 识别约 17 个 CLI agent：状态点、通知、分支 + diff、重启后续上会话 |
+| **Coding agent** | 按 pane 识别约 17 个 CLI agent：状态点、通知、分支 + diff、重启后续上会话、托盘图标提醒"等你输入" |
 | **SSH** | 原生 russh 栈：profile 凭据进 keychain、SFTP 面板、端口转发、跳板机 |
 
 每一行的细节见 [docs/features.zh-CN.md](docs/features.zh-CN.md)。快捷键：<kbd>⌘ ,</kbd>

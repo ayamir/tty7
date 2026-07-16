@@ -68,7 +68,13 @@ pub fn spawn_check(cx: &mut App) {
     if !cx.global::<Config>().check_for_updates {
         return;
     }
+    spawn_check_forced(cx);
+}
 
+/// The same check, ignoring the `check_for_updates` toggle — for explicit
+/// user-initiated checks (the tray's "Check for Updates…"), where "I asked"
+/// overrides "don't ask on my behalf at startup".
+pub fn spawn_check_forced(cx: &mut App) {
     cx.spawn(async move |cx| {
         let current = env!("CARGO_PKG_VERSION");
         // Race the fetch against a timer so a stalled connection can't leave the

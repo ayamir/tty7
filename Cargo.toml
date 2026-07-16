@@ -113,6 +113,21 @@ tokio = { version = "1", features = [
 # Already in the tree transitively (vte et al.), so this pins no new code.
 memchr = "2"
 
+# System tray / menu bar status item (`ui::tray`). Rasterizes the bundled SVG
+# logo into the tray bitmap at runtime — gpui's own SVG path only yields a
+# tinted alpha mask, not raw RGBA. Pinned to the exact version already in the
+# tree via gpui (0.45.x), so this adds no new native code; default features off
+# drops the text/font machinery our icon SVGs don't use.
+resvg = { version = "0.45", default-features = false }
+
+# The tray icon itself, macOS + Windows: tauri's `tray-icon` (NSStatusItem /
+# Shell_NotifyIcon via objc2 / windows-sys, both already in the tree). Linux is
+# deliberately NOT on this crate — its Linux backend needs GTK + libappindicator,
+# which tty7's AppImage doesn't bundle and the x11/wayland gpui backends don't
+# pull. Linux instead uses `ksni` below.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+tray-icon = "0.24"
+
 # `setsid` (daemon detach) and the macOS foreground-process proc queries are the
 # only libc users left, both Unix-only — so the dep is Unix-only too.
 [target.'cfg(unix)'.dependencies]
@@ -155,6 +170,12 @@ objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder", "
 # itself via `cfg`, so no feature is needed for them.
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui_platform = { workspace = true, features = ["x11", "wayland"] }
+# Linux tray (`ui::tray`): pure-Rust StatusNotifierItem over DBus (zbus — already
+# in the tree). `blocking` + `async-io` gives a synchronous handle without
+# requiring the app to own a tokio runtime; ksni runs its own service thread. On
+# desktops without an SNI host (bare GNOME without the AppIndicator extension)
+# spawning fails and the tray is silently absent — the app is unaffected.
+ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
 
 # gpui's `test-support` unlocks `#[gpui::test]` + `TestAppContext`, the headless
 # App/Window harness the view/event tests run on. Dev-only: the feature merges
