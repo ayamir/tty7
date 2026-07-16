@@ -2818,7 +2818,7 @@ impl Tty7App {
             let (dot_color, status_text) = match state {
                 HooksState::NotInstalled => (muted_fg, "Not installed"),
                 HooksState::Installed => (success, "Installed"),
-                HooksState::Outdated => (warning, "Outdated — points at another tty7"),
+                HooksState::Outdated => (warning, "Outdated — installed by another tty7 version"),
             };
             // The primary action reads as what it will *do* from this state.
             let primary_label = match state {

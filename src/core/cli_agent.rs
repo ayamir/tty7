@@ -498,6 +498,19 @@ impl AgentSessionState {
                     self.message = ev.message.clone();
                 }
             }
+            // A tool call finished. Only meaningful as the recovery edge out
+            // of a block: the user answered the permission prompt / question,
+            // the approved tool ran, so the turn is moving again — no agent
+            // emits an explicit "permission replied" signal here, so the next
+            // tool completion is that signal. Guarded on Waiting so the steady
+            // stream of completions during normal work is a no-op and can
+            // never overwrite Done between turns.
+            AgentEventKind::ToolComplete => {
+                if self.status == AgentStatus::Waiting {
+                    self.status = AgentStatus::Working;
+                    self.message = None;
+                }
+            }
             AgentEventKind::Stop => {
                 self.status = AgentStatus::Done;
                 self.message = ev.message.clone();
@@ -514,9 +527,9 @@ impl AgentSessionState {
 
 /// The event vocabulary of the sentinel protocol (`"event"` in the JSON).
 /// Deliberately a superset of what any one agent emits: Claude Code hooks map
-/// onto session-start / prompt-submit / notification / stop / session-end,
-/// while permission-request / question-asked are there for agents (Codex,
-/// OpenCode plugins) that can distinguish them.
+/// onto session-start / prompt-submit / notification / tool-complete / stop /
+/// session-end, while permission-request / question-asked are there for
+/// agents (Codex, OpenCode plugins) that can distinguish them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentEventKind {
@@ -524,6 +537,7 @@ pub enum AgentEventKind {
     PromptSubmit,
     PermissionRequest,
     QuestionAsked,
+    ToolComplete,
     Notification,
     Stop,
     SessionEnd,
@@ -778,7 +792,23 @@ mod tests {
         assert_eq!(s.status, AgentStatus::Waiting);
         assert!(s.message.as_deref().unwrap().contains("permission"));
 
+        // The user approved: the granted tool runs to completion, and that
+        // completion is the "back to work" edge — amber flips back to blue
+        // instead of lingering for the rest of the turn.
+        s.apply_event(&ev(AgentEventKind::ToolComplete, None, None));
+        assert_eq!(s.status, AgentStatus::Working);
+        assert_eq!(s.message, None, "the stale permission prompt is cleared");
+
+        // Tool completions during normal work are a no-op, not state churn.
+        s.apply_event(&ev(AgentEventKind::ToolComplete, None, None));
+        assert_eq!(s.status, AgentStatus::Working);
+
         s.apply_event(&ev(AgentEventKind::Stop, None, None));
+        assert_eq!(s.status, AgentStatus::Done);
+
+        // A straggler tool-complete after the turn ended must not resurrect
+        // Working and hide the unread green dot.
+        s.apply_event(&ev(AgentEventKind::ToolComplete, None, None));
         assert_eq!(s.status, AgentStatus::Done);
 
         // A Notification arriving BETWEEN turns (while Done) is Claude Code's
