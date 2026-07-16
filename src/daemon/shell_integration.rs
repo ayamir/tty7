@@ -7,9 +7,12 @@
 //! interoperates with the wider ecosystem rather than a bespoke scheme:
 //!   - `OSC 133 ; A ST`            prompt start
 //!   - `OSC 133 ; B ST`            prompt end / command input begins
-//!   - `OSC 133 ; C ST`            command output begins (command executing)
+//!   - `OSC 133 ; C [; <cmd>] ST`  command output begins; all four integrations
+//!     append the submitted command line percent-encoded (tty7 extension — the
+//!     Windows coding-agent detection input, see `core::cli_agent`)
 //!   - `OSC 133 ; D ; <exit> ST`   command finished, with its exit code
 //!   - `OSC 133 ; V ; 0/1 ST`      tty7 extension: shell edit mode
+//!
 //! plus `OSC 7` to report the cwd precisely (many login shells don't emit it
 //! unless they think they're in Terminal.app).
 //!
@@ -106,10 +109,21 @@ if [[ -o interactive ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
 
   # preexec runs after the user hits Enter, before the command runs: mark the
   # start of command output (C). We track an "active" flag so the very first
-  # prompt (no command yet) doesn't emit a bogus D.
+  # prompt (no command yet) doesn't emit a bogus D. The C mark carries the
+  # submitted line ($1), truncated (detection only reads the front) and with
+  # the bytes that would break OSC framing or the daemon's percent-decode
+  # escaped (% ESC BEL CR NL) — the coding-agent detection input on Windows,
+  # where ConPTY has no process table to poll (see core::cli_agent).
   __tty7_preexec() {
     __tty7_cmd_active=1
-    __tty7_osc "133;C"
+    local cmd=$1
+    cmd=${cmd[1,512]}
+    cmd=${cmd//\%/%25}
+    cmd=${cmd//$'\e'/%1B}
+    cmd=${cmd//$'\a'/%07}
+    cmd=${cmd//$'\r'/%0D}
+    cmd=${cmd//$'\n'/%0A}
+    __tty7_osc "133;C;$cmd"
   }
 
   autoload -Uz add-zsh-hook
@@ -177,9 +191,16 @@ if status is-interactive; and test -z "$TTY7_SHELL_INTEGRATION"
     printf '\e]7;file://%s%s\a' (hostname) (string replace --all '%' '%25' -- $PWD)
   end
 
+  # The C mark carries the submitted line, truncated and with the bytes that
+  # would break OSC framing or the daemon's percent-decode escaped (% ESC BEL
+  # CR NL) — the Windows agent-detection input (see core::cli_agent). fish
+  # command substitution splits output on newlines, so a multi-line command
+  # arrives as a list; the final `string join` re-joins it with the escaped
+  # newline. `%` must be escaped first (the other escapes introduce `%`).
   function __tty7_preexec --on-event fish_preexec
     set -g __tty7_cmd_active 1
-    __tty7_osc "133;C"
+    set -l cmd (string sub -l 512 -- $argv[1] | string replace -a '%' '%25' | string replace -a \e '%1B' | string replace -a \a '%07' | string replace -a \r '%0D' | string join '%0A')
+    __tty7_osc "133;C;$cmd"
   end
 
   # Runs on the fish_prompt *event*, which fires before fish calls the
@@ -270,9 +291,18 @@ if [[ $- == *i* ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
     return $ret
   }
 
+  # The C mark carries the submitted line ($1, from bash-preexec), truncated
+  # and escaped the same way as the zsh path — the Windows agent-detection
+  # input (git-bash; see core::cli_agent).
   __tty7_preexec() {
     __tty7_cmd_active=1
-    __tty7_osc "133;C"
+    local cmd=${1:0:512}
+    cmd=${cmd//\%/%25}
+    cmd=${cmd//$'\e'/%1B}
+    cmd=${cmd//$'\a'/%07}
+    cmd=${cmd//$'\r'/%0D}
+    cmd=${cmd//$'\n'/%0A}
+    __tty7_osc "133;C;$cmd"
   }
 
   if [[ -z "${bash_preexec_imported:-}" ]]; then
@@ -464,7 +494,13 @@ fi
 ///     sniffer keys `at_prompt` off (see `daemon::pane::handle_osc133`).
 ///   - **`PSConsoleHostReadLine`** is PSReadLine's line reader — the closest
 ///     thing PowerShell has to a preexec. After it returns the submitted line,
-///     before the command runs, we emit `133;C` (command output begins).
+///     before the command runs, we emit `133;C;<command>` (command output
+///     begins), carrying the submitted line percent-encoded as a tty7
+///     extension. That capture is the Windows coding-agent detection input:
+///     ConPTY has no foreground process group for the daemon's process-table
+///     poll to read an `argv` from, so — like Warp — the daemon learns what
+///     runs from the line the shell itself reported (see
+///     `core::cli_agent::CLIAgent::detect_from_command_with`).
 ///
 /// `$?` must be captured as the very first statement of `prompt` (an
 /// assignment sets `$?` to true, clobbering it), and is restored before the
@@ -543,7 +579,25 @@ if (-not $env:TTY7_SHELL_INTEGRATION) {
       $line = & $global:__Tty7OrigReadLine
       if (-not [string]::IsNullOrWhiteSpace($line)) {
         $global:__Tty7CmdActive = $true
-        Write-Host -NoNewline "$($global:__Tty7Esc)]133;C$($global:__Tty7Bel)"
+        # Carry the submitted line on the C mark (tty7 extension): the daemon
+        # detects coding agents from it on Windows, where ConPTY exposes no
+        # foreground process group to read an argv from. Truncated (detection
+        # only reads the front) and percent-encoded so the payload can't carry
+        # a raw `;`, ESC or BEL into the OSC framing. The cut can split a
+        # surrogate pair, and a lone high surrogate makes EscapeDataString
+        # throw on .NET Framework (PS 5.1) — inside this wrapper that would
+        # swallow the submitted line, so drop it and keep the whole mark
+        # best-effort: a plain `C` still flips the prompt state.
+        $cmd = if ($line.Length -gt 512) { $line.Substring(0, 512) } else { $line }
+        if ([char]::IsHighSurrogate($cmd[$cmd.Length - 1])) {
+          $cmd = $cmd.Substring(0, $cmd.Length - 1)
+        }
+        try {
+          $cmd = [Uri]::EscapeDataString($cmd)
+          Write-Host -NoNewline "$($global:__Tty7Esc)]133;C;$cmd$($global:__Tty7Bel)"
+        } catch {
+          Write-Host -NoNewline "$($global:__Tty7Esc)]133;C$($global:__Tty7Bel)"
+        }
       }
       $line
     }
