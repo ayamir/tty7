@@ -4543,7 +4543,19 @@ impl Render for TerminalView {
         // that arms the flag arrives as pane output, so a render always
         // follows it (Output → Wakeup → notify). Both prepend: they were
         // typed before any post-engage keys already sitting in the editor.
-        if self.input_active() {
+        if self.shell_vi_prompt() {
+            // A vi prompt never engages the editor: release held gap input to
+            // the shell's own line editor (raw, no typeahead record — there is
+            // no local adoption to reconcile against) and drop any pending
+            // record without its `^U`. Those bytes land on zle's line and are
+            // the shell's to keep; a record surviving the vi prompt would
+            // flush at the next emacs-mode prompt and resurrect long-consumed
+            // text into the editor.
+            if let Some((_net, bytes)) = self.hold.release() {
+                self.terminal.write(bytes);
+            }
+            self.typeahead.drain();
+        } else if self.input_active() {
             if let Some(net) = self.hold.engage() {
                 self.cmd.prepend_str(&net);
             }
@@ -6068,6 +6080,101 @@ mod gpui_tests {
             next_input_until_timeout(&mut daemon),
             None,
             "leaving shell vi-mode must not flush a stale typeahead wipe"
+        );
+    }
+
+    /// Text typed during a command gap is held for the next prompt's editor —
+    /// but a vi prompt never engages the editor, so the hold must be released
+    /// raw (the shell's own line editor consumes it) and the typeahead record
+    /// dropped. Without that, the record lingers past the whole vi prompt and
+    /// flushes at the next emacs-mode prompt: a spurious `^U` plus the long-
+    /// consumed gap text resurrected into the local editor.
+    #[gpui::test]
+    fn shell_vi_mode_prompt_releases_gap_hold_without_stale_typeahead(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        // Shell integration live, a command running: gap input gets held.
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: false,
+            last_exit: None,
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let gap = window
+                .update(cx, |view, _, _| {
+                    view.terminal.shell_active() && !view.terminal.at_prompt()
+                })
+                .unwrap();
+            if gap {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        window
+            .update(cx, |view, _, cx| view.commit_text("ls", cx))
+            .unwrap();
+
+        // The command finishes into a vi-mode prompt.
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: Some(0),
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        DaemonMsg::Output(b"\x1b]133;V;1\x07\x1b]133;B\x07".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let ready = window
+                .update(cx, |view, _, _| {
+                    view.terminal.shell_vi_mode() && view.terminal.zle_reading()
+                })
+                .unwrap();
+            if ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Fire any pending hold-window timer too, so both release paths are
+        // covered regardless of which one runs first.
+        cx.executor().advance_clock(HOLD_WINDOW * 2);
+        cx.run_until_parked();
+        assert_eq!(
+            next_input_until_timeout(&mut daemon),
+            Some(b"ls".to_vec()),
+            "gap text typed before a vi prompt must reach the shell"
+        );
+
+        // Back to an emacs-mode prompt: the editor re-engages empty-handed.
+        DaemonMsg::Output(b"\x1b]133;V;0\x07\x1b]133;B\x07".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let active = window.update(cx, |view, _, _| view.input_active()).unwrap();
+            if active {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        window
+            .update(cx, |view, _, _| {
+                assert!(view.input_active());
+                assert_eq!(
+                    view.cmd.text(),
+                    "",
+                    "gap text consumed at the vi prompt must not resurrect in the editor"
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            next_input_until_timeout(&mut daemon),
+            None,
+            "no stale ^U wipe once the vi prompt consumed the gap text"
         );
     }
 
