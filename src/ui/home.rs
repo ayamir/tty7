@@ -194,6 +194,7 @@ mod tests {
     fn closed_tab_label_prefers_the_user_set_name() {
         let tab = SessionTab {
             name: Some("build".into()),
+            sidebar_group: None,
             pane: leaf(Some("/work/getty")),
         };
         assert_eq!(closed_tab_label(&tab).as_deref(), Some("build"));
@@ -203,6 +204,7 @@ mod tests {
     fn closed_tab_label_falls_back_to_the_first_leaf_cwd_dir_name() {
         let tab = SessionTab {
             name: None,
+            sidebar_group: None,
             pane: leaf(Some("/work/getty")),
         };
         assert_eq!(closed_tab_label(&tab).as_deref(), Some("getty"));
@@ -210,6 +212,7 @@ mod tests {
         // Whitespace-only names don't count as names.
         let tab = SessionTab {
             name: Some("   ".into()),
+            sidebar_group: None,
             pane: leaf(Some("/work/getty")),
         };
         assert_eq!(closed_tab_label(&tab).as_deref(), Some("getty"));
@@ -219,6 +222,7 @@ mod tests {
     fn closed_tab_label_searches_splits_for_the_first_cwd() {
         let tab = SessionTab {
             name: None,
+            sidebar_group: None,
             pane: SessionPane::Split {
                 axis: crate::core::session::SessionAxis::Horizontal,
                 ratio: 0.5,
@@ -234,11 +238,13 @@ mod tests {
         // No name, no cwd — and "/" has no file name either.
         let unnamed = SessionTab {
             name: None,
+            sidebar_group: None,
             pane: leaf(None),
         };
         assert_eq!(closed_tab_label(&unnamed), None);
         let root = SessionTab {
             name: None,
+            sidebar_group: None,
             pane: leaf(Some("/")),
         };
         assert_eq!(closed_tab_label(&root), None);
@@ -248,6 +254,7 @@ mod tests {
     fn closed_tab_label_clamps_runaway_names() {
         let tab = SessionTab {
             name: Some("a".repeat(40)),
+            sidebar_group: None,
             pane: leaf(None),
         };
         let label = closed_tab_label(&tab).unwrap();

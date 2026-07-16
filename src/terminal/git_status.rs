@@ -102,6 +102,15 @@ impl GitStatusCache {
         self.status.get(root).cloned()
     }
 
+    /// What the cache *knows* about `cwd`'s work-tree root, three-valued for
+    /// the sidebar's repo grouping: `None` = no probe has answered yet (the
+    /// caller should keep whatever grouping it had, not reshuffle on a guess);
+    /// `Some(None)` = probed and confirmed outside any work tree;
+    /// `Some(Some(root))` = probed and inside the repo at `root`.
+    pub fn known_root_for(&self, cwd: &Path) -> Option<Option<PathBuf>> {
+        self.roots.get(cwd).cloned()
+    }
+
     /// Claim a probe for `cwd`. `false` means one is already in flight — the
     /// caller must *not* spawn another; the landed flight will reprobe once
     /// (the cwd is marked dirty) so this trigger's state still gets observed.
@@ -299,5 +308,31 @@ mod tests {
         cache.finish_probe(a, None);
         assert_eq!(cache.status_for(a), None);
         assert!(cache.status_for(b).is_some());
+    }
+
+    /// The three-valued `known_root_for` the sidebar's repo grouping reads:
+    /// unprobed → `None`, probed-and-in-a-repo → `Some(Some(root))`,
+    /// probed-and-not-a-repo → `Some(None)`. The three cases are what let a
+    /// sticky group key hold across an in-flight cd instead of flickering.
+    #[test]
+    fn known_root_for_is_three_valued() {
+        let mut cache = GitStatusCache::default();
+        let (repo, plain, unseen) = (
+            Path::new("/repo/a"),
+            Path::new("/tmp/x"),
+            Path::new("/never"),
+        );
+        cache.finish_probe(repo, Some(snap("/repo", "main", Some((1, 0)))));
+        cache.finish_probe(plain, None);
+
+        // Inside a work tree: the resolved root, wrapped twice.
+        assert_eq!(
+            cache.known_root_for(repo),
+            Some(Some(PathBuf::from("/repo")))
+        );
+        // Probed and confirmed outside any repo: a definite "not a repo".
+        assert_eq!(cache.known_root_for(plain), Some(None));
+        // Never probed: no answer yet — the caller keeps its sticky key.
+        assert_eq!(cache.known_root_for(unseen), None);
     }
 }

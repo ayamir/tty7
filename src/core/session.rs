@@ -77,6 +77,11 @@ pub struct SessionTab {
     #[serde(default)]
     pub name: Option<String>,
     pub pane: SessionPane,
+    /// The tab's last-known sidebar repo group (its work-tree root), so a
+    /// restored session renders grouped immediately instead of starting flat
+    /// and reshuffling as git probes land. `None` = Scratch / never resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_group: Option<std::path::PathBuf>,
 }
 
 /// The full saved session: the open tabs and which one was active.
@@ -179,6 +184,7 @@ mod tests {
             tabs: vec![
                 SessionTab {
                     name: Some("build".into()),
+                    sidebar_group: None,
                     pane: SessionPane::Leaf {
                         cwd: Some(PathBuf::from("/work")),
                         pane_id: Some(7),
@@ -189,6 +195,7 @@ mod tests {
                 },
                 SessionTab {
                     name: None,
+                    sidebar_group: None,
                     pane: SessionPane::Split {
                         axis: SessionAxis::Vertical,
                         ratio: 0.3,
@@ -290,6 +297,7 @@ mod tests {
             active: 0,
             tabs: vec![SessionTab {
                 name: Some("main".into()),
+                sidebar_group: None,
                 pane: SessionPane::Leaf {
                     cwd: Some(PathBuf::from("/home/u")),
                     pane_id: Some(1),

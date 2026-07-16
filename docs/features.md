@@ -15,6 +15,7 @@
 ## In the window
 
 - **Tabs & splits** — always open in the current directory
+- **Repo-grouped sidebar** — the left tab sidebar groups rows under a header per git repository, non-repo tabs in a trailing *Scratch* section; branch switches and in-repo `cd`s never move a row (`sidebar_grouping` in `config.json`: `repo` default, `none` for a flat list)
 - **Command palette** <kbd>⌘ P</kbd> · scrollback search <kbd>⌘ F</kbd>
 - **⌘-click links** · desktop notifications · copy on select (opt-in, Settings → Terminal → Clipboard)
 - **Eight themes, plus your own** — YAML seed themes with solid, gradient, or image backgrounds; iTerm2 `.itermcolors` import; in-app color editor with a background-image picker

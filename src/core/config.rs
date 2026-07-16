@@ -97,6 +97,11 @@ pub struct Config {
     /// the live layout re-clamps it to `[180, window_width/2]`.
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
+    /// How the vertical tab sidebar arranges its rows (only meaningful when
+    /// `tab_bar_position` is `left`): grouped under a header per git work tree
+    /// (`repo`, the default), or one flat list (`none`).
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub sidebar_grouping: SidebarGrouping,
     /// When to post a desktop notification after a long foreground command
     /// finishes.
     #[serde(default, deserialize_with = "de_lenient")]
@@ -342,6 +347,20 @@ pub enum TabBarPosition {
     Left,
 }
 
+/// How the vertical tab sidebar arranges its rows (see
+/// [`Config::sidebar_grouping`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SidebarGrouping {
+    /// Group tabs under a header per git work-tree root, with non-repo tabs
+    /// collected in a trailing "Scratch" group. Branch changes and cds inside
+    /// a repo never move a tab; only changing repos does.
+    #[default]
+    Repo,
+    /// One flat list in tab order (the pre-grouping behavior).
+    None,
+}
+
 /// When tty7 posts a "command finished" desktop notification (see
 /// [`Config::notify_on_command_finish`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -433,6 +452,7 @@ impl Default for Config {
             // `left` opts into the vertical sidebar.
             tab_bar_position: TabBarPosition::Top,
             sidebar_width: default_sidebar_width(),
+            sidebar_grouping: SidebarGrouping::Repo,
             notify_on_command_finish: NotifyMode::Unfocused,
             // Opt-out, not opt-in: a stale terminal that never tells you it's
             // outdated is the status quo we're fixing. One cheap GET at startup.
