@@ -1,13 +1,15 @@
-//! The working-tree diff overlay: a read-only, GitHub-style unified diff that
-//! covers the terminal area when the user clicks a sidebar row's git line
-//! (`⎇ branch +N −N`). One scrolling column — per-file cards with collapsible
-//! hunk bodies, plus an untracked-files section `git diff` itself can't show.
+//! The working-tree diff overlay: a read-only, GitHub-style side-by-side diff
+//! that covers the terminal area when the user clicks a sidebar row's git line
+//! (`⎇ branch +N −N`). A scrolling column of per-file cards with collapsible
+//! hunk bodies — old on the left, new on the right — plus an untracked-files
+//! section `git diff` itself can't show.
 //!
-//! Deliberately a *lens*, not a git client: no staging, no discard, no
-//! side-by-side. The terminal keeps running underneath (the overlay covers
+//! Deliberately a *lens*, not a git client: no staging, no discard. The
+//! terminal keeps running underneath (the overlay covers
 //! only the body area, never the sidebar, so other tabs' git lines stay
-//! clickable to switch which repo is shown). Esc, the ✕, or re-clicking the
-//! same git line closes it.
+//! clickable to switch which repo is shown). The overlay belongs to the tab it
+//! was opened on: switching tabs hides it, switching back restores it, closing
+//! the tab drops it. Esc, the ✕, or re-clicking the same git line closes it.
 //!
 //! Data comes from [`crate::terminal::git_diff`], probed off-thread on open
 //! and re-probed automatically while open whenever the shared
@@ -38,7 +40,9 @@ pub(crate) enum DiffLoad {
     NotARepo,
 }
 
-/// State of the open diff overlay (`None` on [`Tty7App`] when closed).
+/// State of an open diff overlay (`None` on its [`Tab`](crate::ui::app::Tab)
+/// when closed). Per-tab: switching tabs hides/restores it, closing the tab
+/// drops it; only the active tab's overlay is rendered.
 pub(crate) struct DiffOverlayState {
     /// The pane cwd the diff is probed from — the same path the clicked git
     /// line resolved its status through, so overlay and sidebar agree on the
@@ -65,15 +69,24 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.diff_overlay.as_ref().is_some_and(|o| o.cwd == cwd) {
+        if self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.diff_overlay.as_ref())
+            .is_some_and(|o| o.cwd == cwd)
+        {
             self.close_diff_overlay(window, cx);
             return;
         }
         // The overlay steals focus (it needs Esc); snapshot the active pane so
         // closing lands back on the same terminal — same discipline as Settings.
         self.remember_active_pane(window, cx);
+        let active = self.active;
+        let Some(tab) = self.tabs.get_mut(active) else {
+            return; // home page — no tab body to overlay
+        };
         let focus_handle = cx.focus_handle();
-        self.diff_overlay = Some(DiffOverlayState {
+        tab.diff_overlay = Some(DiffOverlayState {
             cwd,
             focus_handle: focus_handle.clone(),
             load: DiffLoad::Loading,
@@ -85,10 +98,15 @@ impl Tty7App {
         cx.notify();
     }
 
-    /// Close the overlay (Esc, ✕, or the toggle) and give focus back to the
-    /// active terminal.
+    /// Close the active tab's overlay (Esc, ✕, or the toggle) and give focus
+    /// back to the active terminal.
     pub(crate) fn close_diff_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.diff_overlay.take().is_some() {
+        let active = self.active;
+        let taken = self
+            .tabs
+            .get_mut(active)
+            .and_then(|t| t.diff_overlay.take());
+        if taken.is_some() {
             self.focus_active(window, cx);
             cx.notify();
         }
@@ -99,7 +117,12 @@ impl Tty7App {
     /// the status cache will fire again on the next real change, and a
     /// just-landed diff is fresh enough.
     fn spawn_diff_probe(&mut self, cx: &mut Context<Self>) {
-        let Some(overlay) = self.diff_overlay.as_mut() else {
+        let active = self.active;
+        let Some(overlay) = self
+            .tabs
+            .get_mut(active)
+            .and_then(|t| t.diff_overlay.as_mut())
+        else {
             return;
         };
         if overlay.loading {
@@ -116,17 +139,25 @@ impl Tty7App {
                 })
                 .await;
             let _ = this.update(cx, |app, cx| {
-                // Guarded by cwd: if the overlay was closed, or swapped to
-                // another repo while we flew, this landing is obsolete.
-                let Some(overlay) = app.diff_overlay.as_mut().filter(|o| o.cwd == cwd) else {
-                    return;
-                };
-                overlay.loading = false;
-                overlay.load = match result {
-                    Some(snap) => DiffLoad::Ready(snap),
-                    None => DiffLoad::NotARepo,
-                };
-                cx.notify();
+                // Land on every tab whose overlay shows this cwd — the spawning
+                // tab may no longer be active, and sibling tabs on the same repo
+                // are equally stale. A slot closed or swapped to another repo
+                // while we flew is skipped.
+                let mut landed = false;
+                for tab in app.tabs.iter_mut() {
+                    let Some(overlay) = tab.diff_overlay.as_mut().filter(|o| o.cwd == cwd) else {
+                        continue;
+                    };
+                    overlay.loading = false;
+                    overlay.load = match &result {
+                        Some(snap) => DiffLoad::Ready(snap.clone()),
+                        None => DiffLoad::NotARepo,
+                    };
+                    landed = true;
+                }
+                if landed {
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -139,7 +170,13 @@ impl Tty7App {
     /// numbers. Comparing branch + totals keeps the quiet case (unrelated
     /// repo's probe landing) from spawning needless `git diff` runs.
     pub(crate) fn maybe_refresh_diff_overlay(&mut self, cx: &mut Context<Self>) {
-        let Some(overlay) = self.diff_overlay.as_ref() else {
+        // Only the active tab's overlay is visible; hidden ones catch up via
+        // this same check when their tab is activated (`activate` calls us).
+        let Some(overlay) = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.diff_overlay.as_ref())
+        else {
             return;
         };
         if overlay.loading {
@@ -163,7 +200,7 @@ impl Tty7App {
     /// absolute child of the body area — it covers the terminal but not the
     /// sidebar or title strip.
     pub(crate) fn render_diff_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let overlay = self.diff_overlay.as_ref()?;
+        let overlay = self.tabs.get(self.active)?.diff_overlay.as_ref()?;
 
         let content = match &overlay.load {
             DiffLoad::Loading => self.diff_message("Reading diff…", cx),
@@ -359,7 +396,12 @@ impl Tty7App {
                 h.cursor_pointer()
                     .hover(|s| s.bg(cx.theme().list_hover))
                     .on_click(cx.listener(move |this, _, _window, cx| {
-                        if let Some(overlay) = this.diff_overlay.as_mut() {
+                        let active = this.active;
+                        if let Some(overlay) = this
+                            .tabs
+                            .get_mut(active)
+                            .and_then(|t| t.diff_overlay.as_mut())
+                        {
                             // Flip this file's override; removing an existing
                             // entry returns it to its default state.
                             if !overlay.toggled.remove(&path) {
@@ -447,8 +489,8 @@ impl Tty7App {
                         .truncate()
                         .child(hunk.header.clone()),
                 );
-                for line in &hunk.lines {
-                    body = body.child(self.diff_line_row(line, cx));
+                for row in split_hunk(&hunk.lines) {
+                    body = body.child(self.diff_split_row(&row, cx));
                 }
             }
             if file.truncated {
@@ -470,41 +512,56 @@ impl Tty7App {
         card.into_any_element()
     }
 
-    /// One diff line: two right-aligned line-number gutters, then the marker
-    /// and text in the terminal font, the whole row tinted green/red.
-    fn diff_line_row(&self, line: &git_diff::DiffLine, cx: &Context<Self>) -> AnyElement {
-        let (marker, tint) = match line.kind {
-            LineKind::Added => ("+", Some(cx.theme().success.opacity(0.12))),
-            LineKind::Removed => ("−", Some(cx.theme().danger.opacity(0.12))),
-            LineKind::Context => (" ", None),
-        };
-        let gutter = |no: Option<u32>| {
-            h_flex()
-                .flex_shrink_0()
-                .w(px(42.))
-                .justify_end()
-                .pr_1p5()
-                .text_color(cx.theme().muted_foreground.opacity(0.7))
-                .child(no.map(|n| n.to_string()).unwrap_or_default())
-        };
+    /// One side-by-side row: the old (left) and new (right) cells with a hairline
+    /// splitter between them. A `None` cell — no counterpart on that side —
+    /// paints a muted placeholder so a pure add/remove reads as one column empty.
+    fn diff_split_row(&self, row: &SplitRow, cx: &Context<Self>) -> AnyElement {
         h_flex()
             .w_full()
             // Fixed row height so blank diff lines don't collapse.
             .h(px(19.))
-            .items_center()
+            .items_stretch()
             .text_xs()
             .font_family(self.font_family.clone())
-            .when_some(tint, |row, bg| row.bg(bg))
-            .child(gutter(line.old_no))
-            .child(gutter(line.new_no))
+            .child(self.diff_split_cell(row.left.as_ref(), Side::Old, cx))
+            .child(div().flex_shrink_0().w(px(1.)).bg(cx.theme().border))
+            .child(self.diff_split_cell(row.right.as_ref(), Side::New, cx))
+            .into_any_element()
+    }
+
+    /// One half of a split row: a right-aligned line-number gutter, then the
+    /// marker and text in the terminal font, tinted green/red when changed.
+    fn diff_split_cell(
+        &self,
+        cell: Option<&SplitCell>,
+        side: Side,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let base = h_flex().flex_1().min_w_0().h_full().items_center();
+        let Some(cell) = cell else {
+            return base.bg(cx.theme().muted.opacity(0.3)).into_any_element();
+        };
+        let (marker, tint) = match (cell.changed, side) {
+            (true, Side::Old) => ("−", Some(cx.theme().danger.opacity(0.12))),
+            (true, Side::New) => ("+", Some(cx.theme().success.opacity(0.12))),
+            (false, _) => (" ", None),
+        };
+        base.when_some(tint, |row, bg| row.bg(bg))
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .w(px(42.))
+                    .justify_end()
+                    .pr_1p5()
+                    .text_color(cx.theme().muted_foreground.opacity(0.7))
+                    .child(cell.no.map(|n| n.to_string()).unwrap_or_default()),
+            )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    // Tabs don't expand in UI text layout; four spaces keeps
-                    // indentation readable.
-                    .child(format!("{marker} {}", line.text.replace('\t', "    "))),
+                    .child(format!("{marker} {}", cell.text)),
             )
             .into_any_element()
     }
@@ -558,4 +615,147 @@ impl Tty7App {
 fn file_expanded(file: &FileDiff, toggled: &HashSet<String>) -> bool {
     let default_open = file.added + file.removed <= AUTO_COLLAPSE_LINES;
     default_open != toggled.contains(&file.path)
+}
+
+/// Which column a split cell belongs to — picks the marker and tint.
+#[derive(Clone, Copy)]
+enum Side {
+    Old,
+    New,
+}
+
+/// One half of a side-by-side row. `changed` distinguishes an added/removed
+/// line (tinted) from a context line (plain, shown identically on both sides).
+struct SplitCell {
+    no: Option<u32>,
+    text: String,
+    changed: bool,
+}
+
+/// A side-by-side row: old on the left, new on the right. Either side is `None`
+/// when a change block is longer on the other side (pure add/remove, or an
+/// uneven replacement).
+struct SplitRow {
+    left: Option<SplitCell>,
+    right: Option<SplitCell>,
+}
+
+/// Pair a hunk's unified lines into side-by-side rows: removed lines fill the
+/// left column, added lines the right, and a context line flushes any pending
+/// change block before landing on both sides. Within a block the two columns
+/// align positionally (i-th removed ↔ i-th added), leftovers pair with `None`.
+fn split_hunk(lines: &[git_diff::DiffLine]) -> Vec<SplitRow> {
+    // Tabs don't expand in UI text layout; four spaces keeps indentation readable.
+    fn clean(text: &str) -> String {
+        text.replace('\t', "    ")
+    }
+    fn flush(
+        rows: &mut Vec<SplitRow>,
+        rem: &mut Vec<&git_diff::DiffLine>,
+        add: &mut Vec<&git_diff::DiffLine>,
+    ) {
+        for i in 0..rem.len().max(add.len()) {
+            rows.push(SplitRow {
+                left: rem.get(i).map(|l| SplitCell {
+                    no: l.old_no,
+                    text: clean(&l.text),
+                    changed: true,
+                }),
+                right: add.get(i).map(|l| SplitCell {
+                    no: l.new_no,
+                    text: clean(&l.text),
+                    changed: true,
+                }),
+            });
+        }
+        rem.clear();
+        add.clear();
+    }
+
+    let mut rows = Vec::new();
+    let mut rem: Vec<&git_diff::DiffLine> = Vec::new();
+    let mut add: Vec<&git_diff::DiffLine> = Vec::new();
+    for line in lines {
+        match line.kind {
+            LineKind::Removed => rem.push(line),
+            LineKind::Added => add.push(line),
+            LineKind::Context => {
+                flush(&mut rows, &mut rem, &mut add);
+                rows.push(SplitRow {
+                    left: Some(SplitCell {
+                        no: line.old_no,
+                        text: clean(&line.text),
+                        changed: false,
+                    }),
+                    right: Some(SplitCell {
+                        no: line.new_no,
+                        text: clean(&line.text),
+                        changed: false,
+                    }),
+                });
+            }
+        }
+    }
+    flush(&mut rows, &mut rem, &mut add);
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::git_diff::{DiffLine, LineKind};
+
+    fn line(kind: LineKind, old: Option<u32>, new: Option<u32>, text: &str) -> DiffLine {
+        DiffLine {
+            kind,
+            old_no: old,
+            new_no: new,
+            text: text.to_string(),
+        }
+    }
+
+    /// An uneven replacement (2 removed ↔ 1 added) between two context lines:
+    /// the pair aligns positionally, the extra removed line pairs with an empty
+    /// right column, and context lines land identically on both sides.
+    #[test]
+    fn pairs_removed_and_added_side_by_side() {
+        let lines = vec![
+            line(LineKind::Context, Some(1), Some(1), "a"),
+            line(LineKind::Removed, Some(2), None, "b"),
+            line(LineKind::Removed, Some(3), None, "c"),
+            line(LineKind::Added, None, Some(2), "B"),
+            line(LineKind::Context, Some(4), Some(3), "d"),
+        ];
+        let rows = split_hunk(&lines);
+        assert_eq!(rows.len(), 4);
+
+        // Leading context: same text both sides, not tinted.
+        let l = rows[0].left.as_ref().unwrap();
+        let r = rows[0].right.as_ref().unwrap();
+        assert_eq!((l.no, l.text.as_str(), l.changed), (Some(1), "a", false));
+        assert_eq!((r.no, r.text.as_str(), r.changed), (Some(1), "a", false));
+
+        // First changed row: removed[0] ↔ added[0], both tinted.
+        let l = rows[1].left.as_ref().unwrap();
+        let r = rows[1].right.as_ref().unwrap();
+        assert_eq!((l.no, l.text.as_str(), l.changed), (Some(2), "b", true));
+        assert_eq!((r.no, r.text.as_str(), r.changed), (Some(2), "B", true));
+
+        // Leftover removed line pairs with an empty right column.
+        assert_eq!(rows[2].left.as_ref().unwrap().text, "c");
+        assert!(rows[2].right.is_none());
+
+        // Trailing context resumes both columns.
+        assert_eq!(rows[3].left.as_ref().unwrap().no, Some(4));
+        assert_eq!(rows[3].right.as_ref().unwrap().no, Some(3));
+    }
+
+    /// Tabs render as four spaces so indentation survives UI text layout.
+    #[test]
+    fn expands_tabs_in_cell_text() {
+        let lines = vec![line(LineKind::Added, None, Some(1), "\tindented")];
+        let rows = split_hunk(&lines);
+        assert_eq!(rows[0].right.as_ref().unwrap().text, "    indented");
+        assert!(rows[0].left.is_none());
+    }
 }
