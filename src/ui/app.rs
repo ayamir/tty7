@@ -4028,31 +4028,49 @@ impl Render for Tty7App {
                 cx.listener(|this, _: &PrevTab, window, cx| this.cycle_tab(false, window, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab1, window, cx| this.activate_visual(0, window, cx)),
+                cx.listener(|this, _: &ActivateTab1, window, cx| {
+                    this.activate_visual(0, window, cx)
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab2, window, cx| this.activate_visual(1, window, cx)),
+                cx.listener(|this, _: &ActivateTab2, window, cx| {
+                    this.activate_visual(1, window, cx)
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab3, window, cx| this.activate_visual(2, window, cx)),
+                cx.listener(|this, _: &ActivateTab3, window, cx| {
+                    this.activate_visual(2, window, cx)
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab4, window, cx| this.activate_visual(3, window, cx)),
+                cx.listener(|this, _: &ActivateTab4, window, cx| {
+                    this.activate_visual(3, window, cx)
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab5, window, cx| this.activate_visual(4, window, cx)),
+                cx.listener(|this, _: &ActivateTab5, window, cx| {
+                    this.activate_visual(4, window, cx)
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab6, window, cx| this.activate_visual(5, window, cx)),
+                cx.listener(|this, _: &ActivateTab6, window, cx| {
+                    this.activate_visual(5, window, cx)
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab7, window, cx| this.activate_visual(6, window, cx)),
+                cx.listener(|this, _: &ActivateTab7, window, cx| {
+                    this.activate_visual(6, window, cx)
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab8, window, cx| this.activate_visual(7, window, cx)),
+                cx.listener(|this, _: &ActivateTab8, window, cx| {
+                    this.activate_visual(7, window, cx)
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &ActivateTab9, window, cx| this.activate_visual(8, window, cx)),
+                cx.listener(|this, _: &ActivateTab9, window, cx| {
+                    this.activate_visual(8, window, cx)
+                }),
             )
             .on_action(cx.listener(|this, _: &IncreaseFontSize, _window, cx| {
                 this.change_font_size(FONT_SIZE_STEP, cx)
