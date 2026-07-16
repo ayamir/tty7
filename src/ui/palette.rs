@@ -481,9 +481,13 @@ impl ListDelegate for PaletteDelegate {
         Some(
             ListItem::new(ix.row)
                 .selected(Some(ix) == self.selected)
-                // Tighter than the stock row: smaller text + compact vertical
-                // padding so the palette reads dense, like the terminal itself.
-                .py_1()
+                // Fixed-height, dense rows (see `PALETTE_ROW_H`: the card's
+                // list viewport is sized to a whole number of rows). The 5px
+                // side margin + 6px radius turn the highlight into the same
+                // inset pill the context menu / dropdown use.
+                .h(px(PALETTE_ROW_H))
+                .mx(px(5.))
+                .rounded(px(6.))
                 .text_sm()
                 .child(row),
         )
@@ -664,6 +668,12 @@ impl PaletteView {
 
 impl EventEmitter<PaletteEvent> for PaletteView {}
 
+/// Fixed command-row height (see `render_item`). The list viewport must hold a
+/// whole number of rows, or the card's bottom edge cuts the last one mid-height.
+const PALETTE_ROW_H: f32 = 30.;
+/// Rows visible before the list scrolls.
+const PALETTE_VISIBLE_ROWS: f32 = 12.;
+
 impl Render for PaletteView {
     /// The centered overlay: a dim full-window scrim plus the command card. The
     /// card just frames gpui-component's `List`, which renders its own search
@@ -672,25 +682,32 @@ impl Render for PaletteView {
         let theme = cx.theme();
         let (background, border, popover) = (theme.background, theme.border, theme.popover);
 
+        // The list viewport holds exactly `PALETTE_VISIBLE_ROWS` fixed-height
+        // rows plus the list's own 4px top padding (`py_1` below, which scrolls
+        // with the content) — any other height leaves the last visible row cut
+        // mid-height at the card's bottom edge. The card wraps its content (no
+        // max_h of its own) and adds `pb_1` so that row still clears the
+        // rounded corners.
+        let list_max_h = px(PALETTE_ROW_H * PALETTE_VISIBLE_ROWS + 4.);
         let card = v_flex()
             .w(px(560.))
-            .max_h(px(440.))
             .bg(popover)
             .border_1()
             .border_color(border)
-            .rounded_lg()
-            .shadow_lg()
+            // 10px radius + the floatier shadow match the context menu /
+            // dropdown panel (see the fork's `PopupMenu`).
+            .rounded(px(10.))
+            .shadow_xl()
             .overflow_hidden()
-            // `py_1` (not `p_1`): the row padding is vertical only, so the
-            // selected row's fill runs edge to edge — the same flat, full-bleed
-            // highlight the context menu, new-tab dropdown and completion popup
-            // use. The 4px top/bottom inset keeps the first/last row clear of the
-            // card's rounded corners.
+            .pb_1()
+            // `py_1` (not `p_1`): the search input keeps its full-bleed width;
+            // the rows inset themselves into rounded pills (see `render_item`),
+            // Spotlight-style, matching the context menu's highlight language.
             .child(
                 List::new(&self.list)
                     .search_placeholder(self.search_placeholder())
                     .py_1()
-                    .max_h(px(440.)),
+                    .max_h(list_max_h),
             );
 
         // Full-window scrim; clicking the empty area dismisses the palette (the
