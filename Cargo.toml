@@ -45,6 +45,14 @@ keyring = "4"
 serde_yaml = "0.9"
 plist = "1"
 
+# Clipboard-image paste (`terminal::view`). When the clipboard holds a screenshot
+# and a coding-agent TUI (Claude Code &co.) is in the pane, off macOS we stage the
+# image to a temp file and paste its path — agents attach an image path the same way
+# they do a drag-drop. Windows screenshots arrive as BMP (`CF_DIB`), which agent
+# vision won't accept, so we transcode to PNG. `image` is already in the tree via
+# gpui's own clipboard code, so pinning it here adds no new native code.
+image = "0.25"
+
 # HTTP client for the startup update check (`core::update`): one GET to the
 # GitHub releases API to see if a newer version has shipped. `reqwest_client`
 # wraps Zed's `zed-reqwest` fork behind gpui's `http_client` trait (re-exported
