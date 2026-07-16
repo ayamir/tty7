@@ -4,9 +4,9 @@
 
 ### tty7
 
-**纯 Rust 编写的 GPU 渲染终端。**
+**终端工作台：shell、会话、SSH、coding agent。**
 
-<sub>GPU 渲染基于 Zed 的 gpui · VT 内核来自 Alacritty</sub>
+<sub>纯 Rust · GPU 渲染基于 Zed 的 gpui · VT 内核来自 Alacritty</sub>
 
 <br />
 
@@ -15,85 +15,43 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-%E5%8A%A0%E5%85%A5%E7%BE%A4%E7%BB%84-5865F2?logo=discord&logoColor=white)](https://discord.gg/s3dethqz2V)
 
-[**为什么是 tty7**](#为什么是-tty7) · [**安装**](#安装) · [**功能**](#功能) · [**基准测试**](#基准测试) · [**快捷键**](#快捷键)
-
 <sub>[English](README.md) · 简体中文</sub>
 
 </div>
 
-## 为什么是 tty7
+## 为什么
 
-- **快** —— 同一台机器上，吞吐约为 Alacritty、Ghostty、Kitty 的
-  2 倍（[基准测试](#基准测试)）
-- **现代的提示符** —— 补全、语法高亮、历史搜索全部内置，不用东拼西凑插件
-- **会话不死** —— 关窗口、退应用，shell 照样运行；无需 tmux
-- **零配置** —— zsh、bash、fish、PowerShell 开箱即用
-
-macOS、Windows、Linux 三平台原生构建，每个 release 一起打出。
+- **快** —— 吞吐约为 Alacritty、Ghostty、Kitty 的 2 倍（[基准测试](#基准测试)）
+- **会话常驻** —— 退应用、重启机器，shell 照样运行；无需 tmux
+- **编辑器级输入** —— 补全、语法高亮、历史搜索内置；zsh、bash、fish、PowerShell 零配置
+- **认识 agent** —— 识别 pane 里的 Claude Code 等：状态、通知、会话恢复
 
 ## 安装
 
-到 [**Releases**](https://github.com/l0ng-ai/tty7/releases) 下载对应平台的构建：
+三平台原生构建都在 [**Releases**](https://github.com/l0ng-ai/tty7/releases)：
 
-- **macOS** —— `tty7-<version>-macos-arm64.dmg`（Apple Silicon）或 `…-x86_64.dmg`
-  （Intel）；打开后把 `tty7.app` 拖进「应用程序」即可。
-- **Windows** —— `…-windows-x86_64-setup.exe`（安装包：带开始菜单快捷方式和
-  卸载入口），或 `…-windows-x86_64.zip`（便携版：解压后运行 `tty7.exe`）。
-- **Linux** —— `…-linux-x86_64.AppImage`(推荐:已打包 x11/wayland 依赖库,
-  Fedora / Arch 等发行版免装依赖,`chmod +x` 后直接运行),或
-  `…-linux-x86_64.tar.gz`(裸二进制,解压后运行 `./tty7`,需自行装齐常见的
-  x11/wayland 运行时库)。
+| | | |
+|---|---|---|
+| **macOS** | `…-macos-arm64.dmg` · `…-x86_64.dmg` | 拖进「应用程序」 |
+| **Windows** | `…-setup.exe` · 便携版 `….zip` | |
+| **Linux** | `…-x86_64.AppImage` | `chmod +x` 直接跑，x11/wayland 依赖已打包 |
 
-## 功能
+## 有什么
 
-### 提示符
-
-- **影子建议** —— 边打字边用你的历史补全整条命令，<kbd>→</kbd> 接受
-- **会解释的 Tab 补全** —— 每个 flag、每个子命令都带说明，覆盖约 100 个常用命令
-- **语法高亮** —— 边打边亮，什么都不用装
-- **模糊历史搜索** —— <kbd>⌃ R</kbd> 看到每条命令在哪跑的、什么时候、有没有失败
-- **历史开箱即用** —— 你已有的 shell 历史直接生效，并跨会话延续
-- **真正的行编辑** —— 选区、词级移动、撤销
-
-### 窗口
-
-- **标签页与分屏** —— 永远开在当前目录
-- **命令面板** <kbd>⌘ P</kbd> · 回滚搜索 <kbd>⌘ F</kbd>
-- **⌘ 点击打开链接** · 桌面通知
-- **8 套主题** · CJK / 输入法输入
-
-### CLI coding agent
-
-tty7 能识别 pane 里跑着的第三方 coding agent（Claude Code、Codex、Gemini CLI、Aider、Amp、OpenCode 等约 17 个）并为其增强体验 —— 只观察、只加分，绝不包裹或替代 agent 本身。
-
-- **品牌头像** —— 标签 chip / 侧栏行显示每个 pane 跑的是哪个 agent；自定义包装命令可通过 `config.json` 的 `agent_commands` 映射
-- **实时状态点** —— 工作中（蓝）/ 等你输入（琥珀）/ 完成（绿），由 agent 自己上报的 OSC 事件驱动；在命令面板运行 *Agent: Install Claude Code Hooks* 一键接通 Claude Code
-- **真正有用的通知** —— agent 卡在等你批准的那一刻弹 "needs your permission…"，每轮结束弹 "finished after Ns"，遵循你的通知策略
-- **一眼看分支** —— 侧栏每行显示该 pane 的 git 分支和工作区改动（`+N −M`），`cd` 或命令跑完时自动刷新
-- **会话恢复** —— 重启后无法重连的 pane 会自动续上 agent 对话（`claude --resume …`；`restore_agent_sessions`，默认开启）
-- **上下文回填** —— 面板命令把当前选区或仓库 `git diff` 打包成 prompt 直接喂给正在跑的 agent
-
-### SSH 连接管理器
-
-**唯一**路径就是原生 Rust SSH 栈（russh）—— profile、凭据、SFTP 全部内置，绝不 shell 出 `ssh`。没有系统 ssh 兼容模式。
-
-- **QuickConnect** —— 面板里打 `user@host[:port]` 回车即连；支持 IPv6 `[::1]:port`
-- **保存 profile** —— 完整连接配置，密码 / passphrase 进 OS keychain，绝不落盘
-- **`~/.ssh/config` alias** —— 直接输入 alias 即连（原生解析常用字段，尽力而为，走 russh），也可在设置页一键导入为 profile
-- **GUI 认证** —— pane 内 sheet 输入密码、私钥 passphrase、2FA，并确认主机密钥（新主机 vs 已变更）
-- **内置 SFTP** —— 滑入式文件面板：浏览、上传 / 下载、重命名 / 删除 / chmod，可拖进 Finder
-- **端口转发** —— Local / Remote / Dynamic，预配置或运行时增删，外加 ⌘ 点击 `localhost:PORT` 一键转发
-- **跳板与代理** —— 经 profile 引用或 `ProxyJump` 多跳、ProxyCommand、SOCKS5 / HTTP
-
-| 入口 | 连接方式 |
+| | |
 |---|---|
-| 保存 profile · QuickConnect · 输入 `user@host[:port]` | 原生 russh —— SFTP · keychain · GUI 认证 · L/R/D 转发 |
-| `~/.ssh/config` alias | 原生解析后走 russh（`Match`/canonicalize/GSSAPI 不支持，且无回退） |
+| **输入** | 历史影子建议 · 带说明的 Tab 补全 · 语法高亮 · 多行编辑 · 点击定位光标 · <kbd>⌃ R</kbd> 模糊历史搜索 |
+| **窗口** | 标签页与分屏 · <kbd>⌘ P</kbd> 命令面板 · <kbd>⌘ F</kbd> 回滚搜索 · 8 套主题 · 输入法 |
+| **Coding agent** | 按 pane 识别约 17 个 CLI agent：状态点、通知、分支 + diff、重启后续上会话 |
+| **SSH** | 原生 russh 栈：profile 凭据进 keychain、SFTP 面板、端口转发、跳板机 |
+
+每一行的细节见 [docs/features.zh-CN.md](docs/features.zh-CN.md)。快捷键：<kbd>⌘ ,</kbd>
+打开设置，可查看、重绑全部键位，含 tmux 预设（[完整列表](docs/features.zh-CN.md#快捷键)）。
 
 ## 基准测试
 
-四款终端在同一台机器上依次测完，网格统一为 155×40 —— Apple M1 Pro，
-macOS 26.3.1，取五次运行的平均值（2026-07-04）：
+同一台机器、同一天、统一 155×40 网格 —— Apple M1 Pro，macOS 26.3.1，
+取五次运行的平均值（2026-07-04）：
 
 | | **tty7** | Alacritty | Ghostty | Kitty |
 |---|---:|---:|---:|---:|
@@ -103,40 +61,7 @@ macOS 26.3.1，取五次运行的平均值（2026-07-04）：
 
 <sub>¹ GUI 105 MB + 常驻守护进程 11 MB。</sub>
 
-速度从哪来：
-
-- 以设备速度读取 PTY，在渲染路径之外成批解析
-- 热路径全程无锁 —— 再大的 `cat` 也不会阻塞在渲染上
-- 触发背压前，守护进程最多可领先窗口缓冲 16 MiB
-
-测试方法（每款终端怎么驱动、网格是否公平、有哪些坑）连同一键复现脚本，都放在
-[`scripts/bench/`](scripts/bench/README.md)，欢迎自己跑一遍。
-
-## 快捷键
-
-下表按 macOS 记法书写 —— 在 Windows 和 Linux 上，把 <kbd>⌘</kbd> 读作
-<kbd>Ctrl</kbd>。按 <kbd>⌘ ,</kbd> 打开设置，可查看或重新映射全部键位。最常用的几个：
-
-| | |
-|---|---|
-| <kbd>⌘ T</kbd> · <kbd>⌘ W</kbd> · <kbd>⌘ ⇧ T</kbd> | 新建标签页 · 关闭标签页 · 恢复关闭的标签页 |
-| <kbd>⌘ 1</kbd>…<kbd>⌘ 9</kbd> · <kbd>⌃ ⇥</kbd> · <kbd>⌃ ⇧ ⇥</kbd> | 跳到第 1–9 个标签页 · 下一个 · 上一个标签页 |
-| <kbd>⌘ D</kbd> · <kbd>⌘ ⇧ D</kbd> | 向右分屏 · 向下分屏 |
-| <kbd>⌘ ]</kbd> · <kbd>⌘ [</kbd> | 下一个窗格 · 上一个窗格 |
-| <kbd>⌘ ⌥ ←→↑↓</kbd> | 按方向切换焦点窗格 |
-| <kbd>⌘ ⏎</kbd> · <kbd>⌘ ⇧ ⏎</kbd> | 切换全屏 · 最大化 / 还原窗格 |
-| <kbd>⌘ K</kbd> | 清屏并清空回滚缓冲区 |
-| <kbd>⌘ P</kbd> | 命令面板 |
-| <kbd>⌘ F</kbd> | 搜索回滚缓冲区 |
-| <kbd>⌃ R</kbd> | 模糊搜索 shell 历史 |
-| <kbd>⌘ +</kbd> · <kbd>⌘ −</kbd> · <kbd>⌘ 0</kbd> | 字号增大 · 减小 · 重置 |
-
-**Settings → Keybindings** 列出全部快捷键。点一行、按下新键即可（<kbd>Esc</kbd>
-取消，<kbd>Backspace</kbd> 恢复默认），改完立即生效。窗格缩放与交换默认不绑定键 ——
-在这里绑定，或从命令面板执行。习惯 tmux？打开 **tmux** 预设，把窗格/标签页操作
-映射到前缀键（默认 <kbd>⌃ B</kbd>）：<kbd>⌃ B</kbd> <kbd>C</kbd> 新建标签页，
-<kbd>⌃ B</kbd> <kbd>%</kbd> 分屏，<kbd>⌃ B</kbd> 接方向键切换焦点。单独按前缀键会在
-短暂延迟后送达 shell，`前缀` + 未绑定的键会原样透传给终端。
+测试方法与一键复现脚本：[`scripts/bench/`](scripts/bench/README.md)。
 
 ---
 

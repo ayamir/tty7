@@ -1,0 +1,84 @@
+# 功能
+
+<sub>[English](features.md) · 简体中文</sub>
+
+## 输入
+
+- **影子建议** —— 边打字边用你的历史补全整条命令，<kbd>→</kbd> 接受
+- **带说明的 Tab 补全** —— 每个 flag、每个子命令都带说明，覆盖约 100 个常用命令
+- **语法高亮** —— 边打边亮，什么都不用装
+- **模糊历史搜索** —— <kbd>⌃ R</kbd> 看到每条命令在哪跑的、什么时候、有没有失败
+- **历史开箱即用** —— 你已有的 shell 历史直接生效，并跨会话延续
+- **行编辑** —— 点击定位光标、鼠标选区、词级移动、撤销
+- **多行编辑** —— 折行和多行命令原地编辑；网格自动上移，光标始终可见
+
+## 窗口
+
+- **标签页与分屏** —— 永远开在当前目录
+- **命令面板** <kbd>⌘ P</kbd> · 回滚搜索 <kbd>⌘ F</kbd>
+- **⌘ 点击打开链接** · 桌面通知 · 划选即复制（可选，设置 → 终端 → 剪贴板）
+- **8 套主题** · CJK / 输入法输入
+
+## Coding agent
+
+tty7 能识别 pane 里跑着的第三方 coding agent（Claude Code、Codex、Gemini CLI、
+Aider、Amp、OpenCode 等约 17 个）并在其外围加功能 —— 绝不包裹或替代 agent 本身。
+
+- **品牌头像** —— 标签 chip / 侧栏行显示每个 pane 跑的是哪个 agent；自定义包装命令可通过 `config.json` 的 `agent_commands` 映射
+- **状态点** —— 工作中（蓝）/ 等你输入（琥珀）/ 完成（绿），由 agent 自己上报的 OSC 事件驱动；在命令面板运行 *Agent: Install Claude Code Hooks* 一键接通 Claude Code
+- **通知** —— agent 卡在等你批准的那一刻弹 "needs your permission…"，每轮结束弹 "finished after Ns"，遵循你的通知策略
+- **一眼看分支** —— 侧栏每行显示该 pane 的 git 分支和工作区改动（`+N −M`），`cd` 或命令跑完时自动刷新
+- **会话恢复** —— 重启后无法重连的 pane 会自动续上 agent 对话（`claude --resume …`；`restore_agent_sessions`，默认开启）
+- **上下文回填** —— 面板命令把当前选区或仓库 `git diff` 打包成 prompt 直接喂给正在跑的 agent
+
+## SSH
+
+**唯一**路径就是原生 Rust SSH 栈（russh）—— profile、凭据、SFTP 全部内置，
+不 shell 出 `ssh`，也没有系统 ssh 兼容模式。
+
+- **QuickConnect** —— 面板里打 `user@host[:port]` 回车即连；支持 IPv6 `[::1]:port`
+- **保存 profile** —— 完整连接配置，密码 / passphrase 进 OS keychain，不落盘
+- **`~/.ssh/config` alias** —— 直接输入 alias 即连（原生解析常用字段，尽力而为，走 russh），也可在设置页一键导入为 profile
+- **GUI 认证** —— pane 内 sheet 输入密码、私钥 passphrase、2FA，并确认主机密钥（新主机 vs 已变更）
+- **内置 SFTP** —— 滑入式文件面板：浏览、上传 / 下载、重命名 / 删除 / chmod，可拖进 Finder
+- **端口转发** —— Local / Remote / Dynamic，预配置或运行时增删，外加 ⌘ 点击 `localhost:PORT` 一键转发
+- **跳板与代理** —— 经 profile 引用或 `ProxyJump` 多跳、ProxyCommand、SOCKS5 / HTTP
+
+| 入口 | 连接方式 |
+|---|---|
+| 保存 profile · QuickConnect · 输入 `user@host[:port]` | 原生 russh —— SFTP · keychain · GUI 认证 · L/R/D 转发 |
+| `~/.ssh/config` alias | 原生解析后走 russh（`Match`/canonicalize/GSSAPI 不支持，且无回退） |
+
+## 快捷键
+
+下表按 macOS 记法书写 —— 在 Windows 和 Linux 上，把 <kbd>⌘</kbd> 读作
+<kbd>Ctrl</kbd>。最常用的几个：
+
+| | |
+|---|---|
+| <kbd>⌘ T</kbd> · <kbd>⌘ W</kbd> · <kbd>⌘ ⇧ T</kbd> | 新建标签页 · 关闭标签页 · 恢复关闭的标签页 |
+| <kbd>⌘ 1</kbd>…<kbd>⌘ 9</kbd> · <kbd>⌃ ⇥</kbd> · <kbd>⌃ ⇧ ⇥</kbd> | 跳到第 1–9 个标签页 · 下一个 · 上一个标签页 |
+| <kbd>⌘ D</kbd> · <kbd>⌘ ⇧ D</kbd> | 向右分屏 · 向下分屏 |
+| <kbd>⌘ ]</kbd> · <kbd>⌘ [</kbd> | 下一个窗格 · 上一个窗格 |
+| <kbd>⌘ ⌥ ←→↑↓</kbd> | 按方向切换焦点窗格 |
+| <kbd>⌘ ⏎</kbd> · <kbd>⌘ ⇧ ⏎</kbd> | 切换全屏 · 最大化 / 还原窗格 |
+| <kbd>⌘ K</kbd> | 清屏并清空回滚缓冲区 |
+| <kbd>⌘ P</kbd> | 命令面板 |
+| <kbd>⌘ F</kbd> | 搜索回滚缓冲区 |
+| <kbd>⌃ R</kbd> | 模糊搜索 shell 历史 |
+| <kbd>⌘ +</kbd> · <kbd>⌘ −</kbd> · <kbd>⌘ 0</kbd> | 字号增大 · 减小 · 重置 |
+
+**Settings → Keybindings**（<kbd>⌘ ,</kbd>）列出全部快捷键。点一行、按下新键即可
+（<kbd>Esc</kbd> 取消，<kbd>Backspace</kbd> 恢复默认），改完立即生效。窗格缩放与
+交换默认不绑定键 —— 在这里绑定，或从命令面板执行。
+
+**tmux 预设** —— 把窗格/标签页操作映射到前缀键（默认 <kbd>⌃ B</kbd>）：
+<kbd>⌃ B</kbd> <kbd>C</kbd> 新建标签页，<kbd>⌃ B</kbd> <kbd>%</kbd> 分屏，
+<kbd>⌃ B</kbd> 接方向键切换焦点。单独按前缀键会在短暂延迟后送达 shell，
+`前缀` + 未绑定的键原样透传给终端。
+
+## 性能说明
+
+- 以设备速度读取 PTY，在渲染路径之外成批解析
+- 热路径全程无锁 —— 再大的 `cat` 也不会阻塞在渲染上
+- 触发背压前，守护进程最多可领先窗口缓冲 16 MiB

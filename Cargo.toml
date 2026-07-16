@@ -2,7 +2,7 @@
 name = "tty7"
 version = "0.16.1"
 edition = "2024"
-description = "A terminal built on Zed's gpui that never loses your session — daemon-backed, shell-aware"
+description = "A terminal workbench: shells, persistent sessions, SSH, coding agents — GPU-rendered on Zed's gpui, pure Rust"
 repository = "https://github.com/l0ng-ai/tty7"
 license = "Apache-2.0"
 readme = "README.md"
