@@ -101,6 +101,16 @@ pub struct Tab {
     /// switching back restores it; closing the tab drops it. Only the active
     /// tab's overlay is rendered. See [`crate::ui::diff_overlay`].
     pub(crate) diff_overlay: Option<crate::ui::diff_overlay::DiffOverlayState>,
+    /// The sidebar group this tab last *definitively* belonged to: the git
+    /// work-tree root of its label-driving pane's cwd, or `None` for outside
+    /// any repo (the "Scratch" group). Sticky on purpose: it only moves when
+    /// the git cache has a landed answer for the current cwd
+    /// ([`GitStatusCache::known_root_for`](crate::terminal::git_status::GitStatusCache::known_root_for)
+    /// returns `Some`), so a cd whose probe is still in flight — or a pane
+    /// with no cwd reported yet — keeps the row where it was instead of
+    /// flickering through the Scratch group and back. A `RefCell` because the
+    /// sidebar refreshes it during render, which only has `&Tab`.
+    pub(crate) sidebar_group: std::cell::RefCell<Option<std::path::PathBuf>>,
 }
 
 impl Tab {
@@ -110,6 +120,7 @@ impl Tab {
             name: None,
             last_focused: None,
             diff_overlay: None,
+            sidebar_group: std::cell::RefCell::new(None),
         }
     }
 
@@ -733,6 +744,7 @@ impl Tty7App {
                 name: st.name,
                 last_focused: None,
                 diff_overlay: None,
+                sidebar_group: std::cell::RefCell::new(None),
             },
         );
         self.active = insert_at;
@@ -1584,6 +1596,17 @@ impl Tty7App {
     /// choice; the layout re-derives from the `Config` global on the next render.
     pub(crate) fn set_tab_bar_position(&mut self, pos: TabBarPosition, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.tab_bar_position = pos);
+    }
+
+    /// Set how the vertical tab sidebar arranges its rows (Settings → Window &
+    /// Tabs): grouped per git repo or one flat list. Persists the choice; the
+    /// sidebar re-derives from the `Config` global on the next render.
+    pub(crate) fn set_sidebar_grouping(
+        &mut self,
+        grouping: crate::core::config::SidebarGrouping,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_config(cx, |cfg| cfg.sidebar_grouping = grouping);
     }
 
     /// `ToggleTabSidebar`: flip the tab bar between the horizontal title-bar strip
@@ -4166,6 +4189,7 @@ fn tabs_from_session(
             name: st.name.clone(),
             last_focused: None,
             diff_overlay: None,
+            sidebar_group: std::cell::RefCell::new(None),
         });
     }
     // Clamp the saved active index into the rebuilt range.
