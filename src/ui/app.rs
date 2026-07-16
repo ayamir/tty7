@@ -3,7 +3,7 @@
 
 use gpui::{
     App, Axis, Bounds, Context, Entity, Focusable, Pixels, PromptLevel, Subscription, Window, div,
-    prelude::*, px,
+    img, prelude::*, px,
 };
 use gpui_component::color_picker::{ColorPickerEvent, ColorPickerState};
 use gpui_component::input::{InputEvent, InputState};
@@ -29,7 +29,7 @@ use crate::ui::presets::Fill;
 use crate::ui::settings::{
     Recording, SettingsSection, SettingsState, ThemeEditor, humanize_action,
 };
-use crate::ui::theme::{apply_theme, set_menus};
+use crate::ui::theme::{apply_theme, set_menus, window_background};
 
 /// One editable color of a user theme, targeted by the in-app color editor. Maps
 /// a picker to the seed field (or ANSI slot) it writes back to the theme's file.
@@ -897,6 +897,9 @@ impl Tty7App {
         cx.global::<Config>().save();
         // The editor targets the active theme, so its pickers must track a switch.
         self.rebuild_theme_editor(window, cx);
+        // With no global override, the effective opacity follows the theme — keep
+        // the Appearance slider's thumb on it.
+        self.sync_window_opacity_slider(window, cx);
         cx.notify();
     }
 
@@ -941,12 +944,12 @@ impl Tty7App {
         }
     }
 
-    /// Apply one color edit to the active (editable) theme: mutate the seed field,
-    /// write the theme's file, reload the registry, and repaint live.
-    pub(crate) fn edit_active_theme(
+    /// Apply one edit to the active (editable) theme: mutate it, write the
+    /// theme's file, reload the registry, and repaint live. The shared tail of
+    /// every in-app theme edit (color pickers, opacity slider, blur switch).
+    fn mutate_active_theme(
         &mut self,
-        edit: ThemeEdit,
-        value: gpui::Hsla,
+        mutate: impl FnOnce(&mut crate::ui::presets::Theme),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -955,15 +958,7 @@ impl Tty7App {
         if !theme.editable() {
             return;
         }
-        let c = hsla_to_u32(value);
-        match edit {
-            ThemeEdit::Background => theme.background = Fill::Solid(c),
-            ThemeEdit::Foreground => theme.foreground = c,
-            ThemeEdit::Accent => theme.accent = c,
-            ThemeEdit::Cursor => theme.caret = Some(c),
-            ThemeEdit::Selection => theme.selection = Some(c),
-            ThemeEdit::Ansi(i) => theme.ansi16[i] = ((c >> 16) as u8, (c >> 8) as u8, c as u8),
-        }
+        mutate(&mut theme);
         if let Err(e) = crate::ui::presets::write_theme_file(&theme) {
             log::warn!("failed to write theme file: {e}");
             return;
@@ -971,6 +966,142 @@ impl Tty7App {
         crate::ui::presets::load_registry(cx);
         apply_theme(Some(window), cx);
         cx.notify();
+    }
+
+    /// Apply one color edit to the active (editable) theme.
+    pub(crate) fn edit_active_theme(
+        &mut self,
+        edit: ThemeEdit,
+        value: gpui::Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let c = hsla_to_u32(value);
+        self.mutate_active_theme(
+            |theme| match edit {
+                ThemeEdit::Background => theme.background = Fill::Solid(c),
+                ThemeEdit::Foreground => theme.foreground = c,
+                ThemeEdit::Accent => theme.accent = c,
+                ThemeEdit::Cursor => theme.caret = Some(c),
+                ThemeEdit::Selection => theme.selection = Some(c),
+                ThemeEdit::Ansi(i) => theme.ansi16[i] = ((c >> 16) as u8, (c >> 8) as u8, c as u8),
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// The window opacity currently in effect: the global config override when
+    /// set, else the active theme's own value, else fully opaque.
+    pub(crate) fn effective_window_opacity(cx: &App) -> f32 {
+        let config = cx.global::<Config>();
+        let theme = crate::ui::presets::by_id(cx, &config.theme_preset);
+        config.window_opacity.or(theme.opacity).unwrap_or(1.0)
+    }
+
+    /// Set the global window-opacity override from the Appearance slider. Applies
+    /// to every theme (persisted in the config, not the theme file).
+    pub(crate) fn set_window_opacity(
+        &mut self,
+        v: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.global_mut::<Config>().window_opacity = Some(v.clamp(0.2, 1.0));
+        apply_theme(Some(window), cx);
+        cx.global::<Config>().save();
+        cx.notify();
+    }
+
+    /// Set the global window-blur override from the Appearance switch.
+    pub(crate) fn set_window_blur(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        cx.global_mut::<Config>().window_blur = Some(on);
+        apply_theme(Some(window), cx);
+        cx.global::<Config>().save();
+        cx.notify();
+    }
+
+    /// Clear both window overrides so opacity/blur follow the active theme again
+    /// (the Appearance section's "Follow theme" action).
+    pub(crate) fn reset_window_overrides(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        {
+            let config = cx.global_mut::<Config>();
+            config.window_opacity = None;
+            config.window_blur = None;
+        }
+        apply_theme(Some(window), cx);
+        cx.global::<Config>().save();
+        self.sync_window_opacity_slider(window, cx);
+        cx.notify();
+    }
+
+    /// Snap the Appearance opacity slider's thumb to the value now in effect.
+    /// Needed whenever that value changes for a reason other than the user
+    /// dragging it (theme switch, "Follow theme" reset).
+    pub(crate) fn sync_window_opacity_slider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let eff = Self::effective_window_opacity(cx);
+        if let Some(slider) = self
+            .active_settings()
+            .map(|s| s.window_opacity_slider.clone())
+        {
+            slider.update(cx, |s, cx| s.set_value(eff, window, cx));
+        }
+    }
+
+    /// Set the active (editable) theme's background image from a native file
+    /// picker, keeping the existing image opacity (or the schema default).
+    pub(crate) fn pick_theme_image(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.mutate_active_theme(
+                            |theme| {
+                                let opacity =
+                                    theme.image.as_ref().map(|i| i.opacity).unwrap_or(0.3);
+                                theme.image = Some(crate::ui::presets::Image { path, opacity });
+                            },
+                            window,
+                            cx,
+                        );
+                        // The editor gains/loses the image-opacity slider with
+                        // the image itself.
+                        this.rebuild_theme_editor(window, cx);
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Remove the active theme's background image.
+    pub(crate) fn remove_theme_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.mutate_active_theme(|theme| theme.image = None, window, cx);
+        self.rebuild_theme_editor(window, cx);
+    }
+
+    /// Set the active theme's background-image opacity from the editor slider.
+    pub(crate) fn set_theme_image_opacity(
+        &mut self,
+        v: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.mutate_active_theme(
+            |theme| {
+                if let Some(img) = theme.image.as_mut() {
+                    img.opacity = v.clamp(0.0, 1.0);
+                }
+            },
+            window,
+            cx,
+        );
     }
 
     /// (Re)build the settings tab's color-editor pickers for the current active
@@ -1045,11 +1176,36 @@ impl Tty7App {
             })
             .collect();
 
+        // Background-image opacity slider, present only while the theme has an
+        // image (choosing/removing one rebuilds the editor). Emits `Change`
+        // continuously while dragging; each tick writes the theme file and
+        // repaints, so the mix is live under the thumb.
+        let image_opacity_slider = theme.image.as_ref().map(|img| {
+            let slider = cx.new(|_| {
+                SliderState::new()
+                    .min(0.0)
+                    .max(1.0)
+                    .step(0.01)
+                    .default_value(img.opacity)
+            });
+            subs.push(cx.subscribe_in(
+                &slider,
+                window,
+                |this, _s, ev: &SliderEvent, window, cx| {
+                    if let SliderEvent::Change(v) = ev {
+                        this.set_theme_image_opacity(v.start(), window, cx);
+                    }
+                },
+            ));
+            slider
+        });
+
         if let Some(s) = self.settings.as_mut() {
             s.theme_editor = Some(ThemeEditor {
                 for_id: theme.id.clone(),
                 seed,
                 ansi,
+                image_opacity_slider,
                 _subs: subs,
             });
         }
@@ -2577,6 +2733,7 @@ impl Tty7App {
         let (shell_program_input, shell_args_input, wd_path_input) =
             self.build_shell_inputs(&mut subs, window, cx);
         let scroll_slider = self.build_scroll_slider(&mut subs, window, cx);
+        let window_opacity_slider = self.build_window_opacity_slider(&mut subs, window, cx);
         // Live filter for the theme picker panel; each keystroke re-renders the
         // (already-cheap) list so results narrow as you type.
         let theme_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search themes…"));
@@ -2611,6 +2768,7 @@ impl Tty7App {
             shell_args_input,
             wd_path_input,
             scroll_slider,
+            window_opacity_slider,
             theme_editor: None,
             theme_panel_open: false,
             theme_search,
@@ -2792,6 +2950,35 @@ impl Tty7App {
             }),
         );
         (shell_program_input, shell_args_input, wd_path_input)
+    }
+
+    /// Window-opacity slider for the Appearance page (20%–100%). Emits `Change`
+    /// continuously as the user drags; each tick sets the global override and
+    /// repaints, so the translucency is live under the thumb.
+    fn build_window_opacity_slider(
+        &mut self,
+        subs: &mut Vec<Subscription>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<SliderState> {
+        let eff = Self::effective_window_opacity(cx);
+        let slider = cx.new(|_| {
+            SliderState::new()
+                .min(0.2)
+                .max(1.0)
+                .step(0.01)
+                .default_value(eff)
+        });
+        subs.push(cx.subscribe_in(
+            &slider,
+            window,
+            |this, _s, ev: &SliderEvent, window, cx| {
+                if let SliderEvent::Change(v) = ev {
+                    this.set_window_opacity(v.start(), window, cx);
+                }
+            },
+        ));
+        slider
     }
 
     /// Mouse-scroll multiplier slider (0.5×–5×). Emits `Change` continuously as
@@ -3744,6 +3931,15 @@ impl Render for Tty7App {
                 .into_any_element(),
         };
 
+        // The real window background paint: gradient-aware and opacity-carrying
+        // (see `theme::window_background`), plus the theme's optional background
+        // image. Falls back to the component theme's solid before the first
+        // `apply_theme` has published the global.
+        let (window_bg, bg_image) = match cx.try_global::<crate::ui::presets::ActiveBackground>() {
+            Some(bg) => (window_background(bg), bg.image.clone()),
+            None => (cx.theme().background.into(), None),
+        };
+
         // Settings is a full-window overlay (not a tab): it covers the tab rail,
         // title strip, and terminal so it never crowds the tab list. `occlude`
         // blocks input to the elements behind it. It fills the window edge to
@@ -3755,7 +3951,11 @@ impl Render for Tty7App {
                 .absolute()
                 .inset_0()
                 .occlude()
-                .bg(cx.theme().background)
+                // Same gradient-aware paint as the root, so a gradient theme's
+                // settings page doesn't snap to a flat color. A translucent
+                // theme's alpha rides along, letting the background image show
+                // through here too.
+                .bg(window_bg)
                 .child(self.render_settings(cx))
         });
 
@@ -3764,7 +3964,7 @@ impl Render for Tty7App {
             .size_full()
             .flex()
             .flex_col()
-            .bg(cx.theme().background)
+            .bg(window_bg)
             .text_color(cx.theme().foreground)
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_action(cx.listener(|this, _: &NewTab, window, cx| this.new_tab(window, cx)))
@@ -3892,6 +4092,24 @@ impl Render for Tty7App {
             .on_action(cx.listener(|this, _: &RestartSshSession, window, cx| {
                 this.restart_ssh_session(window, cx)
             }))
+            // The theme's background image, composited over the background fill
+            // at its own opacity and under all content. Absolute, so it doesn't
+            // participate in the flex column; the wrapper clips the Cover
+            // overflow (gpui's `img` paints the fitted bounds unclipped).
+            .when_some(bg_image, |this, image| {
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .overflow_hidden()
+                        .opacity(image.opacity)
+                        .child(
+                            img(image.path)
+                                .size_full()
+                                .object_fit(gpui::ObjectFit::Cover),
+                        ),
+                )
+            })
             .child(main_layout)
             // Settings overlay, above the tabs/terminal when open.
             .when_some(settings_overlay, |this, overlay| this.child(overlay))

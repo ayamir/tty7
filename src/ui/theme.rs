@@ -4,13 +4,15 @@
 //! `ui::presets`) and publishes the terminal-facing palette.
 
 use gpui::{
-    App, Hsla, Menu, MenuItem, Pixels, Point, Window, WindowBackgroundAppearance, point, px, rgb,
+    App, Background, Hsla, Menu, MenuItem, Pixels, Point, Window, WindowBackgroundAppearance,
+    linear_color_stop, linear_gradient, point, px, rgb,
 };
 use gpui_component::{Theme, ThemeMode};
 
 use crate::core::actions::*;
 use crate::core::config::Config;
 use crate::ui::presets;
+use crate::ui::presets::Fill;
 
 /// The traffic-light origin, nudged down from the macOS default so the buttons
 /// stay vertically centred in our taller (40px) title bar. Shared between the
@@ -59,6 +61,45 @@ pub(crate) fn set_menus(cx: &mut App) {
     ]);
 }
 
+/// The actual window-background paint for the active theme: a flat color or a
+/// real two-stop linear gradient (vertical = CSS `to bottom`, horizontal =
+/// `to right`), with the theme's window opacity carried in the stops' alpha so
+/// a translucent theme shows through gradients exactly like solids.
+pub(crate) fn window_background(bg: &presets::ActiveBackground) -> Background {
+    let alpha = bg.opacity.unwrap_or(1.0);
+    let stop = |c: u32| -> Hsla {
+        let mut h: Hsla = rgb(c).into();
+        h.a = alpha;
+        h
+    };
+    match bg.fill {
+        Fill::Solid(c) => stop(c).into(),
+        Fill::Vertical { top, bottom } => linear_gradient(
+            180.,
+            linear_color_stop(stop(top), 0.),
+            linear_color_stop(stop(bottom), 1.),
+        ),
+        Fill::Horizontal { left, right } => linear_gradient(
+            90.,
+            linear_color_stop(stop(left), 0.),
+            linear_color_stop(stop(right), 1.),
+        ),
+    }
+}
+
+/// The background appearance the window should be *created* with: Blurred when
+/// the effective theme wants blur, otherwise Transparent — never Opaque, so the
+/// opacity slider works live (see the comment in [`apply_theme`]).
+pub(crate) fn background_appearance(cx: &App) -> WindowBackgroundAppearance {
+    let config = cx.global::<Config>();
+    let theme = presets::by_id(cx, &config.theme_preset);
+    if config.window_blur.unwrap_or(theme.blur) {
+        WindowBackgroundAppearance::Blurred
+    } else {
+        WindowBackgroundAppearance::Transparent
+    }
+}
+
 /// Paint gpui-component's `Theme` from the active color theme (selected by
 /// `Config::theme_preset`). The theme's inferred `dark` brightness picks the
 /// component `ThemeMode`; every shell surface is then derived from the theme's
@@ -66,28 +107,40 @@ pub(crate) fn set_menus(cx: &mut App) {
 /// terminal-facing palette as the `ActivePalette` global so the renderer matches,
 /// and applies the theme's window opacity/blur.
 pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
-    let theme = presets::by_id(cx, &cx.global::<Config>().theme_preset.clone());
+    let config = cx.global::<Config>();
+    let theme = presets::by_id(cx, &config.theme_preset.clone());
     let mode = if theme.dark {
         ThemeMode::Dark
     } else {
         ThemeMode::Light
     };
+    // Window opacity / blur: the global config override wins when set (so a
+    // chosen translucency survives theme switches); otherwise the theme's own
+    // values apply. Only an opacity below 1.0 makes the window translucent.
+    let opacity = config
+        .window_opacity
+        .or(theme.opacity)
+        .filter(|o| *o < 1.0);
+    let blur = config.window_blur.unwrap_or(theme.blur);
     // Force the native macOS chrome (traffic lights, system menus, scrollbars)
     // into the theme's own light/dark mode regardless of the OS setting.
     sync_native_appearance(theme.dark);
     let m = theme.neutrals();
     let active = theme.active_palette();
-    let opacity = theme.opacity.filter(|o| *o < 1.0);
 
-    // Window opacity / blur: only a theme that opts in makes the window
-    // translucent; opaque themes leave the window fully opaque (the default).
+    // Never `Opaque`: on macOS 26 (Tahoe) flipping a window's opacity after
+    // creation doesn't reach the compositor — the window keeps compositing
+    // against black (verified empirically; the framebuffer alpha was correct
+    // but a red window behind never bled through). So the window is created
+    // non-opaque (see `background_appearance`, used by `main.rs`) and stays
+    // that way; a fully opaque theme simply paints alpha-1.0 content, which is
+    // visually identical. Only the Transparent↔Blurred flip happens here at
+    // runtime (it adds/removes an NSVisualEffectView, which does work live).
     if let Some(window) = window.as_deref_mut() {
-        let bg_appearance = if theme.blur {
+        let bg_appearance = if blur {
             WindowBackgroundAppearance::Blurred
-        } else if opacity.is_some() {
-            WindowBackgroundAppearance::Transparent
         } else {
-            WindowBackgroundAppearance::Opaque
+            WindowBackgroundAppearance::Transparent
         };
         window.set_background_appearance(bg_appearance);
     }
@@ -95,6 +148,15 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     Theme::change(mode, window.as_deref_mut(), cx);
     // Publish the terminal palette before borrowing the theme mutably.
     cx.set_global(active);
+    // Publish the render-facing background (fill/opacity/image) for the root
+    // view, which paints gradients and the background image for real —
+    // gpui-component's `Theme.background` below only carries the representative
+    // solid.
+    cx.set_global(presets::ActiveBackground {
+        fill: theme.background.clone(),
+        opacity,
+        image: theme.image.clone(),
+    });
 
     let t = Theme::global_mut(cx);
     // The window base carries the theme's opacity so a translucent/blurred theme

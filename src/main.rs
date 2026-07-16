@@ -15,7 +15,7 @@ use crate::ui::app::Tty7App;
 use crate::ui::assets::Assets;
 use crate::ui::keymap;
 use gpui::*;
-use gpui_component::{ActiveTheme as _, Root, TitleBar};
+use gpui_component::{Root, TitleBar};
 
 /// Register the bundled Hack monospace faces with gpui's text system so the
 /// default `font_family` ("Hack") renders identically on every machine, with no
@@ -380,6 +380,8 @@ fn main() {
                         WindowBounds::Fullscreen(bounds)
                     }
                 };
+                let window_background =
+                    cx.update(|cx| crate::ui::theme::background_appearance(cx));
                 let options = WindowOptions {
                     window_bounds: Some(window_bounds),
                     // Start from the component defaults but nudge the traffic lights
@@ -390,12 +392,21 @@ fn main() {
                         traffic_light_position: Some(crate::ui::theme::traffic_light_position()),
                         ..TitleBar::title_bar_options()
                     }),
+                    // Non-opaque from creation: macOS 26 ignores a runtime flip to
+                    // transparent, so the opacity slider only works on a window
+                    // born this way (see `theme::background_appearance`).
+                    window_background,
                     ..Default::default()
                 };
 
                 cx.open_window(options, |window, cx| {
                     let app = cx.new(|cx| Tty7App::new(window, cx));
-                    cx.new(|cx| Root::new(app, window, cx).bg(cx.theme().background))
+                    // Root's own background is fully transparent: `Tty7App`'s root
+                    // div is the single owner of the window background (solid /
+                    // gradient / image, with the theme's alpha). A second paint
+                    // here would compound the alpha and read darker than the
+                    // configured opacity.
+                    cx.new(|cx| Root::new(app, window, cx).bg(gpui::transparent_black()))
                 })
                 .expect("failed to open window");
             })
