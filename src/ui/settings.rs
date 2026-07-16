@@ -814,9 +814,11 @@ impl Tty7App {
                     div()
                         .px_10()
                         .py_8()
-                        // Fill the pane edge-to-edge; cap only on very wide windows so
-                        // rows never stretch to an unreadable width.
-                        .child(div().w_full().max_w(px(860.)).child(content)),
+                        // Cap the column tight enough (640px) that a row's
+                        // right-aligned control stays visually paired with its
+                        // label — the cap is what makes `settings_row`'s
+                        // space-between layout safe.
+                        .child(div().w_full().max_w(px(640.)).child(content)),
                 )
         };
 
@@ -939,10 +941,15 @@ impl Tty7App {
     }
 
     /// One labelled settings row, shared by every section: title + description
-    /// in a fixed-width left column, control immediately beside it. A fixed
-    /// column (not space-between) keeps label and control visually paired
-    /// regardless of window width — space-between on a wide pane stretched the
-    /// two apart into a dead gap.
+    /// on the left, control right-aligned. Space-between is safe here only
+    /// because both hosting columns are capped — the main content column at
+    /// 640px and the SSH detail pane at 720px — so the two never stretch apart
+    /// into a dead gap the way they did on an uncapped pane; widen either cap
+    /// and every row inside it stretches with it. A soft full-row
+    /// hover fill makes each row read as one scannable unit — the same quiet
+    /// highlight the sidebar and menus use; negative side margins let that fill
+    /// bleed past the text edge while labels stay aligned with the section
+    /// headers above.
     pub(crate) fn settings_row(
         &self,
         label: impl Into<String>,
@@ -951,15 +958,20 @@ impl Tty7App {
         cx: &Context<Self>,
     ) -> Div {
         let theme = cx.theme();
+        let desc = desc.into();
         h_flex()
             .items_center()
+            .justify_between()
             .gap_8()
             .py_2()
+            .px_2p5()
+            .mx_neg_2p5()
+            .rounded_lg()
+            .hover(|h| h.bg(theme.secondary.opacity(0.2)))
             .child(
                 v_flex()
                     .gap_0p5()
-                    .w(px(260.))
-                    .flex_shrink_0()
+                    .min_w_0()
                     .child(
                         div()
                             .text_sm()
@@ -967,14 +979,18 @@ impl Tty7App {
                             .text_color(theme.foreground)
                             .child(label.into()),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(desc.into()),
-                    ),
+                    // Rows without a description (the theme color editor) stay
+                    // single-line instead of carrying an empty text child.
+                    .when(!desc.is_empty(), |col| {
+                        col.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(desc),
+                        )
+                    }),
             )
-            .child(control)
+            .child(h_flex().flex_shrink_0().child(control))
     }
 
     /// A segmented control (gpui-component's `ButtonGroup`, outline) for a small
@@ -1056,13 +1072,14 @@ impl Tty7App {
         let control_h = px(24.);
         // The −│value│+ pill plus its quiet Reset — one shape shared by the
         // font-size and line-height rows; callers hand in the wired buttons.
+        // Reset sits *before* the pill: with controls right-aligned, the pill
+        // holds the row's hard right edge and the quiet action tucks inboard.
         let stepper_row =
             move |dec: Stateful<Div>, value: String, inc: Stateful<Div>, reset: Button| {
                 h_flex()
                     .items_center()
-                    .justify_start()
-                    .w(px(240.))
                     .gap_3()
+                    .child(reset)
                     .child(
                         h_flex()
                             .items_center()
@@ -1088,7 +1105,6 @@ impl Tty7App {
                             )
                             .child(inc),
                     )
-                    .child(reset)
                     .into_any_element()
             };
         let font_size_control = stepper_row(
@@ -1123,21 +1139,16 @@ impl Tty7App {
 
         // One font dropdown, shared shape for primary / bold / italic pickers.
         let font_dropdown = |state: &Entity<SelectState<SearchableVec<String>>>| {
-            h_flex()
-                .justify_start()
-                .w(px(240.))
-                .child(
-                    Select::new(state)
-                        .small()
-                        .w(px(180.))
-                        .h(control_h)
-                        .search_placeholder("Search fonts…")
-                        // Cap the popup's own height so browsing doesn't dump the
-                        // OS's entire font catalog on screen at once — it just
-                        // scrolls from here. Every font is still in the list and
-                        // reachable by typing; this only trims what's shown.
-                        .menu_max_h(px(224.)),
-                )
+            Select::new(state)
+                .small()
+                .w(px(180.))
+                .h(control_h)
+                .search_placeholder("Search fonts…")
+                // Cap the popup's own height so browsing doesn't dump the
+                // OS's entire font catalog on screen at once — it just
+                // scrolls from here. Every font is still in the list and
+                // reachable by typing; this only trims what's shown.
+                .menu_max_h(px(224.))
                 .into_any_element()
         };
         let font_family_control = font_dropdown(&font_select);
@@ -1469,11 +1480,7 @@ impl Tty7App {
         state: Entity<ColorPickerState>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let control = h_flex()
-            .items_center()
-            .w(px(240.))
-            .child(ColorPicker::new(&state).small())
-            .into_any_element();
+        let control = ColorPicker::new(&state).small().into_any_element();
         self.settings_row(label, "", control, cx)
     }
 
@@ -2201,16 +2208,23 @@ impl Tty7App {
             .child(self.settings_row(
                 "Name",
                 "A label for this connection.",
-                Input::new(&form.name).small().into_any_element(),
+                // Explicit widths on every text control: `settings_row` right-aligns
+                // the control in a shrink-to-fit slot, so a bare Input has no
+                // definite width to fill. 260px matches the Shell section's inputs.
+                div()
+                    .w(px(260.))
+                    .child(Input::new(&form.name).small())
+                    .into_any_element(),
                 cx,
             ))
             .child(
                 self.settings_row(
                     "Host",
                     "Hostname or IP address.",
+                    // Host + port split the shared 260px control width.
                     h_flex()
                         .gap_2()
-                        .child(Input::new(&form.host).small())
+                        .child(div().w(px(172.)).child(Input::new(&form.host).small()))
                         .child(div().w(px(80.)).child(Input::new(&form.port).small()))
                         .into_any_element(),
                     cx,
@@ -2219,7 +2233,10 @@ impl Tty7App {
             .child(self.settings_row(
                 "User",
                 "Login user (blank = resolve at connect).",
-                Input::new(&form.user).small().into_any_element(),
+                div()
+                    .w(px(260.))
+                    .child(Input::new(&form.user).small())
+                    .into_any_element(),
                 cx,
             ))
             .child(self.settings_row(
@@ -2319,7 +2336,10 @@ impl Tty7App {
             section = section.child(self.settings_row(
                 "Jump host",
                 "Name of another profile to tunnel through (blank = direct).",
-                Input::new(&form.jump).small().into_any_element(),
+                div()
+                    .w(px(260.))
+                    .child(Input::new(&form.jump).small())
+                    .into_any_element(),
                 cx,
             ));
         }
@@ -2390,7 +2410,12 @@ impl Tty7App {
             this.settings_row(
                 label.to_string(),
                 desc.to_string(),
-                Input::new(input).small().into_any_element(),
+                // Same explicit control width as the core fields above — a bare
+                // Input has nothing to fill in the row's right-aligned slot.
+                div()
+                    .w(px(260.))
+                    .child(Input::new(input).small())
+                    .into_any_element(),
                 cx,
             )
         };
@@ -3222,7 +3247,8 @@ impl Tty7App {
     }
 
     /// The compact "Current theme" card on the Appearance page: a preview of the
-    /// active theme beside its name and light/dark mode, the whole row a click
+    /// active theme beside its kind (built-in vs custom) and light/dark mode,
+    /// its name, and its six chromatic ANSI swatches; the whole row a click
     /// target that opens the picker panel on the right.
     fn render_current_theme(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
@@ -3236,6 +3262,23 @@ impl Tty7App {
         let active = presets::by_id(cx, &active_id);
         let name = active.name.clone();
         let mode = if active.dark { "Dark" } else { "Light" };
+        // A user file (duplicated or dropped in the themes folder) vs a built-in.
+        let kind = if active.path.is_some() {
+            "Custom"
+        } else {
+            "Built-in"
+        };
+        // The six chromatic ANSI slots (red…cyan) as tiny swatches — the part of
+        // a theme the mini preview's few bars can't show, and what actually
+        // distinguishes two same-background themes at a glance.
+        let to_u32 = |(r, g, b): (u8, u8, u8)| (r as u32) << 16 | (g as u32) << 8 | b as u32;
+        let swatches = h_flex().gap_1().mt_1p5().children((1..=6).map(|i| {
+            div()
+                .w(px(10.))
+                .h(px(10.))
+                .rounded(px(3.))
+                .bg(rgb(to_u32(active.ansi16[i])))
+        }));
         let preview = self.theme_preview(&active);
         let open = self.active_settings().is_some_and(|s| s.theme_panel_open);
 
@@ -3243,7 +3286,7 @@ impl Tty7App {
             .id("current-theme")
             .mt_1()
             .mb_2()
-            .max_w(px(520.))
+            .w_full()
             .cursor_pointer()
             .on_click(cx.listener(|this, _, _w, cx| this.toggle_theme_panel(cx)))
             .child(
@@ -3266,12 +3309,18 @@ impl Tty7App {
                             .gap_0p5()
                             .child(
                                 div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(format!("{kind} · {mode}")),
+                            )
+                            .child(
+                                div()
                                     .text_sm()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(foreground)
                                     .child(name),
                             )
-                            .child(div().text_xs().text_color(muted_fg).child(mode)),
+                            .child(swatches),
                     )
                     .child(div().flex_1())
                     .child(
