@@ -282,6 +282,9 @@ pub struct Tty7App {
     pub(crate) closed: Vec<SessionTab>,
     /// `Some` while a tab label is being renamed inline; `None` otherwise.
     pub(crate) renaming: Option<Renaming>,
+    /// `Some` while the "New Worktree Tab" sheet is open (see
+    /// `ui::worktree_prompt`); `None` otherwise.
+    pub(crate) worktree_prompt: Option<crate::ui::worktree_prompt::WorktreePrompt>,
     /// When `Some`, the active tab renders only this one leaf full-window
     /// (Cmd+Shift+Enter maximize). Cleared on any structural / navigation change.
     maximized: Option<Entity<TerminalView>>,
@@ -529,6 +532,7 @@ impl Tty7App {
             palette_sub: None,
             closed: Vec::new(),
             renaming: None,
+            worktree_prompt: None,
             maximized: None,
             mod_hint_badges: false,
             mod_hint_gen: 0,
@@ -1922,6 +1926,10 @@ impl Tty7App {
         // A rename in progress stores a fixed tab index; removing a tab shifts
         // indices and would let the pending edit commit onto the wrong tab. Drop it.
         self.renaming = None;
+        // Capture the tab's cwd *before* its panes are killed (the daemon can't
+        // report it afterwards): if it sat in a tty7-managed worktree, the
+        // cleanup offer below needs it.
+        let worktree_cwd = self.tab_cwd(index, window, cx);
         // Snapshot the tab (layout + each pane's current cwd + name) onto the
         // recently-closed stack so Cmd+Shift+T can bring it back.
         let snapshot = tab_to_session(&self.tabs[index], cx);
@@ -1947,6 +1955,187 @@ impl Tty7App {
         } else if index < self.active {
             self.active -= 1;
         }
+        self.focus_active(window, cx);
+        self.save_session(cx);
+        cx.notify();
+        // The tab is gone; if it lived in a tty7-managed worktree, offer to
+        // clean the checkout up rather than letting them pile up silently.
+        self.offer_worktree_cleanup(worktree_cwd, cx);
+    }
+
+    /// After closing a tab that sat in a tty7-managed worktree (see
+    /// [`crate::core::worktree::managed`]), offer to remove the checkout: a
+    /// clean worktree gets a plain keep/remove prompt; one with uncommitted
+    /// changes defaults to keeping and makes discarding explicit. Removal also
+    /// deletes the branch when it carries no unmerged commits (`branch -d`).
+    /// No offer while any surviving pane still has its cwd inside the checkout
+    /// (new tabs inherit the current cwd, so shared worktrees are common) —
+    /// removal would yank the directory out from under a live shell.
+    /// Detection, the dirty probe, and removal all run off the UI thread.
+    fn offer_worktree_cleanup(&mut self, cwd: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
+        let Some(cwd) = cwd else { return };
+        // Every leaf of every surviving tab, not just focused panes — a shell
+        // tucked away in a split occupies the worktree all the same.
+        let open_cwds: Vec<std::path::PathBuf> = self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.pane.leaves())
+            .filter_map(|leaf| leaf.read(cx).cwd())
+            .collect();
+        cx.spawn(async move |this, cx| {
+            let Some(wt) = cx
+                .background_spawn(async move {
+                    crate::core::worktree::managed(&cwd)
+                        .filter(|wt| !crate::core::worktree::occupied(&wt.path, &open_cwds))
+                })
+                .await
+            else {
+                return;
+            };
+            let detail = if wt.dirty {
+                format!(
+                    "The closed tab's worktree at {} has uncommitted changes.",
+                    wt.path.display()
+                )
+            } else {
+                format!(
+                    "The closed tab's worktree at {} is clean.",
+                    wt.path.display()
+                )
+            };
+            let title = format!("Remove worktree \"{}\"?", wt.branch);
+            let level = if wt.dirty {
+                PromptLevel::Warning
+            } else {
+                PromptLevel::Info
+            };
+            let remove_label = if wt.dirty {
+                "Discard Changes & Remove"
+            } else {
+                "Remove Worktree"
+            };
+            let Ok(answer) = this.update_in(cx, |_, window, cx| {
+                window.prompt(level, &title, Some(&detail), &["Keep", remove_label], cx)
+            }) else {
+                return;
+            };
+            if !matches!(answer.await, Ok(1)) {
+                return;
+            }
+            let force = wt.dirty;
+            let branch = wt.branch.clone();
+            let result = cx
+                .background_spawn(async move { crate::core::worktree::remove(&wt, force) })
+                .await;
+            let _ = this.update_in(cx, |_, window, cx| match result {
+                Ok(()) => window.push_notification(format!("Removed worktree \"{branch}\""), cx),
+                Err(e) => window.push_notification(format!("Worktree removal failed: {e}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Close every tab except `index` ("Close Other Tabs"). Iterates from the
+    /// end so removals never shift an index still to visit. Tabs holding a live
+    /// warn-on-close SSH session are skipped outright — the per-tab confirm
+    /// sheet is keyed by index, which a bulk close would immediately
+    /// invalidate — so they simply survive the sweep.
+    pub(crate) fn close_other_tabs(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        for i in (0..self.tabs.len()).rev() {
+            if i == index || self.tab_has_warn_ssh(i, cx) {
+                continue;
+            }
+            self.close_tab(i, window, cx);
+        }
+    }
+
+    /// Close every tab after `index` ("Close Tabs to the Right" / "Close Tabs
+    /// Below" in the sidebar). Same end-first iteration and warn-SSH skip as
+    /// [`close_other_tabs`](Self::close_other_tabs).
+    pub(crate) fn close_tabs_right_of(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for i in ((index + 1)..self.tabs.len()).rev() {
+            if self.tab_has_warn_ssh(i, cx) {
+                continue;
+            }
+            self.close_tab(i, window, cx);
+        }
+    }
+
+    /// The cwd of the tab's label-driving terminal (focused leaf, else first) —
+    /// what the tab context menu's "Copy Working Directory" copies and "New
+    /// Worktree Tab" derives the repo from.
+    pub(crate) fn tab_cwd(
+        &self,
+        index: usize,
+        window: &Window,
+        cx: &App,
+    ) -> Option<std::path::PathBuf> {
+        self.tabs
+            .get(index)?
+            .pane
+            .focused_or_first(window, cx)
+            .and_then(|leaf| leaf.read(cx).cwd())
+    }
+
+    /// "New Worktree Tab": probe the repository containing the tab's cwd for
+    /// defaults (a fresh generated name, the current branch as start point) on
+    /// the background executor, then open the confirmation sheet
+    /// (`ui::worktree_prompt`) where name/branch/base can be edited before
+    /// anything is created. Failure to probe lands as a notification.
+    pub(crate) fn new_worktree_tab(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cwd) = self.tab_cwd(index, window, cx) else {
+            window.push_notification("This tab has no working directory yet", cx);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let probe_cwd = cwd.clone();
+            let result = cx
+                .background_spawn(async move { crate::core::worktree::defaults(&probe_cwd) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(defaults) => this.open_worktree_prompt(cwd, defaults, window, cx),
+                Err(e) => window.push_notification(format!("New worktree failed: {e}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Open the tab for a just-created worktree: a default-shell terminal in
+    /// the worktree directory, with the tab pre-named after its branch so a
+    /// strip of parallel worktrees stays tellable-apart. Mirrors
+    /// `new_tab_with_shell`, minus the cwd inheritance (the cwd *is* the point).
+    pub(crate) fn open_worktree_tab(
+        &mut self,
+        wt: crate::core::worktree::NewWorktree,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = new_terminal(self.font_size, Some(wt.path), None, None, window, cx);
+        self.remember_active_pane(window, cx);
+        self.maximized = None;
+        let insert_at = self.new_tab_insert_at(cx);
+        let mut tab = Tab::new(Pane::leaf(view));
+        tab.name = Some(wt.branch);
+        self.tabs.insert(insert_at, tab);
+        self.active = insert_at;
         self.focus_active(window, cx);
         self.save_session(cx);
         cx.notify();
@@ -3449,6 +3638,10 @@ impl Render for Tty7App {
             .when_some(self.render_ssh_close_confirm_overlay(cx), |this, el| {
                 this.child(el)
             })
+            // "New Worktree Tab" confirmation sheet (from the tab context menu).
+            .when_some(self.render_worktree_prompt_overlay(cx), |this, el| {
+                this.child(el)
+            })
             // Working-tree diff overlay (clicked from a sidebar git line) —
             // last child, so it paints over every pane-contextual element
             // above. It covers only the body: the sidebar stays interactive.
@@ -3642,6 +3835,10 @@ impl Render for Tty7App {
             .when_some(settings_overlay, |this, overlay| this.child(overlay))
             // Command palette overlay, layered above everything when open.
             .when_some(self.palette.clone(), |this, palette| this.child(palette))
+            // Toast layer for `window.push_notification` (worktree/SSH errors).
+            // gpui-component's Root only *stores* the list; the root view must
+            // render the layer — without this child every toast was invisible.
+            .children(gpui_component::Root::render_notification_layer(window, cx))
     }
 }
 

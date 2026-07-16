@@ -5,12 +5,12 @@
 //! orchestration rather than chrome rendering.
 
 use gpui::{
-    App, Context, FontWeight, MouseButton, MouseDownEvent, SharedString, Window, div, prelude::*,
-    px,
+    App, Axis, Context, FontWeight, MouseButton, MouseDownEvent, SharedString, Window, div,
+    prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex};
 
 use crate::core::actions::{OpenSettings, TogglePalette};
@@ -377,6 +377,128 @@ impl Tty7App {
         })
     }
 
+    /// Build the per-tab right-click menu, shared by the strip's chips and the
+    /// sidebar's rows (which passes `below_wording` so the trailing close reads
+    /// "Close Tabs Below" in the vertical list). Live state — tab count, the
+    /// tab's cwd — is read at open time through the weak `app` handle, so the
+    /// render loop never pays a per-frame cwd syscall and the enablement can't
+    /// go stale between render and click.
+    pub(crate) fn tab_context_menu(
+        menu: PopupMenu,
+        index: usize,
+        below_wording: bool,
+        app: &gpui::WeakEntity<Self>,
+        window: &Window,
+        cx: &App,
+    ) -> PopupMenu {
+        let Some(entity) = app.upgrade() else {
+            return menu;
+        };
+        let this = entity.read(cx);
+        let tab_count = this.tabs.len();
+        let cwd = this.tab_cwd(index, window, cx);
+        let has_cwd = cwd.is_some();
+        let mut menu = menu.min_w(px(200.));
+
+        // Rename — the same inline edit a label double-click starts, given a
+        // discoverable entry point.
+        menu = menu.item(PopupMenuItem::new("Rename Tab").on_click({
+            let app = app.clone();
+            move |_, window, cx| {
+                let _ = app.update(cx, |this, cx| this.start_rename(index, window, cx));
+            }
+        }));
+
+        // Worktree: an isolated checkout of this tab's repo on a fresh branch,
+        // opened as a new tab — parallel-agent fuel. Only offered when the
+        // tab's cwd actually sits in a git repository (a filesystem-only
+        // probe, cheap enough at open time); outside one the entry would be
+        // pure noise.
+        let in_repo = cwd
+            .as_deref()
+            .is_some_and(crate::core::worktree::is_inside_repo);
+        if in_repo {
+            menu = menu
+                .separator()
+                .item(PopupMenuItem::new("New Worktree Tab").on_click({
+                    let app = app.clone();
+                    move |_, window, cx| {
+                        let _ = app.update(cx, |this, cx| this.new_worktree_tab(index, window, cx));
+                    }
+                }));
+        }
+
+        // Splits act on the right-clicked tab: activate it first (a no-op when
+        // it already is), then split its focused pane — one code path with the
+        // keyboard actions.
+        menu = menu
+            .separator()
+            .item(PopupMenuItem::new("Split Right").on_click({
+                let app = app.clone();
+                move |_, window, cx| {
+                    let _ = app.update(cx, |this, cx| {
+                        this.activate(index, window, cx);
+                        this.split(Axis::Horizontal, window, cx);
+                    });
+                }
+            }))
+            .item(PopupMenuItem::new("Split Down").on_click({
+                let app = app.clone();
+                move |_, window, cx| {
+                    let _ = app.update(cx, |this, cx| {
+                        this.activate(index, window, cx);
+                        this.split(Axis::Vertical, window, cx);
+                    });
+                }
+            }));
+
+        menu = menu.separator().item(
+            PopupMenuItem::new("Copy Working Directory")
+                .disabled(!has_cwd)
+                .on_click(move |_, _window, cx| {
+                    if let Some(cwd) = cwd.as_ref() {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                            cwd.display().to_string(),
+                        ));
+                    }
+                }),
+        );
+
+        menu.separator()
+            .item(PopupMenuItem::new("Close Tab").on_click({
+                let app = app.clone();
+                move |_, window, cx| {
+                    let _ = app.update(cx, |this, cx| this.close_tab(index, window, cx));
+                }
+            }))
+            .item(
+                PopupMenuItem::new("Close Other Tabs")
+                    .disabled(tab_count <= 1)
+                    .on_click({
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            let _ =
+                                app.update(cx, |this, cx| this.close_other_tabs(index, window, cx));
+                        }
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(if below_wording {
+                    "Close Tabs Below"
+                } else {
+                    "Close Tabs to the Right"
+                })
+                .disabled(index + 1 >= tab_count)
+                .on_click({
+                    let app = app.clone();
+                    move |_, window, cx| {
+                        let _ =
+                            app.update(cx, |this, cx| this.close_tabs_right_of(index, window, cx));
+                    }
+                }),
+            )
+    }
+
     /// The horizontal tab strip rendered into the title bar. `show_chips` draws
     /// the per-tab chip row; passing `false` (the vertical-sidebar mode, where
     /// the sidebar owns the tab list) keeps only the "+" and "⋯" chrome so the
@@ -639,7 +761,12 @@ impl Tty7App {
                         .into_any_element()
                 });
 
-            chips = chips.child(chip);
+            // Per-tab right-click menu (rename / worktree / split / copy cwd /
+            // close group) — the same builder the sidebar rows use.
+            let menu_app = cx.entity().downgrade();
+            chips = chips.child(chip.context_menu(move |menu, window, cx| {
+                Self::tab_context_menu(menu, i, false, &menu_app, window, cx)
+            }));
         }
 
         // "+" new-tab button — click opens the shell picker. The default shell
