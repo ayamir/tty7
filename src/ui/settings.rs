@@ -15,6 +15,7 @@ use gpui_component::Selectable as _;
 use gpui_component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_component::color_picker::{ColorPicker, ColorPickerState};
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::link::Link;
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::select::{SearchableVec, Select, SelectState};
 use gpui_component::sidebar::{Sidebar, SidebarCollapsible, SidebarMenu, SidebarMenuItem};
@@ -97,27 +98,27 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: Appearance,
-            title: "Font Family",
+            title: "Font family",
             keywords: "typeface monospace typography",
         },
         SearchEntry {
             section: Appearance,
-            title: "Font Size",
+            title: "Font size",
             keywords: "typography text bigger smaller zoom",
         },
         SearchEntry {
             section: Appearance,
-            title: "Line Height",
+            title: "Line height",
             keywords: "typography leading spacing",
         },
         SearchEntry {
             section: Appearance,
-            title: "Bold Font",
+            title: "Bold font",
             keywords: "typeface weight",
         },
         SearchEntry {
             section: Appearance,
-            title: "Italic Font",
+            title: "Italic font",
             keywords: "typeface oblique",
         },
         SearchEntry {
@@ -132,7 +133,7 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: Appearance,
-            title: "Blink cursor",
+            title: "Cursor blink",
             keywords: "caret blinking flash",
         },
         SearchEntry {
@@ -213,11 +214,16 @@ fn settings_search_entries() -> &'static [SearchEntry] {
             title: "Verify host keys",
             keywords: "ssh security known_hosts fingerprint mitm host key verification",
         },
+        SearchEntry {
+            section: Ssh,
+            title: "Warn before closing",
+            keywords: "ssh confirm close tab pane live session security",
+        },
         // Agents
         SearchEntry {
             section: Agents,
             title: "Claude Code hooks",
-            keywords: "agent integration install uninstall status rich session working waiting sidebar badge claude",
+            keywords: "agent integration install uninstall status rich session working waiting tab bar sidebar badge claude",
         },
         SearchEntry {
             section: Agents,
@@ -247,7 +253,7 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: WindowTabs,
-            title: "Remember window size",
+            title: "Remember window size & position",
             keywords: "window size position bounds geometry launch startup remember",
         },
         SearchEntry {
@@ -1171,31 +1177,31 @@ impl Tty7App {
             .child(self.section_rule(cx))
             .child(self.section_header("Typography", cx))
             .child(self.settings_row(
-                "Font Size",
+                "Font size",
                 "Terminal text size in pixels.",
                 font_size_control,
                 cx,
             ))
             .child(self.settings_row(
-                "Line Height",
+                "Line height",
                 "Row spacing as a multiple of the font size.",
                 line_height_control,
                 cx,
             ))
             .child(self.settings_row(
-                "Font Family",
+                "Font family",
                 "Pick from fonts installed on your system.",
                 font_family_control,
                 cx,
             ))
             .child(self.settings_row(
-                "Bold Font",
+                "Bold font",
                 "Face for bold text; Default synthesizes it from the primary.",
                 font_bold_control,
                 cx,
             ))
             .child(self.settings_row(
-                "Italic Font",
+                "Italic font",
                 "Face for italic text; Default synthesizes it from the primary.",
                 font_italic_control,
                 cx,
@@ -1215,7 +1221,7 @@ impl Tty7App {
                 cx,
             ))
             .child(self.settings_row(
-                "Blink cursor",
+                "Cursor blink",
                 "Pulse the cursor while the terminal is focused.",
                 blink_switch,
                 cx,
@@ -1230,7 +1236,7 @@ impl Tty7App {
         let editor = self.active_settings().and_then(|s| s.theme_editor.as_ref());
 
         let folder_button = Button::new("open-themes-folder")
-            .label("Open Themes Folder")
+            .label("Open themes folder")
             .small()
             .on_click(cx.listener(|this, _, _w, cx| this.open_themes_folder(cx)));
 
@@ -1283,9 +1289,9 @@ impl Tty7App {
                     .child(
                         // Plain (not `.primary()`): a solid near-black fill reads
                         // far too heavy against this soft, mostly-outline sheet —
-                        // it matches the "Open Themes Folder" button beside it.
+                        // it matches the "Open themes folder" button beside it.
                         Button::new("duplicate-theme")
-                            .label("Duplicate to Edit")
+                            .label("Duplicate to edit")
                             .small()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.fork_active_theme(window, cx)
@@ -1320,9 +1326,9 @@ impl Tty7App {
     /// A two-column master-detail (like the theme picker): the **left** column is
     /// a fixed-width, self-scrolling master — Import / Add on top, then the profile
     /// list; the **right** column is the flex-1, self-scrolling detail pane showing
-    /// the selected profile's edit form, or — with nothing selected — an empty
-    /// state carrying the "pick a profile" hint and the two global security
-    /// toggles. Selection is tracked in [`SettingsState::ssh_detail`].
+    /// the selected profile's edit form (or a "pick a profile" hint) with the
+    /// global security defaults always below. Selection is tracked in
+    /// [`SettingsState::ssh_detail`].
     fn render_settings_ssh(&self, cx: &mut Context<Self>) -> AnyElement {
         let border = cx.theme().border;
         h_flex()
@@ -1513,36 +1519,36 @@ impl Tty7App {
     }
 
     /// The right (detail) pane: a selected profile's edit form, or — with nothing
-    /// selected — the empty state (a "pick a profile" hint plus the two global
-    /// security toggles).
+    /// selected — a "pick a profile" hint. The global security defaults render
+    /// below either state: tucked into the empty state alone they vanished the
+    /// moment a profile was selected, so they were easy to never discover.
     fn render_ssh_detail(&self, cx: &mut Context<Self>) -> AnyElement {
         let detail = self
             .active_settings()
             .map(|s| s.ssh_detail)
             .unwrap_or(SshDetail::None);
-        match detail {
+        let body: AnyElement = match detail {
             SshDetail::Profile(_)
                 if self.active_settings().is_some_and(|s| s.ssh_form.is_some()) =>
             {
                 self.render_ssh_profile_form(cx)
             }
-            // No selection (or a stale profile whose form is gone): the empty-state
-            // hint, then the global security toggles below it.
-            _ => v_flex()
-                .gap_6()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Select a profile to edit, or add a new one."),
-                )
-                .child(self.render_ssh_security_block(cx))
+            // No selection (or a stale profile whose form is gone).
+            _ => div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("Select a profile to edit, or add a new one.")
                 .into_any_element(),
-        }
+        };
+        v_flex()
+            .child(body)
+            .child(self.section_rule(cx))
+            .child(self.render_ssh_security_block(cx))
+            .into_any_element()
     }
 
     /// Build the per-profile overflow menu shared by the hover ⋯ dropdown and the
-    /// row's right-click context menu: Connect, Copy, Duplicate, then the
+    /// row's right-click context menu: Connect, Copy address, Duplicate, then the
     /// destructive Delete — rendered last, set apart by a separator and drawn in
     /// danger red. Each item drives the same `Tty7App` handler the old inline
     /// buttons did, via the weak `app` handle.
@@ -1563,7 +1569,7 @@ impl Tty7App {
                     });
                 }
             }))
-            .item(PopupMenuItem::new("Copy").on_click({
+            .item(PopupMenuItem::new("Copy address").on_click({
                 let app = app.clone();
                 move |_, _window, cx| {
                     let _ = app.update(cx, |this, cx| this.copy_profile_connect_string(id, cx));
@@ -1602,7 +1608,8 @@ impl Tty7App {
     }
 
     /// Security block: the global host-key verification default and warn-on-close
-    /// toggle (both overridable per profile).
+    /// toggle (both overridable per profile). Always visible in the detail pane,
+    /// under the form or the empty-state hint.
     fn render_ssh_security_block(&self, cx: &mut Context<Self>) -> AnyElement {
         let verify = cx.global::<Config>().verify_host_keys;
         let verify_switch = Switch::new("ssh-verify-host-keys")
@@ -1617,19 +1624,23 @@ impl Tty7App {
             .into_any_element();
 
         v_flex()
-            .child(self.section_header("Security", cx))
+            .child(self.section_intro(
+                "Security defaults",
+                "Apply to every profile; a profile can override each one under Advanced.",
+                cx,
+            ))
             .child(self.settings_row(
                 "Verify host keys",
                 "Check each server's key against known_hosts and confirm unknown or \
-                 changed keys. A profile can override this. Turning it off disables \
-                 host-key checking for the native SSH path.",
+                 changed keys before connecting. Off connects without checking, so a \
+                 spoofed server would go unnoticed.",
                 verify_switch,
                 cx,
             ))
             .child(self.settings_row(
                 "Warn before closing",
                 "Ask for confirmation before closing a tab or pane with a live SSH \
-                 session. A profile can override this.",
+                 session.",
                 warn_switch,
                 cx,
             ))
@@ -2400,7 +2411,7 @@ impl Tty7App {
                 cx,
             ))
             .child(self.settings_row(
-                "Warn on close",
+                "Warn before closing",
                 "Override the global confirm-before-closing for this profile.",
                 self.segmented(
                     "ssh-form-woc",
@@ -2511,7 +2522,7 @@ impl Tty7App {
             .child(self.section_header("Working directory", cx))
             .child(self.settings_row(
                 "Start in",
-                "Inherit the launch dir, your home, or a fixed path.",
+                "What a fresh shell starts in: tty7's launch directory, your home folder, or a fixed path.",
                 wd_radio,
                 cx,
             ))
@@ -2528,7 +2539,7 @@ impl Tty7App {
                     .mt_3()
                     .text_xs()
                     .text_color(muted_fg)
-                    .child("Applies to new tabs and panes; shells already open keep running. A new tab still inherits the active pane's directory."),
+                    .child("Applies to shells with nothing to inherit — like the first tab of a window. New tabs and splits keep inheriting the active pane's directory, and shells already open keep running."),
             )
             .into_any_element()
     }
@@ -2731,7 +2742,7 @@ impl Tty7App {
             ))
             .child(self.settings_row(
                 "Report mouse to apps",
-                "Let full-screen apps (vim, tmux) handle clicks and scrolling. Off keeps the mouse local; Shift always does for one gesture.",
+                "Let full-screen apps (vim, tmux) handle clicks and scrolling; hold Shift to keep a gesture local.",
                 mouse_report_switch,
                 cx,
             ))
@@ -2809,7 +2820,7 @@ impl Tty7App {
         let mut page = v_flex().child(self.section_intro(
             "Agents",
             "Hook integrations give panes running these agents live session status \
-             (working / waiting / done) in the sidebar. Only active inside tty7.",
+             (working / waiting / done) in the tab bar. Only active inside tty7.",
             cx,
         ));
         for (i, (agent, state)) in states.into_iter().enumerate() {
@@ -2956,7 +2967,7 @@ impl Tty7App {
                 cx,
             ))
             .child(self.settings_row(
-                "Remember window size",
+                "Remember window size & position",
                 "Reopen at the size and position the window had when tty7 last quit. Off opens centered at the default size.",
                 remember_window_switch,
                 cx,
@@ -3470,8 +3481,8 @@ impl Tty7App {
 
         v_flex()
             .child(self.section_intro(
-                "Keyboard Shortcuts",
-                "Click a shortcut, then press the new keys — it saves after a brief pause. Chain keys for a sequence like Ctrl-B then X. Esc cancels; Backspace removes the last key, or resets to default. Changes apply immediately.",
+                "Keybindings",
+                "Click a shortcut, then press the new keys — it saves after a brief pause. Chain keys for a sequence like Ctrl-B then X. Esc cancels; Backspace removes the last key, or resets the shortcut to default when pressed first.",
                 cx,
             ))
             .child(preset_row)
@@ -3535,27 +3546,35 @@ impl Tty7App {
                             .child(div().text_sm().text_color(muted_fg).child(format!(
                                 "Version {}",
                                 env!("CARGO_PKG_VERSION")
-                            ))),
+                            )))
+                            .child(
+                                Link::new("about-github")
+                                    .href("https://github.com/l0ng-ai/tty7")
+                                    .text_sm()
+                                    .child("github.com/l0ng-ai/tty7"),
+                            ),
                     ),
             )
             .child(
                 v_flex()
                     .mt_5()
                     .gap_2()
+                    // Mirrors the README's positioning line and stack sub-line, so
+                    // the app and the repo describe tty7 in the same words.
                     .child(
                         div()
                             .text_sm()
                             .text_color(foreground)
-                            .child("The window closes. Your session doesn't."),
+                            .child("A terminal workbench: shells, sessions, SSH, coding agents."),
                     )
                     .child(div().text_sm().text_color(muted_fg).child(
-                        "The window is just a view — your shells run in a persistent daemon, so closing it never kills a session. GPU-rendered through gpui on Zed's alacritty_terminal core.",
+                        "Editor-grade input in every shell, sessions that survive quits and reboots without tmux, a native SSH stack with profiles and port forwarding, and live status for panes running coding agents.",
                     ))
                     .child(
                         div()
                             .text_xs()
                             .text_color(muted_fg)
-                            .child("GPU-rendered · daemon-backed · shell-aware"),
+                            .child("Pure Rust · GPU rendering on Zed's gpui · VT core from Alacritty"),
                     ),
             )
             // Updates: the startup check drops a newer version here if it found
@@ -3582,10 +3601,9 @@ impl Tty7App {
                                     format!("Version {} is available.", upd.version),
                                 ))
                                 .child(
-                                    // Match the sibling "Restart Background
-                                    // Service…" button (default style, not the
-                                    // dark `.primary()` fill) so About reads as
-                                    // one panel.
+                                    // Match the sibling "Restart daemon…" button
+                                    // (default style, not the dark `.primary()`
+                                    // fill) so About reads as one panel.
                                     Button::new("download-update")
                                         .label("Download")
                                         .small()
@@ -3596,7 +3614,7 @@ impl Tty7App {
                         )
                     })
                     .child(div().text_sm().text_color(muted_fg).child(
-                        "Check GitHub for a newer release on launch and show a download link here. tty7 never updates itself; the button opens the Releases page.",
+                        "Check GitHub for a newer release on launch and show it here. tty7 never updates itself — downloading happens on the Releases page.",
                     ))
                     .child(
                         h_flex()
@@ -3640,7 +3658,7 @@ impl Tty7App {
                     .child(
                         h_flex().child(
                             Button::new("restart-daemon")
-                                .label("Restart Daemon…")
+                                .label("Restart daemon…")
                                 .small()
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.restart_daemon(window, cx)
