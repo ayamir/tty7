@@ -169,11 +169,16 @@ pub fn managed(cwd: &Path) -> Option<ManagedWorktree> {
 /// Whether any of `cwds` still lives inside the worktree at `path` — removing
 /// the checkout then would pull the directory out from under a live shell (new
 /// tabs inherit the current cwd, so two tabs sharing one worktree is common).
-/// Each cwd is canonicalized before the ancestor test to match the physical
-/// path git reported; a vanished cwd never counts as occupying.
+/// Both sides are canonicalized before the ancestor test — cwds may arrive
+/// through symlinks, and on Windows canonicalize adds a `\\?\` verbatim prefix
+/// that git-reported paths lack, so comparing raw would never match. A
+/// vanished path never counts as occupying.
 pub fn occupied(path: &Path, cwds: &[PathBuf]) -> bool {
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
     cwds.iter()
-        .any(|c| std::fs::canonicalize(c).is_ok_and(|c| c.starts_with(path)))
+        .any(|c| std::fs::canonicalize(c).is_ok_and(|c| c.starts_with(&path)))
 }
 
 /// Remove a managed worktree (`git worktree remove`, `--force` to discard
@@ -297,6 +302,13 @@ mod tests {
         dir
     }
 
+    /// Strip Windows' `\\?\` verbatim prefix so `std::fs::canonicalize` output
+    /// compares equal to the plain absolute paths git reports; a no-op on Unix.
+    fn plain(p: &Path) -> PathBuf {
+        let s = p.to_string_lossy();
+        PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
+    }
+
     fn sh(dir: &Path, args: &[&str]) {
         assert!(
             std::process::Command::new(args[0])
@@ -363,8 +375,8 @@ mod tests {
         assert_eq!(d.base, head);
         // The target dir is the repo's own `.tty7/worktrees` (git reports the
         // canonical root: /var → /private/var on macOS).
-        let canon = std::fs::canonicalize(&repo).unwrap();
-        assert_eq!(d.dir, canon.join(".tty7").join("worktrees"));
+        let canon = plain(&std::fs::canonicalize(&repo).unwrap());
+        assert_eq!(plain(&d.dir), canon.join(".tty7").join("worktrees"));
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -375,8 +387,8 @@ mod tests {
         assert!(wt.path.join("a.txt").exists());
         assert!(branch_exists(&repo, &wt.branch));
         // The worktree lands under `<repo>/.tty7/worktrees/<name>`…
-        let canon = std::fs::canonicalize(&repo).unwrap();
-        assert_eq!(wt.path, canon.join(".tty7/worktrees/quiet-otter"));
+        let canon = plain(&std::fs::canonicalize(&repo).unwrap());
+        assert_eq!(plain(&wt.path), canon.join(".tty7/worktrees/quiet-otter"));
         // …on the new branch…
         let head = git(&wt.path, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
         assert_eq!(head, wt.branch);
