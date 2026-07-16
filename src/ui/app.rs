@@ -825,9 +825,16 @@ impl Tty7App {
                     self.activate(ix, window, cx);
                     // The reveal must actually show the pane: a sibling leaf
                     // maximized in this tab would otherwise keep the target
-                    // off-screen while we hand it keyboard focus (every other
-                    // focus-moving path clears this too).
-                    self.maximized = None;
+                    // off-screen while we hand it keyboard focus. The target
+                    // itself staying maximized is fine — it's already the
+                    // visible one.
+                    if self
+                        .maximized
+                        .as_ref()
+                        .is_some_and(|m| m.entity_id().as_u64() != leaf_id)
+                    {
+                        self.maximized = None;
+                    }
                     if let Some(leaf) = self.tabs[ix]
                         .pane
                         .leaves()
@@ -886,7 +893,7 @@ impl Tty7App {
             cx,
         );
         cx.spawn(async move |_this, cx| {
-            // Index 1 == "Shut Down"; Cancel or a dismissed prompt do nothing.
+            // Index 1 == "Quit and Stop"; Cancel or a dismissed prompt do nothing.
             if !matches!(answer.await, Ok(1)) {
                 return;
             }

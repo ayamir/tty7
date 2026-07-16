@@ -45,12 +45,7 @@ const AMBER: (u8, u8, u8) = (0xF5, 0x9E, 0x0B);
 pub(super) fn render(attention: bool) -> Option<RgbaImage> {
     let tree = usvg::Tree::from_data(GLYPH_SVG, &usvg::Options::default()).ok()?;
     let mut pixmap = tiny_skia::Pixmap::new(SIZE, SIZE)?;
-    let scale = SIZE as f32 / tree.size().width().max(tree.size().height());
-    resvg::render(
-        &tree,
-        tiny_skia::Transform::from_scale(scale, scale),
-        &mut pixmap.as_mut(),
-    );
+    resvg::render(&tree, fit_center(&tree, SIZE), &mut pixmap.as_mut());
 
     if attention {
         // macOS attention leaves template mode (color needs real RGB), so the
@@ -114,12 +109,7 @@ pub(super) fn agent_avatar(
     let tree = usvg::Tree::from_data(&svg, &usvg::Options::default()).ok()?;
     let glyph_size = (s * 0.60).round() as u32;
     let mut glyph = tiny_skia::Pixmap::new(glyph_size, glyph_size)?;
-    let scale = glyph_size as f32 / tree.size().width().max(tree.size().height());
-    resvg::render(
-        &tree,
-        tiny_skia::Transform::from_scale(scale, scale),
-        &mut glyph.as_mut(),
-    );
+    resvg::render(&tree, fit_center(&tree, glyph_size), &mut glyph.as_mut());
     recolor(&mut glyph, (0xFF, 0xFF, 0xFF));
     let offset = ((SIZE - glyph_size) / 2) as i32;
     pixmap.draw_pixmap(
@@ -164,6 +154,19 @@ pub(super) fn agent_avatar(
     }
 
     Some(pixmap)
+}
+
+/// Scale-to-fit + center transform for rendering an SVG into a square
+/// `size`×`size` bitmap — a non-square SVG would otherwise hug the top-left
+/// corner. (Both bundled icons are square today; this keeps that an
+/// aesthetic fact, not a correctness assumption.)
+fn fit_center(tree: &usvg::Tree, size: u32) -> tiny_skia::Transform {
+    let (w, h) = (tree.size().width(), tree.size().height());
+    let scale = size as f32 / w.max(h);
+    tiny_skia::Transform::from_scale(scale, scale).post_translate(
+        (size as f32 - w * scale) / 2.0,
+        (size as f32 - h * scale) / 2.0,
+    )
 }
 
 /// Un-premultiply a tiny-skia pixmap into straight RGBA (what

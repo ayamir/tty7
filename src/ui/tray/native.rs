@@ -22,8 +22,8 @@ pub(super) struct Backend {
 impl Backend {
     /// Build the status item with the calm icon and an initial (empty-state)
     /// menu; the first `update` follows immediately. `None` (creation
-    /// failure) is terminal for this enable-cycle — see `gave_up` in the
-    /// poll loop.
+    /// failure) is retried by the poll loop on a slow backoff (see
+    /// `mod.rs`).
     pub(super) async fn create(
         tx: smol::channel::Sender<TrayAction>,
         _cx: &AsyncApp,
