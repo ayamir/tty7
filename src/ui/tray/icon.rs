@@ -247,7 +247,6 @@ pub(super) fn render_argb(attention: bool) -> Option<(Vec<u8>, u32)> {
     Some((argb, img.width))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

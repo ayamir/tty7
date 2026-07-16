@@ -52,7 +52,9 @@ pub(crate) enum TrayAction {
     /// leaf, and activate the window. The id is the leaf's gpui entity id —
     /// resolved against the live tab tree at click time, so a row that
     /// outlived its pane (menu open across a close) degrades to a no-op.
-    RevealPane { leaf_id: u64 },
+    RevealPane {
+        leaf_id: u64,
+    },
     /// Set the notification policy (the same knob as Settings → Terminal).
     SetNotifyMode(NotifyMode),
     OpenSettings,
@@ -90,9 +92,7 @@ pub(crate) struct TraySnapshot {
 impl TraySnapshot {
     /// Whether any agent is blocked on the user — drives the attention icon.
     pub(crate) fn attention(&self) -> bool {
-        self.agents
-            .iter()
-            .any(|a| a.status == AgentStatus::Waiting)
+        self.agents.iter().any(|a| a.status == AgentStatus::Waiting)
     }
 
     /// Hover text: a one-line census of the agent panes ("tty7 — 1 waiting,
@@ -148,10 +148,7 @@ pub(crate) fn menu_spec(snap: &TraySnapshot) -> Vec<SpecItem> {
         checked: None,
         avatar: None,
     };
-    let mut items = vec![
-        item("show", "Show tty7".into()),
-        SpecItem::Separator,
-    ];
+    let mut items = vec![item("show", "Show tty7".into()), SpecItem::Separator];
     for a in &snap.agents {
         // The avatar (brand disc + status dot) carries the who/state visually,
         // exactly like the tab chip; the textual suffix repeats the state for
@@ -301,10 +298,11 @@ mod tests {
             ]
         );
         // No two separators in a row when the agent section is absent.
-        assert!(!empty.windows(2).any(|w| matches!(
-            w,
-            [SpecItem::Separator, SpecItem::Separator]
-        )));
+        assert!(
+            !empty
+                .windows(2)
+                .any(|w| matches!(w, [SpecItem::Separator, SpecItem::Separator]))
+        );
 
         let with_agent = menu_spec(&snapshot_with_agent(AgentStatus::Waiting));
         assert!(with_agent.iter().any(|i| matches!(
@@ -360,10 +358,7 @@ pub(crate) fn init(cx: &mut Context<Tty7App>) {
         loop {
             cx.background_executor().timer(POLL).await;
             let Ok((enabled, snap)) = this.update(cx, |app, cx| {
-                (
-                    cx.global::<Config>().show_tray_icon,
-                    app.tray_snapshot(cx),
-                )
+                (cx.global::<Config>().show_tray_icon, app.tray_snapshot(cx))
             }) else {
                 break; // app gone — backend drops with the task
             };

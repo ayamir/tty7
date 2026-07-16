@@ -5,11 +5,10 @@
 //! `TrayIcon` is `!Send` there, so the backend lives inside the foreground
 //! poll task and dropping it removes the status item.
 
-use super::{action_from_id, icon, SpecItem, TrayAction, TraySnapshot};
+use super::{SpecItem, TrayAction, TraySnapshot, action_from_id, icon};
 use gpui::AsyncApp;
 use tray_icon::menu::{
-    CheckMenuItem, IconMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem,
-    Submenu,
+    CheckMenuItem, IconMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
 };
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 

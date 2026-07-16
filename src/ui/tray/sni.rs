@@ -9,7 +9,7 @@
 //! extension) the spawn fails; the poll loop logs once and the app runs
 //! without a tray.
 
-use super::{action_from_id, icon, SpecItem, TrayAction, TraySnapshot};
+use super::{SpecItem, TrayAction, TraySnapshot, action_from_id, icon};
 use gpui::AsyncApp;
 
 pub(super) struct Backend {
