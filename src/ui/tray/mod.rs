@@ -1,10 +1,12 @@
 //! System tray / menu bar status item.
 //!
-//! The tray is the app's face outside the window: the icon flips to an
-//! attention state the moment any pane's coding agent blocks on the user
-//! (amber `Waiting`), and the menu lists every agent pane — click one to
-//! reveal it — plus window/notification/quit controls. Menu labels are
-//! English, matching the native app menus (`ui::theme::set_menus`).
+//! The tray is the app's face outside the window: on Windows/Linux the icon
+//! flips to an amber-badged attention state the moment any pane's coding
+//! agent blocks on the user (`Waiting`); on macOS the icon is a template
+//! image that stays calm in every state (legible on any bar) — agent status
+//! lives in the tooltip and menu instead. The menu lists every agent pane —
+//! click one to reveal it — plus window/notification/quit controls. Menu
+//! labels are English, matching the native app menus (`ui::theme::set_menus`).
 //!
 //! Platform split (see Cargo.toml for the why):
 //! - macOS / Windows: tauri's `tray-icon` (NSStatusItem / Shell_NotifyIcon),
@@ -90,7 +92,10 @@ pub(crate) struct TraySnapshot {
 }
 
 impl TraySnapshot {
-    /// Whether any agent is blocked on the user — drives the attention icon.
+    /// Whether any agent is blocked on the user — drives the attention badge
+    /// on Windows/Linux (the macOS icon stays calm; the tooltip and menu
+    /// carry agent status there).
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn attention(&self) -> bool {
         self.agents.iter().any(|a| a.status == AgentStatus::Waiting)
     }
@@ -266,6 +271,7 @@ mod tests {
     fn attention_follows_waiting_and_tooltip_counts() {
         assert!(snapshot_with_agent(AgentStatus::Waiting).attention());
         assert!(!snapshot_with_agent(AgentStatus::Working).attention());
+        assert!(!snapshot_with_agent(AgentStatus::Done).attention());
         assert_eq!(
             snapshot_with_agent(AgentStatus::Waiting).tooltip(),
             "tty7 — 1 waiting"
