@@ -566,8 +566,9 @@ impl Tty7App {
             .child(handle)
     }
 
-    /// Each tab's sidebar group key, in tab order: the git work-tree root of
-    /// its *first* pane's cwd, resolved through the tab's sticky
+    /// Each tab's sidebar group key, in tab order: the *repository home* of
+    /// its *first* pane's cwd (the main checkout's root — linked worktrees of
+    /// one repo share a group), resolved through the tab's sticky
     /// `sidebar_group` cell — only a landed probe answer moves a tab (see the
     /// field's doc), so an in-flight cd never reshuffles the list. The first
     /// pane rather than the focused one (which the branch line follows), so
@@ -589,7 +590,7 @@ impl Tty7App {
                     .first_leaf()
                     .and_then(|leaf| leaf.read(cx).git_status_cwd().map(|p| p.to_path_buf()));
                 if let Some(known) =
-                    cwd.and_then(|cwd| cx.global::<GitStatusCache>().known_root_for(&cwd))
+                    cwd.and_then(|cwd| cx.global::<GitStatusCache>().known_repo_for(&cwd))
                 {
                     *tab.sidebar_group.borrow_mut() = known;
                 }
