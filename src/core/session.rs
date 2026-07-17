@@ -77,7 +77,8 @@ pub struct SessionTab {
     #[serde(default)]
     pub name: Option<String>,
     pub pane: SessionPane,
-    /// The tab's last-known sidebar repo group (its work-tree root), so a
+    /// The tab's last-known sidebar repo group (its repository home — the
+    /// main checkout's root, shared by all its linked worktrees), so a
     /// restored session renders grouped immediately instead of starting flat
     /// and reshuffling as git probes land. `None` = Scratch / never resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]

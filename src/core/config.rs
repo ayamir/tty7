@@ -352,7 +352,8 @@ pub enum TabBarPosition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SidebarGrouping {
-    /// Group tabs under a header per git work-tree root, with non-repo tabs
+    /// Group tabs under a header per git repository (linked worktrees fold
+    /// into their main checkout's group), with non-repo tabs
     /// collected in a trailing "Scratch" group. Branch changes and cds inside
     /// a repo never move a tab; only changing repos does.
     #[default]
