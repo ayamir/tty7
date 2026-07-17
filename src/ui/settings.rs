@@ -94,7 +94,7 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         SearchEntry {
             section: Appearance,
             title: "Theme",
-            keywords: "appearance color colours scheme dark light palette background foreground accent",
+            keywords: "appearance color colours scheme dark light palette background foreground accent sync system os auto follow",
         },
         SearchEntry {
             section: Appearance,
@@ -360,12 +360,15 @@ pub(crate) struct SettingsState {
     /// Global window-opacity slider (Appearance's Window section). Shows the
     /// effective value; dragging sets the config override.
     pub(crate) window_opacity_slider: Entity<SliderState>,
-    /// The color editor for the active editable theme, or `None` when the active
-    /// theme is read-only (a built-in / import) or the system is being followed.
+    /// The color editor for the effective (on-screen) theme, or `None` when
+    /// that theme is read-only (a built-in / import).
     pub(crate) theme_editor: Option<ThemeEditor>,
     /// Whether the theme picker panel is open beside the content pane
-    /// (Appearance section only). Toggled from the "Current theme" card.
+    /// (Appearance section only). Toggled from the theme card(s).
     pub(crate) theme_panel_open: bool,
+    /// Which theme choice the open picker panel writes to (see [`ThemeSlot`]).
+    /// Set by the card that opened the panel.
+    pub(crate) theme_panel_slot: ThemeSlot,
     /// Live filter for the theme picker panel's list.
     pub(crate) theme_search: Entity<InputState>,
     /// `Some` while a Keybindings row is capturing a new shortcut: the action
@@ -401,6 +404,16 @@ pub(crate) struct SettingsState {
     /// error), shown under that agent's row. Replaced by the next action.
     pub(crate) agent_hooks_note: Option<(crate::core::agent_hooks::HookAgent, String)>,
     pub(crate) _subs: Vec<Subscription>,
+}
+
+/// The theme choice a picker card / the picker panel targets. `Manual` is the
+/// single `Config::theme_preset` (sync-with-system off); `Light` / `Dark` are
+/// the two follow-system slots (`Config::theme_preset_light` / `_dark`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThemeSlot {
+    Manual,
+    Light,
+    Dark,
 }
 
 /// The SSH section's right-pane selection (see [`SettingsState::ssh_detail`]).
@@ -1191,7 +1204,7 @@ impl Tty7App {
                 "Pick a color theme. Each one sets its own light or dark look.",
                 cx,
             ))
-            .child(self.render_current_theme(cx))
+            .child(self.render_theme_selection(cx))
             // Custom-theme management (duplicate / edit colors / open folder) is
             // *about* themes, so it lives with the picker rather than stranded at
             // the foot of the page after Cursor.
@@ -1266,7 +1279,7 @@ impl Tty7App {
         };
         let config = cx.global::<Config>();
         let overridden = config.window_opacity.is_some() || config.window_blur.is_some();
-        let theme = presets::by_id(cx, &config.theme_preset.clone());
+        let theme = presets::by_id(cx, &crate::ui::theme::effective_preset_id(cx));
         let opacity = Tty7App::effective_window_opacity(cx);
         let blur = cx.global::<Config>().window_blur.unwrap_or(theme.blur);
 
@@ -1349,7 +1362,7 @@ impl Tty7App {
 
             // The theme's current image, for the filename label and the
             // opacity readout (the slider owns its own thumb position).
-            let theme = presets::by_id(cx, &cx.global::<Config>().theme_preset.clone());
+            let theme = presets::by_id(cx, &crate::ui::theme::effective_preset_id(cx));
             let image = theme.image.clone();
             let image_name = image.as_ref().map(|i| {
                 i.path
@@ -3277,11 +3290,39 @@ impl Tty7App {
             )
     }
 
-    /// The compact "Current theme" card on the Appearance page: a preview of the
-    /// active theme beside its kind (built-in vs custom) and light/dark mode,
-    /// its name, and its six chromatic ANSI swatches; the whole row a click
-    /// target that opens the picker panel on the right.
-    fn render_current_theme(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The theme choice block on the Appearance page: the "Sync with system"
+    /// switch, then either the single manual-theme card or — while following
+    /// the OS — one card per light/dark slot.
+    fn render_theme_selection(&self, cx: &mut Context<Self>) -> AnyElement {
+        let follow = cx.global::<Config>().theme_follow_system;
+        let follow_switch = Switch::new("theme-follow-system")
+            .checked(follow)
+            .on_click(cx.listener(|this, on: &bool, window, cx| {
+                this.set_theme_follow_system(*on, window, cx)
+            }))
+            .into_any_element();
+        let root = v_flex().child(self.settings_row(
+            "Sync with system",
+            "Follow the OS appearance with separate light and dark themes.",
+            follow_switch,
+            cx,
+        ));
+        if follow {
+            root.child(self.render_theme_card(ThemeSlot::Light, cx))
+                .child(self.render_theme_card(ThemeSlot::Dark, cx))
+                .into_any_element()
+        } else {
+            root.child(self.render_theme_card(ThemeSlot::Manual, cx))
+                .into_any_element()
+        }
+    }
+
+    /// One compact theme card: a preview of the slot's theme beside its caption
+    /// (kind + light/dark mode for the manual card, the slot's role for the
+    /// follow-system cards), its name, and its six chromatic ANSI swatches; the
+    /// whole row a click target that opens the picker panel on the right,
+    /// aimed at this slot.
+    fn render_theme_card(&self, slot: ThemeSlot, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let border = theme.border;
         let foreground = theme.foreground;
@@ -3289,15 +3330,35 @@ impl Tty7App {
         let hover_bg = theme.secondary.opacity(0.5);
         let surface = theme.secondary.opacity(0.28);
 
-        let active_id = cx.global::<Config>().theme_preset.clone();
+        let config = cx.global::<Config>();
+        let (card_id, active_id) = match slot {
+            ThemeSlot::Manual => ("theme-card-manual", config.theme_preset.clone()),
+            ThemeSlot::Light => ("theme-card-light", config.theme_preset_light.clone()),
+            ThemeSlot::Dark => ("theme-card-dark", config.theme_preset_dark.clone()),
+        };
         let active = presets::by_id(cx, &active_id);
         let name = active.name.clone();
-        let mode = if active.dark { "Dark" } else { "Light" };
         // A user file (duplicated or dropped in the themes folder) vs a built-in.
         let kind = if active.path.is_some() {
             "Custom"
         } else {
             "Built-in"
+        };
+        let caption = match slot {
+            ThemeSlot::Manual => {
+                let mode = if active.dark { "Dark" } else { "Light" };
+                format!("{kind} · {mode}")
+            }
+            // The slot cards are captioned by their role; the one matching the
+            // current OS appearance is the theme actually on screen.
+            ThemeSlot::Light if !crate::ui::theme::system_dark(cx) => {
+                format!("Light mode · {kind} · Active")
+            }
+            ThemeSlot::Light => format!("Light mode · {kind}"),
+            ThemeSlot::Dark if crate::ui::theme::system_dark(cx) => {
+                format!("Dark mode · {kind} · Active")
+            }
+            ThemeSlot::Dark => format!("Dark mode · {kind}"),
         };
         // The six chromatic ANSI slots (red…cyan) as tiny swatches — the part of
         // a theme the mini preview's few bars can't show, and what actually
@@ -3311,15 +3372,17 @@ impl Tty7App {
                 .bg(rgb(to_u32(active.ansi16[i])))
         }));
         let preview = self.theme_preview(&active);
-        let open = self.active_settings().is_some_and(|s| s.theme_panel_open);
+        let open = self
+            .active_settings()
+            .is_some_and(|s| s.theme_panel_open && s.theme_panel_slot == slot);
 
         div()
-            .id("current-theme")
+            .id(card_id)
             .mt_1()
             .mb_2()
             .w_full()
             .cursor_pointer()
-            .on_click(cx.listener(|this, _, _w, cx| this.toggle_theme_panel(cx)))
+            .on_click(cx.listener(move |this, _, _w, cx| this.toggle_theme_panel(slot, cx)))
             .child(
                 h_flex()
                     .items_center()
@@ -3338,12 +3401,7 @@ impl Tty7App {
                     .child(
                         v_flex()
                             .gap_0p5()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted_fg)
-                                    .child(format!("{kind} · {mode}")),
-                            )
+                            .child(div().text_xs().text_color(muted_fg).child(caption))
                             .child(
                                 div()
                                     .text_sm()
@@ -3379,13 +3437,33 @@ impl Tty7App {
         // as its own surface rather than an extension of the page.
         let bg = theme.sidebar;
 
-        let active_id = cx.global::<Config>().theme_preset.clone();
-        let (search, query) = match self.active_settings() {
+        let (search, query, slot) = match self.active_settings() {
             Some(s) => (
                 s.theme_search.clone(),
                 s.theme_search.read(cx).value().trim().to_lowercase(),
+                s.theme_panel_slot,
             ),
             None => return div().into_any_element(),
+        };
+        let config = cx.global::<Config>();
+        // Guard against a slot that no longer exists in the current mode (the
+        // sync switch flipped while the panel was open re-aims it, but stale
+        // state must still render something sensible).
+        let slot = match (config.theme_follow_system, slot) {
+            (false, _) => ThemeSlot::Manual,
+            (true, ThemeSlot::Manual) => {
+                if crate::ui::theme::system_dark(cx) {
+                    ThemeSlot::Dark
+                } else {
+                    ThemeSlot::Light
+                }
+            }
+            (true, s) => s,
+        };
+        let active_id = match slot {
+            ThemeSlot::Manual => config.theme_preset.clone(),
+            ThemeSlot::Light => config.theme_preset_light.clone(),
+            ThemeSlot::Dark => config.theme_preset_dark.clone(),
         };
 
         let header = h_flex()
@@ -3414,7 +3492,11 @@ impl Tty7App {
             .pb_3()
             .text_xs()
             .text_color(muted_fg)
-            .child("Change your current theme.");
+            .child(match slot {
+                ThemeSlot::Manual => "Change your current theme.",
+                ThemeSlot::Light => "Choose the theme for light mode.",
+                ThemeSlot::Dark => "Choose the theme for dark mode.",
+            });
 
         // Plain text input, the same shape the Shell section uses — our own
         // field, not a bespoke pill. The Input fills its parent, but a percent
@@ -3483,8 +3565,10 @@ impl Tty7App {
                                 s.child(Icon::new(IconName::Check).small().text_color(foreground))
                             }),
                     )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.set_preset(&click_id, window, cx)
+                    .on_click(cx.listener(move |this, _, window, cx| match slot {
+                        ThemeSlot::Manual => this.set_preset(&click_id, window, cx),
+                        ThemeSlot::Light => this.set_slot_preset(false, &click_id, window, cx),
+                        ThemeSlot::Dark => this.set_slot_preset(true, &click_id, window, cx),
                     })),
             );
         }

@@ -303,6 +303,10 @@ pub struct Tty7App {
     /// the same repo shows the just-refreshed branch/diff line, not a stale
     /// per-row copy. Never read.
     _git_status_watch: Subscription,
+    /// Keeps the window-appearance observer alive: while
+    /// `Config::theme_follow_system` is on, an OS light/dark flip re-resolves
+    /// the theme slot and repaints. Never read.
+    _appearance_watch: Subscription,
     /// `Some` while the command palette overlay is open; `None` when closed.
     /// The view owns its search input, filtered list and keyboard handling and
     /// emits a `PaletteEvent`; we build the catalog and run the chosen command.
@@ -534,6 +538,24 @@ impl Tty7App {
             // release; holding ⌘ again re-arms it via `on_modifiers_changed`.
             this.set_link_modifier(false, cx);
         });
+        // Follow OS light/dark flips live: while "sync with system" is on, an
+        // appearance change re-resolves the theme slot and repaints. While it's
+        // off the appearance only ever changes because `apply_theme` pinned it
+        // to the theme — skip, or the pin would re-trigger a redundant apply.
+        let this = cx.weak_entity();
+        let appearance_watch = window.observe_window_appearance(move |window, cx| {
+            if !cx.global::<Config>().theme_follow_system {
+                return;
+            }
+            apply_theme(Some(window), cx);
+            let _ = this.update(cx, |this, cx| {
+                // The editor targets the on-screen theme, and with no global
+                // override the opacity slider follows it — keep both in step.
+                this.rebuild_theme_editor(window, cx);
+                this.sync_window_opacity_slider(window, cx);
+                cx.notify();
+            });
+        });
         // Paint the configured color theme (defaults to a light one) and build
         // the menu bar.
         apply_theme(Some(window), cx);
@@ -578,6 +600,7 @@ impl Tty7App {
             _keystroke_watch: keystroke_watch,
             _activation_watch: activation_watch,
             _git_status_watch: git_status_watch,
+            _appearance_watch: appearance_watch,
             palette: None,
             palette_sub: None,
             closed: Vec::new(),
@@ -1079,8 +1102,90 @@ impl Tty7App {
 
     /// Switch the active color theme by id, repaint, and persist the choice so
     /// it survives a restart. The theme carries its own dark/light brightness.
+    /// While the system is being followed, the choice lands in the slot for the
+    /// *current* OS appearance (the theme visibly on screen changes either way).
     pub(crate) fn set_preset(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        cx.global_mut::<Config>().theme_preset = id.to_string();
+        let dark_now = crate::ui::theme::system_dark(cx);
+        let cfg = cx.global_mut::<Config>();
+        if !cfg.theme_follow_system {
+            cfg.theme_preset = id.to_string();
+        } else if dark_now {
+            cfg.theme_preset_dark = id.to_string();
+        } else {
+            cfg.theme_preset_light = id.to_string();
+        }
+        self.after_theme_change(window, cx);
+    }
+
+    /// Set the theme for one follow-system slot explicitly (the Light / Dark
+    /// cards in Settings). Only visibly changes anything when that slot is the
+    /// one currently on screen; either way the choice is persisted.
+    pub(crate) fn set_slot_preset(
+        &mut self,
+        dark_slot: bool,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cfg = cx.global_mut::<Config>();
+        if dark_slot {
+            cfg.theme_preset_dark = id.to_string();
+        } else {
+            cfg.theme_preset_light = id.to_string();
+        }
+        self.after_theme_change(window, cx);
+    }
+
+    /// Turn "sync with system appearance" on/off (the Appearance switch).
+    /// Turning it off never visibly changes the theme: whatever is on screen
+    /// is adopted as the manual choice. Turning it on seeds the slot matching
+    /// the manual theme's own brightness with that theme — so the look only
+    /// changes when the OS is currently in the *other* mode, where switching
+    /// to that mode's slot is exactly what the feature promises.
+    pub(crate) fn set_theme_follow_system(
+        &mut self,
+        on: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if on {
+            let manual = cx.global::<Config>().theme_preset.clone();
+            let manual_dark = crate::ui::presets::by_id(cx, &manual).dark;
+            let cfg = cx.global_mut::<Config>();
+            cfg.theme_follow_system = true;
+            if manual_dark {
+                cfg.theme_preset_dark = manual;
+            } else {
+                cfg.theme_preset_light = manual;
+            }
+        } else {
+            // Resolve while following is still on (the pin is released, so
+            // this reads the real OS appearance).
+            let effective = crate::ui::theme::effective_preset_id(cx);
+            let cfg = cx.global_mut::<Config>();
+            cfg.theme_follow_system = false;
+            cfg.theme_preset = effective;
+        }
+        self.after_theme_change(window, cx);
+        // Re-aim an open picker panel at a slot that exists in the new mode —
+        // after the apply above, so `system_dark` reads the unpinned OS value.
+        let slot = if on {
+            if crate::ui::theme::system_dark(cx) {
+                crate::ui::settings::ThemeSlot::Dark
+            } else {
+                crate::ui::settings::ThemeSlot::Light
+            }
+        } else {
+            crate::ui::settings::ThemeSlot::Manual
+        };
+        if let Some(s) = self.active_settings_mut() {
+            s.theme_panel_slot = slot;
+        }
+    }
+
+    /// The shared tail of every theme-selection change: repaint, persist, and
+    /// keep the dependent Settings widgets in step.
+    fn after_theme_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         apply_theme(Some(window), cx);
         set_menus(cx);
         cx.global::<Config>().save();
@@ -1092,10 +1197,21 @@ impl Tty7App {
         cx.notify();
     }
 
-    /// Show/hide the theme picker panel beside the Appearance page.
-    pub(crate) fn toggle_theme_panel(&mut self, cx: &mut Context<Self>) {
+    /// Show/hide the theme picker panel beside the Appearance page. Clicking
+    /// the card whose slot the open panel already targets closes it; clicking
+    /// another card re-aims the open panel at that slot.
+    pub(crate) fn toggle_theme_panel(
+        &mut self,
+        slot: crate::ui::settings::ThemeSlot,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(s) = self.active_settings_mut() {
-            s.theme_panel_open = !s.theme_panel_open;
+            if s.theme_panel_open && s.theme_panel_slot == slot {
+                s.theme_panel_open = false;
+            } else {
+                s.theme_panel_open = true;
+                s.theme_panel_slot = slot;
+            }
             cx.notify();
         }
     }
@@ -1121,7 +1237,7 @@ impl Tty7App {
     /// and open the color editor on it. This is the entry point for customizing a
     /// read-only built-in (or an imported iTerm scheme).
     pub(crate) fn fork_active_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = cx.global::<Config>().theme_preset.clone();
+        let id = crate::ui::theme::effective_preset_id(cx);
         let theme = crate::ui::presets::by_id(cx, &id);
         match crate::ui::presets::fork_to_file(&theme) {
             Ok(new_id) => {
@@ -1142,7 +1258,7 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let id = cx.global::<Config>().theme_preset.clone();
+        let id = crate::ui::theme::effective_preset_id(cx);
         let mut theme = crate::ui::presets::by_id(cx, &id);
         if !theme.editable() {
             return;
@@ -1184,7 +1300,7 @@ impl Tty7App {
     /// set, else the active theme's own value, else fully opaque.
     pub(crate) fn effective_window_opacity(cx: &App) -> f32 {
         let config = cx.global::<Config>();
-        let theme = crate::ui::presets::by_id(cx, &config.theme_preset);
+        let theme = crate::ui::presets::by_id(cx, &crate::ui::theme::effective_preset_id(cx));
         config.window_opacity.or(theme.opacity).unwrap_or(1.0)
     }
 
@@ -1311,7 +1427,7 @@ impl Tty7App {
         if self.settings.is_none() {
             return;
         }
-        let id = cx.global::<Config>().theme_preset.clone();
+        let id = crate::ui::theme::effective_preset_id(cx);
         let theme = crate::ui::presets::by_id(cx, &id);
         if !theme.editable() {
             if let Some(s) = self.settings.as_mut() {
@@ -3010,6 +3126,7 @@ impl Tty7App {
             window_opacity_slider,
             theme_editor: None,
             theme_panel_open: false,
+            theme_panel_slot: crate::ui::settings::ThemeSlot::Manual,
             theme_search,
             recording: None,
             rebinding_note: None,

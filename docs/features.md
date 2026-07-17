@@ -19,6 +19,7 @@
 - **Command palette** <kbd>⌘ P</kbd> · scrollback search <kbd>⌘ F</kbd>
 - **⌘-click links** · desktop notifications · copy on select (opt-in, Settings → Terminal → Clipboard)
 - **Eight themes, plus your own** — YAML seed themes with solid, gradient, or image backgrounds; iTerm2 `.itermcolors` import; in-app color editor with a background-image picker
+- **Sync with system** — Settings → Appearance; pick separate light and dark themes and tty7 follows the OS appearance live (`theme_follow_system`, `theme_preset_light` / `theme_preset_dark` in `config.json`)
 - **Window opacity & blur** — Settings → Appearance → Window; applies to every theme, *Follow theme* returns to the theme's own `opacity` / `blur`
 - **CJK / IME input**
 

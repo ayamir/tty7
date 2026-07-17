@@ -42,6 +42,18 @@ pub struct Config {
     /// `~/.config/tty7/themes/*`); unknown ids fall back to the default theme. The
     /// native chrome is forced to match the theme's light/dark brightness.
     pub theme_preset: String,
+    /// Follow the OS light/dark appearance. When `true` the active theme is
+    /// resolved from `theme_preset_light` / `theme_preset_dark` by the current
+    /// system appearance (switching live when the OS mode flips) and
+    /// `theme_preset` is ignored; the native chrome follows the OS instead of
+    /// being pinned to the theme.
+    pub theme_follow_system: bool,
+    /// Theme id used while `theme_follow_system` is on and the OS is in light
+    /// mode. Same registry/fallback rules as `theme_preset`.
+    pub theme_preset_light: String,
+    /// Theme id used while `theme_follow_system` is on and the OS is in dark
+    /// mode. Same registry/fallback rules as `theme_preset`.
+    pub theme_preset_dark: String,
     /// Global window-opacity override, 0.2–1.0. `None` (the default) follows the
     /// active theme's own `opacity`; when set it applies to every theme, so a
     /// chosen translucency survives theme switches.
@@ -431,6 +443,11 @@ impl Default for Config {
             // The default theme id (mirrors `ui::presets::DEFAULT_ID`; core can't
             // depend on ui). Unknown ids fall back to it anyway.
             theme_preset: "light".to_string(),
+            theme_follow_system: false,
+            // The built-in light/dark pair; each side is user-swappable in
+            // Settings once "sync with system" is on.
+            theme_preset_light: "light".to_string(),
+            theme_preset_dark: "dark".to_string(),
             window_opacity: None,
             window_blur: None,
             keybindings: HashMap::new(),
@@ -832,6 +849,27 @@ mod tests {
         let back: Config = serde_json::from_str(&json).unwrap();
         assert!(back.ssh_warn_on_close);
         assert_eq!(back.ssh_profile_frecency.get(&id).unwrap().count, 4);
+    }
+
+    #[test]
+    fn theme_follow_system_defaults_and_round_trips() {
+        // Old configs (no follow-system keys) must land on off + the built-in
+        // light/dark pair, so nothing changes until the user opts in.
+        let cfg: Config = serde_json::from_str(r#"{"theme_preset":"dracula"}"#).unwrap();
+        assert!(!cfg.theme_follow_system);
+        assert_eq!(cfg.theme_preset_light, "light");
+        assert_eq!(cfg.theme_preset_dark, "dark");
+        assert_eq!(cfg.theme_preset, "dracula");
+
+        let mut cfg = Config::default();
+        cfg.theme_follow_system = true;
+        cfg.theme_preset_light = "one_light".to_string();
+        cfg.theme_preset_dark = "dracula".to_string();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert!(back.theme_follow_system);
+        assert_eq!(back.theme_preset_light, "one_light");
+        assert_eq!(back.theme_preset_dark, "dracula");
     }
 
     #[test]

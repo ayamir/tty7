@@ -19,6 +19,7 @@
 - **命令面板** <kbd>⌘ P</kbd> · 回滚搜索 <kbd>⌘ F</kbd>
 - **⌘ 点击打开链接** · 桌面通知 · 划选即复制（可选，设置 → 终端 → 剪贴板）
 - **8 套主题，也能自定义** — YAML 种子主题，背景支持纯色、渐变或图片；可导入 iTerm2 `.itermcolors`；应用内颜色编辑器带背景图选择
+- **跟随系统外观** — 设置 → Appearance；分别选好浅色和深色主题，tty7 随系统深浅模式实时切换（`config.json` 中的 `theme_follow_system`、`theme_preset_light` / `theme_preset_dark`）
 - **窗口透明与模糊** — 设置 → Appearance → Window；对所有主题生效，*Follow theme* 恢复主题自带的 `opacity` / `blur`
 - **CJK / 输入法输入**
 
