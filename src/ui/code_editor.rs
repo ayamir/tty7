@@ -81,21 +81,55 @@ impl OpenFile {
     }
 }
 
-/// State for the editor panel, held on [`Tty7App`].
-pub(crate) struct EditorPanelState {
-    pub(crate) open: bool,
+/// Per-tab code-panel state, hung on [`Tab::code`](crate::ui::app::Tab) with
+/// the same lifecycle contract as the diff overlay: only the active tab's
+/// panel renders, switching away hides it, closing the tab drops it. The
+/// shared caches (directory listings, gitignore matchers, language servers,
+/// filesystem watchers) live on [`Tty7App`] — this holds only what is truly
+/// this tab's: its open files and its tree view state.
+pub(crate) struct TabCode {
+    /// Whether the overlay is currently shown for this tab. The open-file set
+    /// survives hiding (Esc) — only closing the tab drops it.
+    pub(crate) visible: bool,
     pub(crate) files: Vec<OpenFile>,
     pub(crate) active: usize,
-    /// Watches the parent directories of open files for external changes.
-    /// Rebuilt whenever the open set changes; `None` while nothing is open.
+    /// Find-references results, shown as a drawer under the editor.
+    pub(crate) references: Option<Vec<ReferenceItem>>,
+    /// File-tree roots: this tab's pane cwds resolved to repo roots.
+    pub(crate) roots: Vec<PathBuf>,
+    pub(crate) expanded: std::collections::HashSet<PathBuf>,
+    pub(crate) selected: Option<PathBuf>,
+}
+
+impl TabCode {
+    pub(crate) fn new() -> Self {
+        Self {
+            visible: true,
+            files: Vec::new(),
+            active: 0,
+            references: None,
+            roots: Vec::new(),
+            expanded: std::collections::HashSet::new(),
+            selected: None,
+        }
+    }
+
+    pub(crate) fn active_file(&self) -> Option<&OpenFile> {
+        self.files.get(self.active)
+    }
+}
+
+/// App-global editor infrastructure shared by every tab's panel.
+pub(crate) struct EditorPanelState {
+    /// Watches the parent directories of open files (across all tabs) for
+    /// external changes. Rebuilt whenever any open set changes; `None` while
+    /// nothing is open anywhere.
     watcher: Option<notify::RecommendedWatcher>,
     /// Feeds changed paths from the watcher thread into the UI-side reload
     /// loop spawned in [`EditorPanelState::new`].
     events_tx: smol::channel::Sender<PathBuf>,
     /// Language-server registry (one client per server × workspace root).
     pub(crate) lsp: crate::ui::lsp::LspRegistry,
-    /// Find-references results, shown as a drawer under the editor.
-    pub(crate) references: Option<Vec<ReferenceItem>>,
 }
 
 /// One row in the find-references drawer.
@@ -132,56 +166,10 @@ impl EditorPanelState {
         })
         .detach();
         Self {
-            open: false,
-            files: Vec::new(),
-            active: 0,
             watcher: None,
             events_tx: tx,
             lsp: crate::ui::lsp::LspRegistry::new(window, cx),
-            references: None,
         }
-    }
-
-    pub(crate) fn active_file(&self) -> Option<&OpenFile> {
-        self.files.get(self.active)
-    }
-
-    /// Rebuild the external-change watcher over the current open set. Watches
-    /// each file's *parent directory* (non-recursively): editors that save via
-    /// rename replace the inode, which a direct file watch loses track of.
-    fn rebuild_watcher(&mut self) {
-        use notify::{RecursiveMode, Watcher};
-        self.watcher = None;
-        if self.files.is_empty() {
-            return;
-        }
-        let watched: HashSet<PathBuf> = self.files.iter().map(|f| f.path.clone()).collect();
-        let dirs: HashSet<PathBuf> = watched
-            .iter()
-            .filter_map(|p| p.parent().map(Path::to_path_buf))
-            .collect();
-        let tx = self.events_tx.clone();
-        let handler = move |res: notify::Result<notify::Event>| {
-            let Ok(event) = res else { return };
-            for p in &event.paths {
-                if watched.contains(p) {
-                    let _ = tx.try_send(p.clone());
-                }
-            }
-        };
-        let mut watcher = match notify::recommended_watcher(handler) {
-            Ok(w) => w,
-            Err(e) => {
-                log::warn!("editor: external-change watcher unavailable: {e}");
-                return;
-            }
-        };
-        for dir in dirs {
-            if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
-                log::warn!("editor: failed to watch {}: {e}", dir.display());
-            }
-        }
-        self.watcher = Some(watcher);
     }
 }
 
@@ -260,8 +248,65 @@ fn looks_binary(bytes: &[u8]) -> bool {
 // ---------------------------------------------------------------------------
 
 impl Tty7App {
-    /// Open `path` in the editor panel (activating an existing tab when the
-    /// file is already open) and reveal the panel. Errors surface as window
+    /// The active tab's code-panel state, if the panel was ever opened there.
+    pub(crate) fn tab_code(&self) -> Option<&TabCode> {
+        self.tabs.get(self.active)?.code.as_deref()
+    }
+
+    pub(crate) fn tab_code_mut(&mut self) -> Option<&mut TabCode> {
+        self.tabs.get_mut(self.active)?.code.as_deref_mut()
+    }
+
+    /// Whether the active tab's code panel is currently shown.
+    pub(crate) fn code_panel_visible(&self) -> bool {
+        self.tab_code().is_some_and(|c| c.visible)
+    }
+
+    /// Rebuild the external-change watcher over every tab's open files.
+    /// Watches each file's *parent directory* (non-recursively): editors that
+    /// save via rename replace the inode, which a direct file watch loses.
+    fn editor_rebuild_watcher(&mut self) {
+        use notify::{RecursiveMode, Watcher};
+        self.editor.watcher = None;
+        let watched: HashSet<PathBuf> = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.code.as_deref())
+            .flat_map(|c| c.files.iter().map(|f| f.path.clone()))
+            .collect();
+        if watched.is_empty() {
+            return;
+        }
+        let dirs: HashSet<PathBuf> = watched
+            .iter()
+            .filter_map(|p| p.parent().map(Path::to_path_buf))
+            .collect();
+        let tx = self.editor.events_tx.clone();
+        let handler = move |res: notify::Result<notify::Event>| {
+            let Ok(event) = res else { return };
+            for p in &event.paths {
+                if watched.contains(p) {
+                    let _ = tx.try_send(p.clone());
+                }
+            }
+        };
+        let mut watcher = match notify::recommended_watcher(handler) {
+            Ok(w) => w,
+            Err(e) => {
+                log::warn!("editor: external-change watcher unavailable: {e}");
+                return;
+            }
+        };
+        for dir in dirs {
+            if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
+                log::warn!("editor: failed to watch {}: {e}", dir.display());
+            }
+        }
+        self.editor.watcher = Some(watcher);
+    }
+
+    /// Open `path` in the active tab's editor (activating an existing file tab
+    /// when it is already open) and reveal the panel. Errors surface as window
     /// notifications rather than a half-open tab.
     pub(crate) fn open_file_in_editor(
         &mut self,
@@ -269,10 +314,15 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.tabs.get(self.active).is_none() {
+            return;
+        }
         let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        if let Some(ix) = self.editor.files.iter().position(|f| f.path == path) {
-            self.editor.active = ix;
-            self.editor.open = true;
+        if let Some(code) = self.tab_code_mut()
+            && let Some(ix) = code.files.iter().position(|f| f.path == path)
+        {
+            code.active = ix;
+            code.visible = true;
             self.focus_editor(window, cx);
             cx.notify();
             return;
@@ -354,32 +404,45 @@ impl Tty7App {
         }
         // Dirty tracking: `set_value` suppresses events, so every Change here
         // is a real user edit. Each edit also (re)arms the debounced LSP
-        // didChange sync.
+        // didChange sync. Files may be open in any tab, not just the active
+        // one, so the lookup scans all tabs.
         let sub = cx.subscribe_in(&input, window, {
             let path = path.clone();
             move |this: &mut Tty7App, _input, ev, window, cx| {
                 if matches!(ev, InputEvent::Change) {
                     let path = path.clone();
-                    if let Some(f) = this.editor.files.iter_mut().find(|f| f.path == path) {
-                        if !f.dirty {
-                            f.dirty = true;
-                        }
-                        if f.lsp.is_some() {
-                            f.change_task = Some(cx.spawn_in(window, async move |app, cx| {
-                                cx.background_executor()
-                                    .timer(std::time::Duration::from_millis(150))
-                                    .await;
-                                let _ = app.update(cx, |app, cx| {
-                                    app.editor_sync_lsp_document(&path, cx);
-                                });
-                            }));
-                        }
-                        cx.notify();
+                    let Some(f) = this
+                        .tabs
+                        .iter_mut()
+                        .filter_map(|t| t.code.as_deref_mut())
+                        .flat_map(|c| c.files.iter_mut())
+                        .find(|f| f.path == path)
+                    else {
+                        return;
+                    };
+                    if !f.dirty {
+                        f.dirty = true;
                     }
+                    if f.lsp.is_some() {
+                        f.change_task = Some(cx.spawn_in(window, async move |app, cx| {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(150))
+                                .await;
+                            let _ = app.update(cx, |app, cx| {
+                                app.editor_sync_lsp_document(&path, cx);
+                            });
+                        }));
+                    }
+                    cx.notify();
                 }
             }
         });
-        self.editor.files.push(OpenFile {
+        let tab = self
+            .tabs
+            .get_mut(self.active)
+            .expect("checked at function entry");
+        let code = tab.code.get_or_insert_with(|| Box::new(TabCode::new()));
+        code.files.push(OpenFile {
             path,
             input,
             dirty: false,
@@ -391,27 +454,33 @@ impl Tty7App {
             change_task: None,
             _sub: sub,
         });
-        self.editor.active = self.editor.files.len() - 1;
-        self.editor.open = true;
-        self.editor.rebuild_watcher();
+        code.active = code.files.len() - 1;
+        code.visible = true;
+        self.editor_rebuild_watcher();
         self.focus_editor(window, cx);
         cx.notify();
     }
 
     /// `ToggleCodePanel` (⌘⇧E / the title-bar tree icon / Esc): flip the
-    /// code overlay. Opening re-roots the file tree from the active tab's
-    /// panes and focuses the panel; closing hands focus back to the terminal.
+    /// active tab's code overlay. First open creates the tab's panel state;
+    /// hiding keeps it (open files survive Esc), and only closing the tab
+    /// drops it. Opening re-roots the file tree from the tab's panes and
+    /// focuses the panel; closing hands focus back to the terminal.
     pub(crate) fn toggle_code_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editor.open {
-            self.editor.open = false;
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let code = tab.code.get_or_insert_with(|| Box::new(TabCode::new()));
+        if code.visible {
+            code.visible = false;
             self.file_tree.editing = None;
             self.focus_active(window, cx);
             cx.notify();
             return;
         }
-        self.editor.open = true;
+        code.visible = true;
         self.file_tree_refresh_roots(window, cx);
-        if self.editor.active_file().is_some() {
+        if self.tab_code().is_some_and(|c| c.active_file().is_some()) {
             self.focus_editor(window, cx);
         } else {
             self.file_tree.focus_handle.focus(window, cx);
@@ -421,7 +490,7 @@ impl Tty7App {
 
     /// Focus the active file's text input (e.g. right after opening a file).
     fn focus_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(f) = self.editor.active_file() {
+        if let Some(f) = self.tab_code().and_then(|c| c.active_file()) {
             f.input.update(cx, |input, cx| input.focus(window, cx));
         }
     }
@@ -429,18 +498,25 @@ impl Tty7App {
     /// Whether keyboard focus currently sits inside the editor panel. Lets
     /// shared shortcuts (⌘S, ⌘W) route here before their terminal meaning.
     pub(crate) fn editor_has_focus(&self, window: &Window, cx: &Context<Self>) -> bool {
-        self.editor.open
-            && self.editor.active_file().is_some_and(|f| {
-                f.input
-                    .read(cx)
-                    .focus_handle(cx)
-                    .contains_focused(window, cx)
-            })
+        self.code_panel_visible()
+            && self
+                .tab_code()
+                .and_then(|c| c.active_file())
+                .is_some_and(|f| {
+                    f.input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .contains_focused(window, cx)
+                })
     }
 
     /// `EditorSave` (⌘S): write the active buffer back to its path.
     pub(crate) fn editor_save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(f) = self.editor.files.get_mut(self.editor.active) else {
+        let Some(code) = self.tab_code_mut() else {
+            return;
+        };
+        let active = code.active;
+        let Some(f) = code.files.get_mut(active) else {
             return;
         };
         let text = f.input.read(cx).text().to_string();
@@ -472,7 +548,7 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(f) = self.editor.files.get(ix) else {
+        let Some(f) = self.tab_code().and_then(|c| c.files.get(ix)) else {
             return;
         };
         if !f.dirty {
@@ -492,11 +568,19 @@ impl Tty7App {
             let _ = app.update_in(cx, |app, window, cx| match choice {
                 0 => {
                     // Save, then close. Save failure keeps the tab open.
-                    let prev_active = app.editor.active;
-                    app.editor.active = ix;
+                    let prev_active = app.tab_code().map(|c| c.active);
+                    if let Some(code) = app.tab_code_mut() {
+                        code.active = ix;
+                    }
                     app.editor_save_active(window, cx);
-                    app.editor.active = prev_active;
-                    if app.editor.files.get(ix).is_some_and(|f| !f.dirty) {
+                    if let (Some(code), Some(prev)) = (app.tab_code_mut(), prev_active) {
+                        code.active = prev;
+                    }
+                    if app
+                        .tab_code()
+                        .and_then(|c| c.files.get(ix))
+                        .is_some_and(|f| !f.dirty)
+                    {
                         app.editor_remove_file(ix, cx);
                     }
                 }
@@ -517,42 +601,59 @@ impl Tty7App {
         if !self.editor_has_focus(window, cx) {
             return false;
         }
-        if self.editor.files.is_empty() {
-            self.editor.open = false;
+        let Some(code) = self.tab_code_mut() else {
+            return false;
+        };
+        if code.files.is_empty() {
+            code.visible = false;
             cx.notify();
             return true;
         }
-        self.editor_close_file(self.editor.active, window, cx);
+        let active = code.active;
+        self.editor_close_file(active, window, cx);
         true
     }
 
     fn editor_remove_file(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if ix >= self.editor.files.len() {
+        let Some(code) = self.tab_code_mut() else {
+            return;
+        };
+        if ix >= code.files.len() {
             return;
         }
-        let f = self.editor.files.remove(ix);
+        let f = code.files.remove(ix);
         if let Some((client, _)) = &f.lsp {
             client.did_close(&f.path);
         }
-        if self.editor.active >= ix && self.editor.active > 0 {
-            self.editor.active -= 1;
+        if code.active >= ix && code.active > 0 {
+            code.active -= 1;
         }
-        self.editor.rebuild_watcher();
+        self.editor_rebuild_watcher();
         cx.notify();
+    }
+
+    /// Every open buffer for `path`, across all tabs (a file can be open in
+    /// more than one tab's panel; each has its own buffer).
+    fn editor_files_for_path<'a>(&'a self, path: &'a Path) -> impl Iterator<Item = &'a OpenFile> {
+        self.tabs
+            .iter()
+            .filter_map(|t| t.code.as_deref())
+            .flat_map(|c| c.files.iter())
+            .filter(move |f| f.path == *path)
     }
 
     /// Push the buffer's current text to the language server (the debounced
     /// tail of a typing burst).
     pub(crate) fn editor_sync_lsp_document(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let Some(f) = self.editor.files.iter().find(|f| f.path == *path) else {
-            return;
-        };
-        if let Some((client, _)) = &f.lsp {
-            client.did_change(&f.path, &f.input.read(cx).text().to_string());
+        for f in self.editor_files_for_path(path) {
+            if let Some((client, _)) = &f.lsp {
+                client.did_change(&f.path, &f.input.read(cx).text().to_string());
+                break; // one didChange per path — the server sees one document
+            }
         }
     }
 
-    /// Apply `publishDiagnostics` for `path` to its open buffer, if any.
+    /// Apply `publishDiagnostics` for `path` to its open buffers (any tab).
     pub(crate) fn editor_apply_diagnostics(
         &mut self,
         path: &Path,
@@ -560,24 +661,27 @@ impl Tty7App {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(f) = self.editor.files.iter().find(|f| f.path == *path) else {
-            return;
-        };
-        f.input.clone().update(cx, |st, cx| {
-            let text = st.text().clone();
-            if let Some(set) = st.diagnostics_mut() {
-                set.reset(&text);
-                set.extend(diags);
-                cx.notify();
-            }
-        });
+        let inputs: Vec<Entity<InputState>> = self
+            .editor_files_for_path(path)
+            .map(|f| f.input.clone())
+            .collect();
+        for input in inputs {
+            input.update(cx, |st, cx| {
+                let text = st.text().clone();
+                if let Some(set) = st.diagnostics_mut() {
+                    set.reset(&text);
+                    set.extend(diags.iter().cloned());
+                    cx.notify();
+                }
+            });
+        }
     }
 
     /// `EditorGotoDefinition` (F12): resolve the definition at the cursor and
     /// jump — opening the target file first when it lives elsewhere (the
     /// in-buffer ⌘-click path can't cross files; this one can).
     pub(crate) fn editor_goto_definition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(f) = self.editor.active_file() else {
+        let Some(f) = self.tab_code().and_then(|c| c.active_file()) else {
             return;
         };
         let Some((client, _)) = &f.lsp else { return };
@@ -606,7 +710,7 @@ impl Tty7App {
     /// `EditorFindReferences` (⇧F12): list every reference to the symbol at
     /// the cursor in a drawer under the editor.
     pub(crate) fn editor_find_references(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(f) = self.editor.active_file() else {
+        let Some(f) = self.tab_code().and_then(|c| c.active_file()) else {
             return;
         };
         let Some((client, _)) = &f.lsp else { return };
@@ -648,7 +752,9 @@ impl Tty7App {
                 });
             }
             let _ = app.update(cx, |app, cx| {
-                app.editor.references = Some(items);
+                if let Some(code) = app.tab_code_mut() {
+                    code.references = Some(items);
+                }
                 cx.notify();
             });
         })
@@ -664,7 +770,7 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) {
         self.open_file_in_editor(path, window, cx);
-        if let Some(f) = self.editor.active_file()
+        if let Some(f) = self.tab_code().and_then(|c| c.active_file())
             && f.path == *path
         {
             f.input.clone().update(cx, |st, cx| {
@@ -674,42 +780,61 @@ impl Tty7App {
     }
 
     /// A watched file changed on disk. Clean buffers reload silently; dirty
-    /// ones raise the conflict banner and let the user pick a side.
+    /// ones raise the conflict banner and let the user pick a side. The file
+    /// may be open in several tabs — each buffer is handled on its own.
     pub(crate) fn editor_handle_external_change(
         &mut self,
         path: &Path,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ix) = self.editor.files.iter().position(|f| f.path == *path) else {
-            return;
-        };
         let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-        {
-            let f = &self.editor.files[ix];
-            // Our own save's echo: mtime matches what we just wrote.
-            if mtime.is_some() && mtime == f.disk_mtime {
-                return;
+        let mut reload: Vec<(usize, usize)> = Vec::new();
+        let mut changed = false;
+        for (tab_ix, tab) in self.tabs.iter_mut().enumerate() {
+            let Some(code) = tab.code.as_deref_mut() else {
+                continue;
+            };
+            for (ix, f) in code.files.iter_mut().enumerate() {
+                if f.path != *path {
+                    continue;
+                }
+                // Our own save's echo: mtime matches what we just wrote.
+                if mtime.is_some() && mtime == f.disk_mtime {
+                    continue;
+                }
+                if f.dirty {
+                    f.conflict = true;
+                    changed = true;
+                } else {
+                    reload.push((tab_ix, ix));
+                }
             }
         }
-        if self.editor.files[ix].dirty {
-            self.editor.files[ix].conflict = true;
-            cx.notify();
-            return;
+        for (tab_ix, ix) in reload {
+            self.editor_reload_from_disk(tab_ix, ix, window, cx);
         }
-        self.editor_reload_from_disk(ix, window, cx);
+        if changed {
+            cx.notify();
+        }
     }
 
-    /// Replace the buffer with the on-disk content (used by the silent reload
+    /// Replace one buffer with the on-disk content (used by the silent reload
     /// and the conflict banner's "Reload" choice). A vanished file just keeps
     /// the buffer and marks it dirty — saving will recreate it.
     pub(crate) fn editor_reload_from_disk(
         &mut self,
+        tab_ix: usize,
         ix: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(f) = self.editor.files.get_mut(ix) else {
+        let Some(f) = self
+            .tabs
+            .get_mut(tab_ix)
+            .and_then(|t| t.code.as_deref_mut())
+            .and_then(|c| c.files.get_mut(ix))
+        else {
             return;
         };
         let Ok(text) = std::fs::read_to_string(&f.path) else {
@@ -743,10 +868,10 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.editor.open {
+        if !self.code_panel_visible() {
             return None;
         }
-        let body = match self.editor.active_file() {
+        let body = match self.tab_code().and_then(|c| c.active_file()) {
             None => self.render_editor_empty(cx).into_any_element(),
             // Markdown preview replaces the buffer with a rendered view.
             Some(f) if f.preview => {
@@ -773,8 +898,8 @@ impl Tty7App {
             }
         };
         let conflict_banner = self
-            .editor
-            .active_file()
+            .tab_code()
+            .and_then(|c| c.active_file())
             .filter(|f| f.conflict)
             .map(|_| self.render_editor_conflict_banner(cx));
         let references = self.render_editor_references(cx);
@@ -832,8 +957,9 @@ impl Tty7App {
 
     /// The file tab strip along the panel top.
     fn render_editor_tabs(&self, _window: &Window, cx: &mut Context<Self>) -> gpui::Div {
-        let active = self.editor.active;
-        let tabs = self.editor.files.iter().enumerate().map(|(ix, f)| {
+        let active = self.tab_code().map(|c| c.active).unwrap_or(0);
+        let files: &[OpenFile] = self.tab_code().map(|c| c.files.as_slice()).unwrap_or(&[]);
+        let tabs = files.iter().enumerate().map(|(ix, f)| {
             let is_active = ix == active;
             let title = f.label();
             h_flex()
@@ -854,7 +980,9 @@ impl Tty7App {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, window, cx| {
-                        this.editor.active = ix;
+                        if let Some(code) = this.tab_code_mut() {
+                            code.active = ix;
+                        }
                         this.focus_editor(window, cx);
                         cx.notify();
                     }),
@@ -887,8 +1015,8 @@ impl Tty7App {
             .child(div().flex_1())
             // Markdown files get a preview toggle.
             .when_some(
-                self.editor
-                    .active_file()
+                self.tab_code()
+                    .and_then(|c| c.active_file())
                     .filter(|f| language_for_path(&f.path) == "markdown"),
                 |this, f| {
                     let preview = f.preview;
@@ -898,35 +1026,43 @@ impl Tty7App {
                             .ghost()
                             .xsmall()
                             .on_click(cx.listener(|this, _, _w, cx| {
-                                let ix = this.editor.active;
-                                if let Some(f) = this.editor.files.get_mut(ix) {
-                                    f.preview = !f.preview;
-                                    cx.notify();
+                                if let Some(code) = this.tab_code_mut() {
+                                    let ix = code.active;
+                                    if let Some(f) = code.files.get_mut(ix) {
+                                        f.preview = !f.preview;
+                                        cx.notify();
+                                    }
                                 }
                             })),
                     )
                 },
             )
             // Soft-wrap toggle for the active buffer.
-            .when(self.editor.active_file().is_some(), |this| {
-                this.child(
-                    Button::new("editor-wrap-toggle")
-                        .label("Wrap")
-                        .ghost()
-                        .xsmall()
-                        .tooltip("Toggle soft wrap")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            let ix = this.editor.active;
-                            if let Some(f) = this.editor.files.get_mut(ix) {
-                                f.wrap = !f.wrap;
-                                let wrap = f.wrap;
-                                f.input.clone().update(cx, |st, cx| {
-                                    st.set_soft_wrap(wrap, window, cx);
-                                });
-                            }
-                        })),
-                )
-            })
+            .when(
+                self.tab_code().is_some_and(|c| c.active_file().is_some()),
+                |this| {
+                    this.child(
+                        Button::new("editor-wrap-toggle")
+                            .label("Wrap")
+                            .ghost()
+                            .xsmall()
+                            .tooltip("Toggle soft wrap")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let Some(code) = this.tab_code_mut() else {
+                                    return;
+                                };
+                                let ix = code.active;
+                                if let Some(f) = code.files.get_mut(ix) {
+                                    f.wrap = !f.wrap;
+                                    let wrap = f.wrap;
+                                    f.input.clone().update(cx, |st, cx| {
+                                        st.set_soft_wrap(wrap, window, cx);
+                                    });
+                                }
+                            })),
+                    )
+                },
+            )
             .child(
                 Button::new("editor-panel-close")
                     .icon(IconName::Close)
@@ -941,7 +1077,7 @@ impl Tty7App {
 
     /// The find-references drawer (⇧F12 results) under the editor body.
     fn render_editor_references(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let refs = self.editor.references.as_ref()?;
+        let refs = self.tab_code()?.references.as_ref()?;
         let muted = cx.theme().muted_foreground;
         let rows = refs.iter().enumerate().map(|(ix, r)| {
             let name = r
@@ -1003,7 +1139,9 @@ impl Tty7App {
                                 .ghost()
                                 .xsmall()
                                 .on_click(cx.listener(|this, _, _w, cx| {
-                                    this.editor.references = None;
+                                    if let Some(code) = this.tab_code_mut() {
+                                        code.references = None;
+                                    }
                                     cx.notify();
                                 })),
                         ),
@@ -1022,7 +1160,8 @@ impl Tty7App {
 
     /// Banner shown when the file changed on disk while the buffer is dirty.
     fn render_editor_conflict_banner(&self, cx: &mut Context<Self>) -> AnyElement {
-        let ix = self.editor.active;
+        let tab_ix = self.active;
+        let ix = self.tab_code().map(|c| c.active).unwrap_or(0);
         h_flex()
             .flex_none()
             .w_full()
@@ -1040,7 +1179,7 @@ impl Tty7App {
                     .label("Reload")
                     .small()
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.editor_reload_from_disk(ix, window, cx);
+                        this.editor_reload_from_disk(tab_ix, ix, window, cx);
                     })),
             )
             .child(
@@ -1049,7 +1188,7 @@ impl Tty7App {
                     .ghost()
                     .small()
                     .on_click(cx.listener(move |this, _, _w, cx| {
-                        if let Some(f) = this.editor.files.get_mut(ix) {
+                        if let Some(f) = this.tab_code_mut().and_then(|c| c.files.get_mut(ix)) {
                             f.conflict = false;
                             cx.notify();
                         }

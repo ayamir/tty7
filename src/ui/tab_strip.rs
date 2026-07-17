@@ -817,7 +817,7 @@ impl Tty7App {
         // affordance, so heavy split layouts don't grow a forest of icons; lit
         // (selected) while the overlay is up. Present in both tab-bar modes —
         // the sidebar layout keeps this strip as the right column's chrome.
-        let code_open = self.editor.open;
+        let code_open = self.code_panel_visible();
         let code_button = div().occlude().flex_shrink_0().child(
             Button::new("titlebar-code-panel")
                 .icon(Icon::new(IconName::FolderClosed).size(px(15.)))

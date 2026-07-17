@@ -101,6 +101,13 @@ pub struct Tab {
     /// switching back restores it; closing the tab drops it. Only the active
     /// tab's overlay is rendered. See [`crate::ui::diff_overlay`].
     pub(crate) diff_overlay: Option<crate::ui::diff_overlay::DiffOverlayState>,
+    /// This tab's code panel (file tree + editor overlay): open files, tree
+    /// roots/expansion, and visibility. Same per-tab contract as
+    /// `diff_overlay` — switching away hides it, switching back restores it,
+    /// closing the tab drops it. Shared caches (directory listings, gitignore
+    /// matchers, language servers, watchers) live on [`Tty7App`]. `None` until
+    /// the panel is first opened in this tab.
+    pub(crate) code: Option<Box<crate::ui::code_editor::TabCode>>,
     /// The sidebar group this tab last *definitively* belonged to: the
     /// repository home of its first pane's cwd — the main checkout's root, so
     /// linked worktrees of one repo share a group (deliberately not the
@@ -123,6 +130,7 @@ impl Tab {
             name: None,
             last_focused: None,
             diff_overlay: None,
+            code: None,
             sidebar_group: std::cell::RefCell::new(None),
         }
     }
@@ -758,6 +766,7 @@ impl Tty7App {
                 name: st.name,
                 last_focused: None,
                 diff_overlay: None,
+                code: None,
                 // Keep the group it had when closed — the row reappears where
                 // it lived instead of flashing through Scratch.
                 sidebar_group: std::cell::RefCell::new(st.sidebar_group),
@@ -2308,9 +2317,9 @@ impl Tty7App {
             // In sidebar mode, pull the newly active row into view (a no-op when
             // the strip is horizontal — the handle tracks no painted list then).
             self.sidebar_scroll.scroll_to_item(index);
-            if self.editor.open {
-                // Code panel up: the tree follows the incoming tab's repos, and
-                // focus stays on the panel (the terminal is covered).
+            if self.code_panel_visible() {
+                // The incoming tab has its own panel open: refresh its roots
+                // (pane cwds may have changed) and keep focus on the panel.
                 self.file_tree_refresh_roots(window, cx);
                 self.file_tree.focus_handle.focus(window, cx);
             } else {
@@ -4490,6 +4499,7 @@ fn tabs_from_session(
             name: st.name.clone(),
             last_focused: None,
             diff_overlay: None,
+            code: None,
             // Seed the sticky group from the saved session so the sidebar
             // renders grouped on the first frame; the first landed probe
             // corrects it if the tab's repo changed while we were gone.

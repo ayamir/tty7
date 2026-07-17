@@ -97,22 +97,24 @@ impl TreeEdit {
     }
 }
 
-/// State for the file-tree panel, held on [`Tty7App`].
+/// App-global file-tree infrastructure, held on [`Tty7App`]. The per-tab view
+/// state (roots, expansion, selection) lives in
+/// [`TabCode`](crate::ui::code_editor::TabCode); everything here is path-keyed
+/// cache or chrome shared by every tab's panel — one panel shows at a time.
 pub(crate) struct FileTreeState {
-    pub(crate) roots: Vec<PathBuf>,
-    expanded: HashSet<PathBuf>,
     /// Lazily-loaded listing per directory; invalidated by watcher events.
     children: HashMap<PathBuf, Vec<TreeEntry>>,
     /// Compiled `.gitignore` per directory (`None` = the dir has none).
     /// Invalidated when a `.gitignore` changes.
     gitignore: HashMap<PathBuf, Option<Rc<Gitignore>>>,
-    pub(crate) selected: Option<PathBuf>,
     pub(crate) show_hidden: bool,
     pub(crate) width: Rc<Cell<f32>>,
     dragging: Rc<Cell<bool>>,
     pub(crate) editing: Option<TreeEdit>,
     editing_subs: Vec<Subscription>,
-    /// Recursive watcher per root; rebuilt when the root set changes.
+    /// One recursive watcher over the union of every tab's roots; rebuilt
+    /// when any root set changes. Events invalidate the path-keyed caches
+    /// above, which are tab-agnostic.
     watcher: Option<notify::RecommendedWatcher>,
     events_tx: smol::channel::Sender<PathBuf>,
     pub(crate) focus_handle: FocusHandle,
@@ -138,11 +140,8 @@ impl FileTreeState {
         })
         .detach();
         Self {
-            roots: Vec::new(),
-            expanded: HashSet::new(),
             children: HashMap::new(),
             gitignore: HashMap::new(),
-            selected: None,
             show_hidden: false,
             width: Rc::new(Cell::new(DEFAULT_WIDTH)),
             dragging: Rc::new(Cell::new(false)),
@@ -154,11 +153,11 @@ impl FileTreeState {
         }
     }
 
-    /// (Re)attach the recursive watcher to the current roots.
-    fn rebuild_watcher(&mut self) {
+    /// (Re)attach the recursive watcher to `roots` (the union across tabs).
+    fn rebuild_watcher(&mut self, roots: &HashSet<PathBuf>) {
         use notify::{RecursiveMode, Watcher};
         self.watcher = None;
-        if self.roots.is_empty() {
+        if roots.is_empty() {
             return;
         }
         let tx = self.events_tx.clone();
@@ -175,7 +174,7 @@ impl FileTreeState {
                 return;
             }
         };
-        for root in &self.roots {
+        for root in roots {
             if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
                 log::warn!("file tree: failed to watch {}: {e}", root.display());
             }
@@ -185,15 +184,15 @@ impl FileTreeState {
 
     /// Load any expanded directory whose listing isn't cached yet. Called once
     /// per render pass so `visible_rows` can stay `&self`.
-    fn ensure_loaded(&mut self) {
+    fn ensure_loaded(&mut self, roots: &[PathBuf], expanded: &HashSet<PathBuf>) {
         // Roots always list; expanded dirs list on demand. Collect first: the
         // borrow checker won't let us mutate `children` while iterating it.
         let mut todo: Vec<(PathBuf, PathBuf)> = Vec::new(); // (dir, its root)
-        for root in &self.roots {
+        for root in roots {
             if !self.children.contains_key(root) {
                 todo.push((root.clone(), root.clone()));
             }
-            for dir in &self.expanded {
+            for dir in expanded {
                 if dir.starts_with(root) && !self.children.contains_key(dir) {
                     todo.push((dir.clone(), root.clone()));
                 }
@@ -265,10 +264,11 @@ impl FileTreeState {
         state
     }
 
-    /// Flatten roots + expanded directories into display order.
-    pub(crate) fn visible_rows(&self) -> Vec<TreeRow> {
+    /// Flatten `roots` + `expanded` directories into display order (both come
+    /// from the active tab's panel state).
+    pub(crate) fn visible_rows(&self, roots: &[PathBuf], expanded: &HashSet<PathBuf>) -> Vec<TreeRow> {
         let mut rows = Vec::new();
-        for root in &self.roots {
+        for root in roots {
             let name = root
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -284,12 +284,18 @@ impl FileTreeState {
                 is_root: true,
                 expanded: true,
             });
-            self.flatten_dir(root, 1, &mut rows);
+            self.flatten_dir(root, 1, expanded, &mut rows);
         }
         rows
     }
 
-    fn flatten_dir(&self, dir: &Path, depth: usize, out: &mut Vec<TreeRow>) {
+    fn flatten_dir(
+        &self,
+        dir: &Path,
+        depth: usize,
+        expanded: &HashSet<PathBuf>,
+        out: &mut Vec<TreeRow>,
+    ) {
         let Some(entries) = self.children.get(dir) else {
             return;
         };
@@ -297,15 +303,15 @@ impl FileTreeState {
             if !self.show_hidden && e.name.starts_with('.') {
                 continue;
             }
-            let expanded = e.is_dir && self.expanded.contains(&e.path);
+            let is_expanded = e.is_dir && expanded.contains(&e.path);
             out.push(TreeRow {
                 entry: e.clone(),
                 depth,
                 is_root: false,
-                expanded,
+                expanded: is_expanded,
             });
-            if expanded {
-                self.flatten_dir(&e.path, depth + 1, out);
+            if is_expanded {
+                self.flatten_dir(&e.path, depth + 1, expanded, out);
             }
         }
     }
@@ -376,15 +382,24 @@ impl Tty7App {
             roots.push(PathBuf::from(home));
         }
         let _ = window;
-        if roots != self.file_tree.roots {
-            self.file_tree.roots = roots;
-            self.file_tree.children.clear();
-            self.file_tree.gitignore.clear();
-            self.file_tree.rebuild_watcher();
-        } else {
-            // Same roots: refresh listings but keep expansion state.
-            self.file_tree.children.clear();
+        let Some(code) = self.tab_code_mut() else {
+            return;
+        };
+        if roots != code.roots {
+            code.roots = roots;
         }
+        // Refresh listings but keep expansion state; the caches are shared
+        // (path-keyed), so a stale entry only costs a relist.
+        self.file_tree.children.clear();
+        self.file_tree.gitignore.clear();
+        // One watcher over every tab's roots.
+        let union: HashSet<PathBuf> = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.code.as_deref())
+            .flat_map(|c| c.roots.iter().cloned())
+            .collect();
+        self.file_tree.rebuild_watcher(&union);
         cx.notify();
     }
 
@@ -396,11 +411,8 @@ impl Tty7App {
         paths: &HashSet<PathBuf>,
         cx: &mut Context<Self>,
     ) {
-        // The tree only renders inside the code overlay; skip churn while it
-        // is closed (the caches rebuild lazily on the next open anyway).
-        if !self.editor.open {
-            return;
-        }
+        // The caches are shared across tabs, so invalidate unconditionally —
+        // a hidden tab's stale listing would otherwise survive until reopened.
         let gitignore_touched = paths
             .iter()
             .any(|p| p.file_name().is_some_and(|n| n == ".gitignore"));
@@ -421,8 +433,11 @@ impl Tty7App {
     }
 
     fn file_tree_toggle_expand(&mut self, dir: &Path, cx: &mut Context<Self>) {
-        if !self.file_tree.expanded.remove(dir) {
-            self.file_tree.expanded.insert(dir.to_path_buf());
+        let Some(code) = self.tab_code_mut() else {
+            return;
+        };
+        if !code.expanded.remove(dir) {
+            code.expanded.insert(dir.to_path_buf());
         }
         cx.notify();
     }
@@ -436,7 +451,9 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.file_tree.selected = Some(row_path.to_path_buf());
+        if let Some(code) = self.tab_code_mut() {
+            code.selected = Some(row_path.to_path_buf());
+        }
         if is_dir {
             self.file_tree_toggle_expand(row_path, cx);
         } else {
@@ -452,12 +469,16 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let rows = self.file_tree.visible_rows();
+        let Some(code) = self.tab_code() else {
+            return;
+        };
+        let rows = self
+            .file_tree
+            .visible_rows(&code.roots, &code.expanded);
         if rows.is_empty() {
             return;
         }
-        let sel_ix = self
-            .file_tree
+        let sel_ix = code
             .selected
             .as_ref()
             .and_then(|s| rows.iter().position(|r| r.entry.path == *s));
@@ -469,18 +490,32 @@ impl Tty7App {
                     (Some(i), "up") => i.saturating_sub(1),
                     (Some(i), _) => (i + 1).min(rows.len() - 1),
                 };
-                self.file_tree.selected = Some(rows[next].entry.path.clone());
+                let path = rows[next].entry.path.clone();
+                if let Some(code) = self.tab_code_mut() {
+                    code.selected = Some(path);
+                }
                 cx.notify();
             }
             "left" => {
                 let Some(i) = sel_ix else { return };
                 let row = &rows[i];
-                if row.entry.is_dir && row.expanded && !row.is_root {
-                    self.file_tree.expanded.remove(&row.entry.path);
-                } else if let Some(parent) = row.entry.path.parent() {
-                    // Jump to the parent row (stay put at a root).
-                    if rows.iter().any(|r| r.entry.path == parent) {
-                        self.file_tree.selected = Some(parent.to_path_buf());
+                let (path, is_dir, expanded, is_root) = (
+                    row.entry.path.clone(),
+                    row.entry.is_dir,
+                    row.expanded,
+                    row.is_root,
+                );
+                let parent_in_rows = path
+                    .parent()
+                    .is_some_and(|p| rows.iter().any(|r| r.entry.path == p));
+                if let Some(code) = self.tab_code_mut() {
+                    if is_dir && expanded && !is_root {
+                        code.expanded.remove(&path);
+                    } else if parent_in_rows
+                        && let Some(parent) = path.parent()
+                    {
+                        // Jump to the parent row (stay put at a root).
+                        code.selected = Some(parent.to_path_buf());
                     }
                 }
                 cx.notify();
@@ -489,7 +524,10 @@ impl Tty7App {
                 let Some(i) = sel_ix else { return };
                 let row = &rows[i];
                 if row.entry.is_dir && !row.expanded && !row.is_root {
-                    self.file_tree.expanded.insert(row.entry.path.clone());
+                    let path = row.entry.path.clone();
+                    if let Some(code) = self.tab_code_mut() {
+                        code.expanded.insert(path);
+                    }
                     cx.notify();
                 }
             }
@@ -538,26 +576,27 @@ impl Tty7App {
             },
         );
         self.file_tree.editing_subs = vec![sub];
+        // New entries land in the target dir (or the file's parent), which
+        // must be expanded for the inline input row to show.
+        let host_dir = if target.is_dir() {
+            target.to_path_buf()
+        } else {
+            target.parent().unwrap_or(target).to_path_buf()
+        };
+        if !matches!(edit_for, TreeEditKind::Rename)
+            && let Some(code) = self.tab_code_mut()
+        {
+            code.expanded.insert(host_dir.clone());
+        }
         self.file_tree.editing = Some(match edit_for {
-            TreeEditKind::NewFile => {
-                // New entries land in the target dir (or the file's parent).
-                let dir = if target.is_dir() {
-                    target.to_path_buf()
-                } else {
-                    target.parent().unwrap_or(target).to_path_buf()
-                };
-                self.file_tree.expanded.insert(dir.clone());
-                TreeEdit::NewFile { dir, input }
-            }
-            TreeEditKind::NewFolder => {
-                let dir = if target.is_dir() {
-                    target.to_path_buf()
-                } else {
-                    target.parent().unwrap_or(target).to_path_buf()
-                };
-                self.file_tree.expanded.insert(dir.clone());
-                TreeEdit::NewFolder { dir, input }
-            }
+            TreeEditKind::NewFile => TreeEdit::NewFile {
+                dir: host_dir,
+                input,
+            },
+            TreeEditKind::NewFolder => TreeEdit::NewFolder {
+                dir: host_dir,
+                input,
+            },
             TreeEditKind::Rename => TreeEdit::Rename {
                 path: target.to_path_buf(),
                 input,
@@ -606,7 +645,9 @@ impl Tty7App {
         match result {
             Ok(new_path) => {
                 self.file_tree.invalidate_dir(edit.host_dir());
-                self.file_tree.selected = Some(new_path.clone());
+                if let Some(code) = self.tab_code_mut() {
+                    code.selected = Some(new_path.clone());
+                }
                 // A freshly created file opens straight into the editor.
                 if matches!(edit, TreeEdit::NewFile { .. }) {
                     self.open_file_in_editor(&new_path, window, cx);
@@ -652,8 +693,10 @@ impl Tty7App {
                         if let Some(parent) = path.parent() {
                             app.file_tree.invalidate_dir(parent);
                         }
-                        if app.file_tree.selected.as_deref() == Some(&path) {
-                            app.file_tree.selected = None;
+                        if let Some(code) = app.tab_code_mut()
+                            && code.selected.as_deref() == Some(&path)
+                        {
+                            code.selected = None;
                         }
                         cx.notify();
                     }
@@ -694,9 +737,9 @@ impl Tty7App {
         // Prefer a repo-relative path (what agents resolve best) when the file
         // sits under one of the tree's roots.
         let rel = self
-            .file_tree
-            .roots
-            .iter()
+            .tab_code()
+            .into_iter()
+            .flat_map(|c| c.roots.iter())
             .find_map(|r| path.strip_prefix(r).ok())
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| path.to_path_buf());
@@ -726,9 +769,13 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.file_tree.ensure_loaded();
+        let (roots, expanded) = match self.tab_code() {
+            Some(code) => (code.roots.clone(), code.expanded.clone()),
+            None => (Vec::new(), std::collections::HashSet::new()),
+        };
+        self.file_tree.ensure_loaded(&roots, &expanded);
         let width = self.file_tree.width.get().clamp(MIN_WIDTH, MAX_WIDTH);
-        let rows = self.file_tree.visible_rows();
+        let rows = self.file_tree.visible_rows(&roots, &expanded);
 
         let list = v_flex()
             .id("file-tree-rows")
@@ -811,7 +858,7 @@ impl Tty7App {
     ) -> Vec<AnyElement> {
         let path = row.entry.path.clone();
         let is_dir = row.entry.is_dir;
-        let selected = self.file_tree.selected.as_deref() == Some(&*path);
+        let selected = self.tab_code().and_then(|c| c.selected.as_deref()) == Some(&*path);
         let muted = cx.theme().muted_foreground;
 
         // Inline rename replaces the row's label with an input.
