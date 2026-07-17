@@ -33,6 +33,14 @@ const MAX_STDIN: u64 = 64 * 1024;
 /// the controlling terminal. Always exits quietly — a hook that fails must
 /// never break the agent's own flow (agents surface nonzero exits).
 pub fn run_agent_hook(agent: &str, event: &str) {
+    // Shed our own console before doing anything else. Debug builds are
+    // console-subsystem (so `println!` logging works while developing the GUI),
+    // so every hook process Claude Code spawns gets its *own* console window —
+    // a rash of terminal windows that flash open and vanish as each end-of-turn
+    // hook fires. We never use this console for I/O (stdin is piped and we write
+    // to the *agent's* console via AttachConsole), so freeing it now tears the
+    // window down before it can paint. No-op in release (GUI subsystem) and Unix.
+    detach_console();
     // Not inside tty7 (or a remote shell): stay silent, so globally-installed
     // hooks don't leak escape sequences into other terminals.
     if std::env::var_os(TTY7_ENV_MARKER).is_none() {
@@ -53,6 +61,26 @@ pub fn run_agent_hook(agent: &str, event: &str) {
     };
     write_to_controlling_tty(&build_hook_sequence(agent, event, &input));
 }
+
+/// Detach from — and, when we're the only process attached, destroy — the
+/// calling process's console. On Windows debug builds each `tty7 agent-hook …`
+/// process owns a throwaway console whose window would otherwise flash on
+/// screen; freeing it before the window paints removes the flash. The emitter
+/// re-attaches to the agent's console via `AttachConsole` when it writes, so
+/// this doesn't cost us the output path. No-op where there's no console to free.
+#[cfg(not(unix))]
+fn detach_console() {
+    use windows_sys::Win32::System::Console::FreeConsole;
+    // SAFETY: FreeConsole takes no arguments; it simply returns 0 when the
+    // process has no attached console (release/GUI builds) and is otherwise a
+    // clean detach.
+    unsafe {
+        FreeConsole();
+    }
+}
+
+#[cfg(unix)]
+fn detach_console() {}
 
 /// The sentinel event one hook invocation maps onto, or `None` to stay silent.
 /// Most hooks pass their event through; the exception is Copilot's single
