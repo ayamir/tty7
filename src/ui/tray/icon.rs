@@ -1,12 +1,12 @@
 //! Tray bitmap rendering: the bundled SVGs rasterized with `resvg` (gpui's
 //! own SVG path only yields a tinted alpha mask, so the tray draws its own).
 //!
-//! Two states per platform:
+//! Per platform:
 //! - macOS: the outline terminal glyph (`tray.svg`) as a *template* image —
-//!   the system recolors its alpha for light/dark menu bars. Attention swaps
-//!   to a non-template variant: the glyph recolored to a mid-grey that reads
-//!   on both bar appearances, plus an amber badge (template images can't
-//!   carry color, so attention opts out of templating).
+//!   the system recolors its alpha for light/dark menu bars, permanently.
+//!   Attention never touches the bitmap (template images can't carry color,
+//!   and leaving template mode made the glyph illegible); the tooltip and
+//!   menu carry agent status instead (see `native.rs`).
 //! - Windows / Linux: the colored app icon (`app-icon.svg`); attention
 //!   punches a transparent ring into the corner and fills an amber badge, so
 //!   the badge separates from the orange tile behind it.
@@ -37,22 +37,32 @@ const SIZE: u32 = 32;
 
 /// The `Waiting` amber, same hue as the in-window status dot
 /// (`AgentStatus::dot_rgb`).
+#[cfg(not(target_os = "macos"))]
 const AMBER: (u8, u8, u8) = (0xF5, 0x9E, 0x0B);
 
-/// Render the tray icon. `attention` = some agent is blocked on the user.
-/// `None` only on a malformed bundled SVG, i.e. never in practice — callers
-/// treat it as "no icon change".
+/// Render the tray icon: the template outline glyph, always — attention
+/// never touches the bitmap, so the icon stays a template image the system
+/// keeps legible on any bar. `None` only on a malformed bundled SVG, i.e.
+/// never in practice — callers treat it as "no icon change".
+#[cfg(target_os = "macos")]
+pub(super) fn render() -> Option<RgbaImage> {
+    let tree = usvg::Tree::from_data(GLYPH_SVG, &usvg::Options::default()).ok()?;
+    let mut pixmap = tiny_skia::Pixmap::new(SIZE, SIZE)?;
+    resvg::render(&tree, fit_center(&tree, SIZE), &mut pixmap.as_mut());
+    Some(to_rgba(&pixmap))
+}
+
+/// Render the tray icon. `attention` = some agent is blocked on the user —
+/// stamps the amber badge into the colored app icon. `None` only on a
+/// malformed bundled SVG, i.e. never in practice — callers treat it as "no
+/// icon change".
+#[cfg(not(target_os = "macos"))]
 pub(super) fn render(attention: bool) -> Option<RgbaImage> {
     let tree = usvg::Tree::from_data(GLYPH_SVG, &usvg::Options::default()).ok()?;
     let mut pixmap = tiny_skia::Pixmap::new(SIZE, SIZE)?;
     resvg::render(&tree, fit_center(&tree, SIZE), &mut pixmap.as_mut());
 
     if attention {
-        // macOS attention leaves template mode (color needs real RGB), so the
-        // glyph must carry its own color: a mid-grey legible on both light
-        // and dark menu bars. Colored platforms keep the icon's own colors.
-        #[cfg(target_os = "macos")]
-        recolor(&mut pixmap, (0x8E, 0x8E, 0x93));
         badge(&mut pixmap);
     }
 
@@ -202,6 +212,7 @@ fn recolor(pixmap: &mut tiny_skia::Pixmap, rgb: (u8, u8, u8)) {
 /// Stamp the amber attention badge in the top-right corner: first clear a
 /// slightly larger disc so the badge is ringed by transparency (separating it
 /// from whatever the glyph or a colored tile puts behind it), then fill.
+#[cfg(not(target_os = "macos"))]
 fn badge(pixmap: &mut tiny_skia::Pixmap) {
     let s = SIZE as f32;
     let (cx, cy) = (s * 0.78, s * 0.22);
@@ -301,8 +312,20 @@ mod tests {
         assert_eq!((px[1], px[2]), (0, 0));
     }
 
+    /// The template glyph renders at the declared size with visible coverage.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn render_produces_template_glyph() {
+        let img = render().unwrap();
+        assert_eq!((img.width, img.height), (SIZE, SIZE));
+        assert_eq!(img.data.len(), (SIZE * SIZE * 4) as usize);
+        let covered = img.data.chunks_exact(4).filter(|p| p[3] > 0).count();
+        assert!(covered > 0, "icon rendered fully transparent");
+    }
+
     /// Both tray states render at the declared size with visible coverage,
     /// and the attention badge actually changes the bitmap.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn render_produces_both_states() {
         let normal = render(false).unwrap();
