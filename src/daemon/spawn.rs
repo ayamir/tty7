@@ -528,6 +528,10 @@ mod tests {
     /// match — this is what keeps a stale pidfile with a recycled pid from
     /// getting an innocent process killed. Driven with a real `sleep` child:
     /// alive, path readable, basename `sleep` ≠ the test binary's.
+    ///
+    /// `spawn` returns after the fork, possibly before the child has exec'd —
+    /// until then its executable path still reads as *this* test binary — so
+    /// the path assertions poll until the exec is visible.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn reap_guard_rejects_a_live_process_of_another_executable() {
@@ -538,11 +542,19 @@ mod tests {
         let pid = child.id() as libc::pid_t;
 
         assert!(process_alive(pid), "the sleep child is alive and ours");
-        assert_eq!(
-            process_path(pid).and_then(|p| p.file_name().map(|n| n.to_os_string())),
-            Some("sleep".into()),
-            "process_path resolves an arbitrary pid, not just our parent"
-        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let basename = process_path(pid).and_then(|p| p.file_name().map(|n| n.to_os_string()));
+            if basename == Some("sleep".into()) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "process_path resolves an arbitrary pid, not just our parent \
+                 (still {basename:?} after 5s)"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             !process_matches_own_exe(pid),
             "sleep must not match the test binary; matching here would mean the reap could kill it"
