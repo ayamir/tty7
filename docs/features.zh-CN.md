@@ -18,6 +18,7 @@
 - **侧栏按仓库分组** —— 左侧标签栏按 git 仓库分组、每组一个标题行，不在仓库里的标签归入末尾的 *Scratch* 组；切分支、仓库内 `cd` 都不会挪动行（`config.json` 的 `sidebar_grouping`：默认 `repo`，`none` 恢复扁平列表）
 - **命令面板** <kbd>⌘ P</kbd> · 回滚搜索 <kbd>⌘ F</kbd>
 - **⌘ 点击打开链接** · 桌面通知 · 划选即复制（可选，设置 → 终端 → 剪贴板）
+- **智能双击选中** —— 双击直接选中整条 URL、文件路径、括号/引号对，中文按词典分词出词；Shift 点击扩展选区（设置 → 终端 → 鼠标可开关；分隔符用 `config.json` 的 `word_separators` 配置）
 - **8 套主题，也能自定义** — YAML 种子主题，背景支持纯色、渐变或图片；可导入 iTerm2 `.itermcolors`；应用内颜色编辑器带背景图选择
 - **跟随系统外观** — 设置 → Appearance；分别选好浅色和深色主题，tty7 随系统深浅模式实时切换（`config.json` 中的 `theme_follow_system`、`theme_preset_light` / `theme_preset_dark`）
 - **窗口透明与模糊** — 设置 → Appearance → Window；对所有主题生效，*Follow theme* 恢复主题自带的 `opacity` / `blur`

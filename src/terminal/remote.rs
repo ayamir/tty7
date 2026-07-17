@@ -1511,6 +1511,7 @@ fn terminal_config_from_user(user_config: &crate::core::config::Config) -> Confi
     Config {
         scrolling_history: user_config.scrollback_limit,
         default_cursor_style: alacritty_cursor_style(user_config.cursor_style),
+        semantic_escape_chars: user_config.word_separators.clone(),
         ..Config::default()
     }
 }

@@ -21,6 +21,13 @@ gpui-component-assets = { workspace = true }
 
 anyhow.workspace = true
 log.workspace = true
+# Smart double-click selection patterns (URL/email/path). Already in the tree
+# transitively, so pinning it here adds no new native code.
+regex = "1"
+# Dictionary-based Chinese word segmentation for double-click selection
+# (`terminal::smart_select`). The default dict ships deflate-compressed inside
+# the binary (~1.8 MB); the table is built lazily on a background thread.
+jieba-rs = "0.10"
 smol.workspace = true
 smallvec.workspace = true
 serde = { workspace = true }
@@ -171,6 +178,9 @@ winresource = "0.1"
 # app appearance to match the active theme (see `ui::theme::sync_native_appearance`)
 # so the native traffic-light buttons render in the right light/dark style.
 [target.'cfg(target_os = "macos")'.dependencies]
+# CFStringTokenizer FFI for dictionary-based CJK word segmentation on
+# double-click (`terminal::smart_select`). Already in the tree transitively.
+core-foundation = "0.10"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder", "NSAppearance", "NSGraphics", "NSImage"] }
 # NSData feeds the runtime Dock icon for bare (non-bundled) binaries — see

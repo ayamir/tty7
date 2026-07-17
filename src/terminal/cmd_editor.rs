@@ -222,24 +222,68 @@ impl CmdEditor {
         self.cursor = self.chars.len();
     }
 
-    /// Bounds `(start, end)` of the word (run of non-whitespace) containing char
-    /// index `idx`. On whitespace this collapses to `(idx, idx)`.
-    pub fn word_bounds(&self, idx: usize) -> (usize, usize) {
+    /// Bounds `(start, end)` of the word containing char index `idx`: the run
+    /// of chars that are neither whitespace nor in `separators` (the
+    /// configured word-separator set, shared with the grid's semantic
+    /// selection). A separator char is its own one-char word, matching the
+    /// grid; on whitespace the run collapses and the leftward walk snaps to
+    /// the previous word's start.
+    pub fn word_bounds(&self, idx: usize, separators: &str) -> (usize, usize) {
         let idx = idx.min(self.chars.len());
+        // A bracket or quote selects through its match, same as the grid.
+        // Checked before CJK segmentation so full-width `（）`/`“”` pair
+        // instead of being segmented as lone punctuation tokens. Only for
+        // the double-click itself — drags use `plain_word_bounds` so the
+        // selection doesn't lurch when the pointer crosses a quote.
+        if let Some((s, e)) = super::smart_select::pair_range(&self.chars, idx) {
+            return (s, e + 1);
+        }
+        // CJK prose has no separators between words: segment it (jieba for
+        // Chinese, the OS tokenizer for Kana/Hangul on macOS) instead of
+        // selecting the whole unbroken run.
+        if let Some(&c) = self.chars.get(idx)
+            && super::smart_select::is_cjk(c)
+        {
+            let text: String = self.chars.iter().collect();
+            if let Some((s, e)) = super::smart_select::cjk_word_range(&text, idx) {
+                return (s, e + 1);
+            }
+        }
+        self.plain_word_bounds(idx, separators)
+    }
+
+    /// [`Self::word_bounds`] without the pair/segmentation smarts: the plain
+    /// separator-walk word. Used for word-granular drags, where pair matching
+    /// would make the selection jump around as the pointer crosses a quote.
+    fn plain_word_bounds(&self, idx: usize, separators: &str) -> (usize, usize) {
+        let idx = idx.min(self.chars.len());
+        if let Some(&c) = self.chars.get(idx)
+            && !c.is_whitespace()
+            && separators.contains(c)
+        {
+            return (idx, idx + 1);
+        }
+        let boundary = |c: char| c.is_whitespace() || separators.contains(c);
         let mut s = idx;
-        while s > 0 && !self.chars[s - 1].is_whitespace() {
+        while s > 0 && !boundary(self.chars[s - 1]) {
             s -= 1;
         }
         let mut e = idx;
-        while e < self.chars.len() && !self.chars[e].is_whitespace() {
+        while e < self.chars.len() && !boundary(self.chars[e]) {
             e += 1;
+        }
+        // Mixed-script runs (a Latin word glued to CJK text) shrink to the
+        // clicked char's script class — same correction as the grid's.
+        if idx < e {
+            let (ns, ne) = super::smart_select::narrow_to_script(&self.chars, idx, s, e - 1);
+            return (ns, ne + 1);
         }
         (s, e)
     }
 
-    /// Select the word (run of non-whitespace) containing char index `idx`.
-    pub fn select_word_at(&mut self, idx: usize) {
-        let (s, e) = self.word_bounds(idx);
+    /// Select the word containing char index `idx` (see [`Self::word_bounds`]).
+    pub fn select_word_at(&mut self, idx: usize, separators: &str) {
+        let (s, e) = self.word_bounds(idx, separators);
         self.anchor = Some(s);
         self.cursor = e;
     }
@@ -249,8 +293,14 @@ impl CmdEditor {
     /// selection grows by whole words: dragging past the anchor word selects
     /// forward to the far edge of the word under `idx`, dragging before it selects
     /// backward to that word's near edge. The cursor sits at the moving edge.
-    pub fn extend_word_to(&mut self, anchor_start: usize, anchor_end: usize, idx: usize) {
-        let (ws, we) = self.word_bounds(idx.min(self.chars.len()));
+    pub fn extend_word_to(
+        &mut self,
+        anchor_start: usize,
+        anchor_end: usize,
+        idx: usize,
+        separators: &str,
+    ) {
+        let (ws, we) = self.plain_word_bounds(idx.min(self.chars.len()), separators);
         if we >= anchor_end {
             self.anchor = Some(anchor_start);
             self.cursor = we;
@@ -573,13 +623,32 @@ mod tests {
         assert_eq!(e.selection(), None);
     }
 
+    /// The default word-separator set (mirrors `Config::word_separators`).
+    const SEPS: &str = ",│`|:\"' ()[]{}<>\t";
+
     #[test]
     fn select_word_and_all() {
         let mut e = ed("git push origin", 6);
-        e.select_word_at(6); // cursor on "push"
+        e.select_word_at(6, SEPS); // cursor on "push"
         assert_eq!(e.selected_text().as_deref(), Some("push"));
         e.select_all();
         assert_eq!(e.selection(), Some((0, 15)));
+    }
+
+    #[test]
+    fn select_word_stops_at_separators() {
+        // Quotes and commas bound a word; a separator char is its own word.
+        let mut e = ed("echo 'a,b'", 0);
+        e.select_word_at(6, SEPS); // on "a"
+        assert_eq!(e.selected_text().as_deref(), Some("a"));
+        e.select_word_at(7, SEPS); // on the comma itself
+        assert_eq!(e.selected_text().as_deref(), Some(","));
+        e.select_word_at(5, SEPS); // on the opening quote: pairs to the close
+        assert_eq!(e.selected_text().as_deref(), Some("'a,b'"));
+        // `/ . - _ =` are not separators: a path stays one word.
+        let mut e = ed("cat ./a-b/c_d.txt", 0);
+        e.select_word_at(8, SEPS);
+        assert_eq!(e.selected_text().as_deref(), Some("./a-b/c_d.txt"));
     }
 
     #[test]
@@ -595,20 +664,20 @@ mod tests {
     fn extend_word_to_grows_by_whole_words_both_directions() {
         // Double-click "push" (chars 4..8), then drag over later/earlier words.
         let mut e = ed("git push origin main", 4);
-        e.select_word_at(6);
+        e.select_word_at(6, SEPS);
         let (s, a) = e.selection().unwrap(); // (4, 8) == "push"
         assert_eq!((s, a), (4, 8));
 
         // Drag forward into "origin": selection reaches that word's far edge.
-        e.extend_word_to(s, a, 10);
+        e.extend_word_to(s, a, 10, SEPS);
         assert_eq!(e.selected_text().as_deref(), Some("push origin"));
         // Drag on into "main": grows to its end.
-        e.extend_word_to(s, a, 18);
+        e.extend_word_to(s, a, 18, SEPS);
         assert_eq!(e.selected_text().as_deref(), Some("push origin main"));
 
         // Drag backward before the anchor word into "git": anchor flips to the
         // word's far edge, selection covers "git push".
-        e.extend_word_to(s, a, 1);
+        e.extend_word_to(s, a, 1, SEPS);
         assert_eq!(e.selected_text().as_deref(), Some("git push"));
     }
 
@@ -673,15 +742,15 @@ mod tests {
         // that word — the same left-scan that makes a double-click at the end
         // of the line select the last word.
         let mut e = ed("ab cd", 0);
-        e.select_word_at(2); // the space between the words
+        e.select_word_at(2, SEPS); // the space between the words
         assert_eq!(e.selected_text().as_deref(), Some("ab"));
         // Index at/past the end selects the trailing word, clamped.
-        e.select_word_at(99);
+        e.select_word_at(99, SEPS);
         assert_eq!(e.selected_text().as_deref(), Some("cd"));
         // On a gap wider than one cell there is no adjacent word to the left of
         // the clicked cell: the empty range collapses to no selection.
         let mut e = ed("ab  cd", 0);
-        e.select_word_at(3); // second space: both neighbours are whitespace
+        e.select_word_at(3, SEPS); // second space: both neighbours are whitespace
         assert_eq!(e.selection(), None);
     }
 
