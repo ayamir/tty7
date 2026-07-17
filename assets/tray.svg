@@ -1,5 +1,16 @@
-<svg width="120" height="120" viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
-  <rect x="11" y="21" width="98" height="78" rx="18" fill="none" stroke="#000" stroke-width="9"/>
-  <path d="M34 48 L50 61 L34 74" fill="none" stroke="#000" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
-  <line x1="60" y1="76" x2="82" y2="76" stroke="#000" stroke-width="9" stroke-linecap="round"/>
+<svg width="96" height="96" viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg">
+  <!-- Template (alpha-only) tray glyph: the "Duo" mark, same geometry as
+       app-icon.svg. Solid front pane with the chevron knocked out; the back
+       pane reads through partial alpha (template images keep alpha, drop
+       color). The mask spans both panes so the chevron cuts clean through. -->
+  <defs>
+    <mask id="chevron-cut">
+      <rect width="96" height="96" fill="#fff"/>
+      <path d="M24 42 L35 53 L24 64" fill="none" stroke="#000" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+    </mask>
+  </defs>
+  <g mask="url(#chevron-cut)">
+    <rect x="28" y="16" width="58" height="46" rx="12" fill="#000" opacity="0.35"/>
+    <rect x="10" y="30" width="58" height="46" rx="12" fill="#000"/>
+  </g>
 </svg>
