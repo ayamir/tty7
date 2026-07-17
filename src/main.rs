@@ -246,6 +246,39 @@ fn enrich_path_from_login_shell() {
     unsafe { std::env::set_var("PATH", merged) };
 }
 
+/// A bare (non-bundled) binary — `cargo dev` / `cargo run` — has no
+/// `Info.plist` pointing the Dock at `tty7.icns`, so macOS shows the generic
+/// executable icon. Feed the Dock the bundled logo at runtime in that case;
+/// launches from the real `.app` keep the `.icns` and skip this.
+#[cfg(target_os = "macos")]
+fn set_dock_icon_for_bare_binary() {
+    use objc2::{AnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let bundled = std::env::current_exe().is_ok_and(|p| {
+        p.components()
+            .any(|c| c.as_os_str().to_string_lossy().ends_with(".app"))
+    });
+    if bundled {
+        return;
+    }
+    // gpui's `run` closure executes on the main thread; bail defensively
+    // rather than panic if that ever stops holding.
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    static ICON_PNG: &[u8] = include_bytes!("../assets/app-icon.png");
+    let data = NSData::with_bytes(ICON_PNG);
+    if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
+        // SAFETY: passing a valid NSImage on the main thread; AppKit copies the
+        // reference, no ownership transferred.
+        unsafe {
+            NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image));
+        }
+    }
+}
+
 fn main() {
     // Agent-hook mode: `tty7 agent-hook <agent> <event>` is the tiny emitter
     // Claude Code's hooks invoke (see `core::agent_hooks`). It reads the hook
@@ -323,6 +356,8 @@ fn main() {
             gpui_component::init(cx);
             register_bundled_fonts(cx);
             cx.activate(true);
+            #[cfg(target_os = "macos")]
+            set_dock_icon_for_bare_binary();
             // Load user config once and stash it as a global for views to read.
             cx.set_global(Config::load());
             // Build the theme registry (built-ins + user theme files) before the
