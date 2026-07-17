@@ -2329,6 +2329,7 @@ mod tests {
             message: Some("Claude needs your permission".into()),
             session_id: Some("sid-1".into()),
             rich: true,
+            cwd: None,
         }))
         .encode(&mut daemon_side)
         .unwrap();

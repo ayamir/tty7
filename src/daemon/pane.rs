@@ -2980,6 +2980,7 @@ mod tests {
             message: None,
             session_id: Some("sid".into()),
             rich: true,
+            cwd: None,
         });
         apply_signals(&mut st, sniffer.feed(b"\x1b]9;noise\x07"));
         assert_eq!(

@@ -2573,7 +2573,18 @@ impl TerminalView {
         // an agent's session is one long foreground command, so its edits would
         // otherwise stay invisible until it exits. All rare edges, so the
         // off-thread `git` shell-out runs seldom, not every 300ms tick.
-        let cwd_now = self.cwd();
+        //
+        // An agent that reports its own cwd through the hook channel wins over
+        // the proc probe: it tracks internal chdirs the PTY can't observe
+        // (Claude Code's EnterWorktree) and works where the proc fallback
+        // doesn't (Windows). The claim dies with the session (`session-end`
+        // clears it, and the agent leaving the foreground drops the whole
+        // state), so an exited agent falls back to the pane's real directory.
+        let cwd_now = self
+            .terminal
+            .agent_session()
+            .and_then(|s| s.cwd)
+            .or_else(|| self.cwd());
         if cwd_now.as_ref() != self.git_status_cwd.as_ref() || cmd_finished || turn_finished {
             self.refresh_git_status(cwd_now, cx);
         }
