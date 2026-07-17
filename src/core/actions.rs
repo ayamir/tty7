@@ -59,6 +59,16 @@ actions!(
         RestartDaemon,
         // Toggle the SFTP file panel for the focused native-SSH pane (WS5).
         ToggleSftp,
+        // Toggle the local project file tree (left column of the body).
+        ToggleFileTree,
+        // Toggle the code-editor panel (right column of the body).
+        ToggleEditor,
+        // Save the editor panel's active file (⌘S).
+        EditorSave,
+        // LSP jump to the definition of the symbol at the editor cursor (F12).
+        EditorGotoDefinition,
+        // LSP list references to the symbol at the editor cursor (⇧F12).
+        EditorFindReferences,
         // Open the SSH profile manager/editor full-window page (WS6, FR-P1).
         OpenSshProfiles,
         // Reconnect a dead native-SSH pane in place (WS6, FR-E4).

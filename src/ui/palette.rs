@@ -58,6 +58,10 @@ pub enum CommandKind {
     RestartDaemon,
     /// Toggle the SFTP file panel for the focused native-SSH pane (WS5).
     ToggleSftp,
+    /// Toggle the local project file tree (left column of the body).
+    ToggleFileTree,
+    /// Toggle the code-editor panel (right column of the body).
+    ToggleEditor,
     /// Reconnect a dead native-SSH pane in place (WS6, FR-E4).
     RestartSshSession,
     /// Send the focused pane's selection to a running CLI coding agent's pane
@@ -136,6 +140,8 @@ impl CommandKind {
             OpenSettings => "OpenSettings",
             RestartDaemon => "RestartDaemon",
             ToggleSftp => "ToggleSftp",
+            ToggleFileTree => "ToggleFileTree",
+            ToggleEditor => "ToggleEditor",
             RestartSshSession => "RestartSshSession",
             SendSelectionToAgent
             | SendGitDiffToAgent
@@ -218,6 +224,8 @@ impl Command {
             Command::new("SSH: Manage Profiles…", OpenSshProfiles),
             Command::new("Reconnect SSH Session", RestartSshSession),
             Command::new("SFTP Panel", ToggleSftp),
+            Command::new("Toggle File Tree", ToggleFileTree),
+            Command::new("Toggle Editor Panel", ToggleEditor),
             Command::new("Change Theme…", OpenThemePicker),
             Command::new("Open Settings", OpenSettings),
             Command::new("Reset Font Size", ResetFontSize),

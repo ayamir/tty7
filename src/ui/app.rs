@@ -345,6 +345,10 @@ pub struct Tty7App {
     pub(crate) loopback_panel: LoopbackForwardPanelState,
     /// Pane-contextual SFTP file panel (WS5), bound to a focused native-SSH pane.
     pub(crate) sftp_panel: crate::ui::sftp::SftpPanelState,
+    /// Local project file tree (left column of the body).
+    pub(crate) file_tree: crate::ui::file_tree::FileTreeState,
+    /// Code-editor panel (right column of the body).
+    pub(crate) editor: crate::ui::code_editor::EditorPanelState,
     /// Vertical tab sidebar width (px), held in a shared `Cell` so the resize
     /// drag's window-level mouse listener can mutate it without the entity handle
     /// (mirrors the split divider's `ratio`). Seeded from `Config::sidebar_width`
@@ -487,6 +491,8 @@ impl Tty7App {
             )
         };
         let sftp_panel = crate::ui::sftp::SftpPanelState::new(window, cx);
+        let file_tree = crate::ui::file_tree::FileTreeState::new(window, cx);
+        let editor = crate::ui::code_editor::EditorPanelState::new(window, cx);
         // Managed-forward add-form inputs (native-SSH panes).
         let mf_bind_host = cx.new(|cx| InputState::new(window, cx).default_value("127.0.0.1"));
         let mf_bind_port = cx.new(|cx| InputState::new(window, cx).placeholder("8080"));
@@ -600,6 +606,8 @@ impl Tty7App {
                 mf_editing: None,
             },
             sftp_panel,
+            file_tree,
+            editor,
             sidebar_width: Rc::new(Cell::new(sidebar_width)),
             sidebar_dragging: Rc::new(Cell::new(false)),
             sidebar_scroll: gpui::ScrollHandle::new(),
@@ -2800,6 +2808,8 @@ impl Tty7App {
             OpenSettings => self.toggle_settings(window, cx),
             RestartDaemon => self.restart_daemon(window, cx),
             ToggleSftp => self.toggle_sftp(window, cx),
+            ToggleFileTree => self.toggle_file_tree(window, cx),
+            ToggleEditor => self.toggle_editor_panel(cx),
             RestartSshSession => self.restart_ssh_session(window, cx),
             SetTheme(i) => {
                 if let Some(id) = crate::ui::presets::all(cx).get(i).map(|t| t.id.clone()) {
@@ -2830,7 +2840,7 @@ impl Tty7App {
     /// The pane the agent-feed commands deliver to: the first leaf running a
     /// recognized coding agent, preferring the active tab, then any tab. `None`
     /// when no agent runs anywhere.
-    fn agent_target_leaf(&self, cx: &App) -> Option<Entity<TerminalView>> {
+    pub(crate) fn agent_target_leaf(&self, cx: &App) -> Option<Entity<TerminalView>> {
         let runs_agent = |leaf: &Entity<TerminalView>| leaf.read(cx).agent().is_some();
         if let Some(tab) = self.tabs.get(self.active)
             && let Some(leaf) = tab.pane.leaves().into_iter().find(runs_agent)
@@ -4115,6 +4125,28 @@ impl Render for Tty7App {
             // above. It covers only the body: the sidebar stays interactive.
             .when_some(self.render_diff_overlay(cx), |this, el| this.child(el));
 
+        // The code-panel row: [file tree | terminal body | editor]. The two
+        // side columns are optional (toggled); the terminal keeps the middle.
+        let file_tree_col = self.render_file_tree(window, cx);
+        let editor_col = self.render_editor_panel(window, cx);
+        let body_area = div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_row()
+            .when_some(file_tree_col, |this, el| this.child(el))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .child(body_area),
+            )
+            .when_some(editor_col, |this, el| this.child(el));
+
         // The two layouts. Horizontal (default): a column of [title bar / body].
         // Vertical: the rail is a full-height *left column* that reaches the very
         // top of the window — the traffic lights sit on its surface — with the
@@ -4189,9 +4221,13 @@ impl Render for Tty7App {
             .text_color(cx.theme().foreground)
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_action(cx.listener(|this, _: &NewTab, window, cx| this.new_tab(window, cx)))
-            .on_action(
-                cx.listener(|this, _: &CloseActiveTab, window, cx| this.close_pane(window, cx)),
-            )
+            .on_action(cx.listener(|this, _: &CloseActiveTab, window, cx| {
+                // With focus in the editor panel, ⌘W closes the active file
+                // tab instead of the terminal pane/tab.
+                if !this.editor_close_active_if_focused(window, cx) {
+                    this.close_pane(window, cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
                 this.split(Axis::Horizontal, window, cx)
             }))
@@ -4320,6 +4356,23 @@ impl Render for Tty7App {
                 cx.listener(|this, _: &RestartDaemon, window, cx| this.restart_daemon(window, cx)),
             )
             .on_action(cx.listener(|this, _: &ToggleSftp, window, cx| this.toggle_sftp(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &ToggleFileTree, window, cx| {
+                    this.toggle_file_tree(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &ToggleEditor, _window, cx| this.toggle_editor_panel(cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &EditorSave, window, cx| this.editor_save_active(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &EditorGotoDefinition, window, cx| {
+                this.editor_goto_definition(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &EditorFindReferences, window, cx| {
+                this.editor_find_references(window, cx)
+            }))
             // Quit lives on the same element-tree action path as every other Cmd
             // shortcut above, so a focused terminal routes `cmd-q` here rather
             // than relying solely on the global handler (which the keystroke
