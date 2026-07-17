@@ -432,7 +432,9 @@ pub fn hooks_state(agent: HookAgent) -> HooksState {
 
 /// Install (or rewrite in place) one agent's tty7 hooks. Idempotent: existing
 /// tty7 entries/files are replaced, never duplicated, and anything
-/// user-authored is left untouched. Returns a short human-readable summary.
+/// user-authored is left untouched. Returns a terse summary meant for the
+/// settings row's note line — the row already shows the agent and target
+/// path, so the summary never repeats them.
 pub fn install_hooks(agent: HookAgent) -> anyhow::Result<String> {
     let path = agent
         .target_path()
@@ -440,10 +442,7 @@ pub fn install_hooks(agent: HookAgent) -> anyhow::Result<String> {
     match agent {
         HookAgent::Claude => {
             hook_map_install(&path, agent, CLAUDE_HOOK_EVENTS)?;
-            Ok(format!(
-                "Claude Code hooks installed in {} — restart running claude sessions to pick them up",
-                path.display()
-            ))
+            Ok("Installed".to_string())
         }
         HookAgent::Codex => {
             hook_map_install(&path, agent, CODEX_HOOK_EVENTS)?;
@@ -451,11 +450,10 @@ pub fn install_hooks(agent: HookAgent) -> anyhow::Result<String> {
             // Best-effort: the file install above is complete and correct
             // either way, so a missing codex binary downgrades to advice
             // instead of failing the install.
-            let summary = format!("Codex hooks installed in {}", path.display());
             Ok(match enable_codex_hooks_feature() {
-                Ok(()) => summary,
+                Ok(()) => "Installed".to_string(),
                 Err(e) => format!(
-                    "{summary} — couldn't run `codex features enable hooks` ({e}); run it once manually"
+                    "Installed, but couldn't run `codex features enable hooks` ({e}) — run it once manually"
                 ),
             })
         }
@@ -463,11 +461,7 @@ pub fn install_hooks(agent: HookAgent) -> anyhow::Result<String> {
             let content = owned_file_content(agent)
                 .ok_or_else(|| anyhow::anyhow!("cannot resolve tty7's own executable path"))?;
             owned_file_install(&path, &content, &agent.marker())?;
-            Ok(format!(
-                "{} integration installed at {}",
-                agent.display_name(),
-                path.display()
-            ))
+            Ok("Installed".to_string())
         }
     }
 }
@@ -505,7 +499,11 @@ pub fn refresh_hooks_at_launch() -> usize {
         match install_hooks(agent) {
             Ok(summary) => {
                 refreshed += 1;
-                log::info!("refreshed stale agent hooks: {summary}");
+                log::info!(
+                    "refreshed stale {} hooks at {}: {summary}",
+                    agent.display_name(),
+                    agent.target_display()
+                );
             }
             Err(e) => log::warn!(
                 "could not refresh stale {} hooks: {e}",
@@ -733,11 +731,7 @@ fn hook_map_uninstall(path: &Path, agent: HookAgent) -> anyhow::Result<String> {
         return Ok("No tty7 hooks found; nothing to remove".to_string());
     }
     crate::core::config::write_atomic(path, serde_json::to_string_pretty(&root)?.as_bytes())?;
-    Ok(format!(
-        "{} hooks removed from {}",
-        agent.display_name(),
-        path.display()
-    ))
+    Ok("Removed".to_string())
 }
 
 /// The tty7 hook command inside one matcher entry
@@ -856,7 +850,7 @@ fn owned_file_uninstall(path: &Path, marker: &str) -> anyhow::Result<String> {
     {
         let _ = std::fs::remove_dir(parent);
     }
-    Ok(format!("Removed {}", path.display()))
+    Ok("Removed".to_string())
 }
 
 /// Copilot hook file (`~/.copilot/hooks/tty7.json`): Copilot auto-loads every
