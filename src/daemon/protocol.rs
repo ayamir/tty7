@@ -1540,6 +1540,7 @@ mod tests {
                 message: Some("Claude needs your permission to use Bash".into()),
                 session_id: Some("abc-123".into()),
                 rich: true,
+                cwd: Some("/repo/.claude/worktrees/fix-x".into()),
             })),
             DaemonMsg::AgentStatus(None),
             DaemonMsg::LoopbackForward(LoopbackForward { local_port: 49152 }),

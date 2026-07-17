@@ -110,7 +110,7 @@ fn build_hook_sequence(agent: &str, event: &str, stdin_json: &str) -> Vec<u8> {
         "agent": agent,
         "event": event,
     });
-    for key in ["session_id", "message"] {
+    for key in ["session_id", "message", "cwd"] {
         if let Some(v) = payload
             .get(key)
             .and_then(|v| v.as_str())
@@ -979,6 +979,7 @@ mod tests {
         assert_eq!(ev.kind, AgentEventKind::Notification);
         assert_eq!(ev.session_id.as_deref(), Some("abc-123"));
         assert!(ev.message.as_deref().unwrap().contains("permission"));
+        assert_eq!(ev.cwd.as_deref(), Some(std::path::Path::new("/w")));
 
         // Garbage stdin still yields a well-formed bare event.
         let seq = build_hook_sequence("claude", "stop", "not json at all");

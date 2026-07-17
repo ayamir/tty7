@@ -485,6 +485,13 @@ pub struct AgentSessionState {
     /// agent's own notification text was already toasted by the client).
     #[serde(default)]
     pub rich: bool,
+    /// The agent's working directory as its hook payloads report it — the
+    /// agent's own claim, which tracks internal chdirs the PTY can't show
+    /// (Claude Code's EnterWorktree moves the session without any shell `cd`).
+    /// Cleared on `session-end` so a finished session can't pin consumers to
+    /// a stale path; while absent, consumers fall back to the pane's proc cwd.
+    #[serde(default)]
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl AgentStatus {
@@ -511,6 +518,9 @@ impl AgentSessionState {
         self.rich = true;
         if let Some(id) = &ev.session_id {
             self.session_id = Some(id.clone());
+        }
+        if let Some(cwd) = &ev.cwd {
+            self.cwd = Some(cwd.clone());
         }
         match ev.kind {
             AgentEventKind::SessionStart => {
@@ -560,9 +570,12 @@ impl AgentSessionState {
             }
             // The agent session ended but its id stays: Claude & friends can
             // resume an *ended* session, which is exactly what restore does.
+            // Its cwd claim does NOT stay: with no agent running, the pane's
+            // real (proc-observed) directory is the truth again.
             AgentEventKind::SessionEnd => {
                 self.status = AgentStatus::Idle;
                 self.message = None;
+                self.cwd = None;
             }
         }
     }
@@ -596,6 +609,9 @@ pub struct AgentEvent {
     pub kind: AgentEventKind,
     pub session_id: Option<String>,
     pub message: Option<String>,
+    /// The agent's working directory at the moment the hook fired, when the
+    /// payload carries one (Claude Code sends it on every hook event).
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 /// Parse a complete OSC payload (identifier included, e.g.
@@ -621,6 +637,8 @@ pub fn parse_agent_event(payload: &[u8]) -> Option<AgentEvent> {
         session_id: Option<String>,
         #[serde(default)]
         message: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     }
 
     let w: Wire = serde_json::from_slice(json).ok()?;
@@ -631,6 +649,7 @@ pub fn parse_agent_event(payload: &[u8]) -> Option<AgentEvent> {
         kind,
         session_id: nonempty(w.session_id),
         message: nonempty(w.message),
+        cwd: nonempty(w.cwd).map(std::path::PathBuf::from),
     })
 }
 
@@ -880,6 +899,7 @@ mod tests {
             kind,
             session_id: id.map(String::from),
             message: msg.map(String::from),
+            cwd: None,
         };
 
         s.apply_event(&ev(AgentEventKind::SessionStart, None, Some("sid-1")));
@@ -937,6 +957,47 @@ mod tests {
         s.apply_event(&ev(AgentEventKind::SessionEnd, None, None));
         assert_eq!(s.status, AgentStatus::Idle);
         assert_eq!(s.session_id.as_deref(), Some("sid-1"));
+    }
+
+    /// The agent's cwd claim: any event carrying one sets it, later events
+    /// without one leave it alone (mid-turn events keep the worktree path
+    /// alive), and session end drops it — an exited agent must not pin the
+    /// pane's git line to a directory nothing runs in anymore.
+    #[test]
+    fn session_state_tracks_and_releases_the_agent_cwd() {
+        use std::path::PathBuf;
+
+        let ev = |kind, cwd: Option<&str>| AgentEvent {
+            agent: Some(CLIAgent::Claude),
+            kind,
+            session_id: None,
+            message: None,
+            cwd: cwd.map(PathBuf::from),
+        };
+
+        let mut s = AgentSessionState::default();
+        s.apply_event(&ev(AgentEventKind::SessionStart, Some("/repo")));
+        assert_eq!(s.cwd.as_deref(), Some(std::path::Path::new("/repo")));
+
+        // EnterWorktree lands as a tool-complete carrying the new directory.
+        s.apply_event(&ev(
+            AgentEventKind::ToolComplete,
+            Some("/repo/.claude/worktrees/fix-x"),
+        ));
+        assert_eq!(
+            s.cwd.as_deref(),
+            Some(std::path::Path::new("/repo/.claude/worktrees/fix-x"))
+        );
+
+        // An event without a cwd (another agent's sparser payload) keeps it.
+        s.apply_event(&ev(AgentEventKind::Stop, None));
+        assert_eq!(
+            s.cwd.as_deref(),
+            Some(std::path::Path::new("/repo/.claude/worktrees/fix-x"))
+        );
+
+        s.apply_event(&ev(AgentEventKind::SessionEnd, None));
+        assert_eq!(s.cwd, None, "session end releases the cwd claim");
     }
 
     #[test]
