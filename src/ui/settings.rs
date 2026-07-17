@@ -3031,7 +3031,7 @@ impl Tty7App {
             let (dot_color, status_text) = match state {
                 HooksState::NotInstalled => (muted_fg, "Not installed"),
                 HooksState::Installed => (success, "Installed"),
-                HooksState::Outdated => (warning, "Outdated — installed by another tty7 version"),
+                HooksState::Outdated => (warning, "Outdated"),
             };
             // The primary action reads as what it will *do* from this state.
             let primary_label = match state {
@@ -3044,8 +3044,11 @@ impl Tty7App {
                 .filter(|(for_agent, _)| *for_agent == agent)
                 .map(|(_, text)| text.clone());
 
+            // items_end: the whole stack shares the row's right edge, so
+            // status, buttons, and note line up across every agent row.
             let control = v_flex()
                 .gap_2()
+                .items_end()
                 .child(
                     h_flex()
                         .gap_2()
@@ -3075,8 +3078,18 @@ impl Tty7App {
                             )
                         }),
                 )
+                // Width-capped so a long note (error text) wraps instead of
+                // inflating the shrink-proof control column and crushing the
+                // label to zero width.
                 .when_some(row_note, |col, text| {
-                    col.child(div().text_xs().text_color(muted_fg).child(text))
+                    col.child(
+                        div()
+                            .max_w_80()
+                            .text_xs()
+                            .text_right()
+                            .text_color(muted_fg)
+                            .child(text),
+                    )
                 })
                 .into_any_element();
 
