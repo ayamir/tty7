@@ -44,8 +44,14 @@ pub struct GitStatus {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RepoSnapshot {
     /// The work tree root (`git rev-parse --show-toplevel`) — the cache key
-    /// every pane inside this repo shares.
+    /// every pane inside this work tree shares. For a linked worktree this is
+    /// the worktree's own directory, not the main checkout's.
     pub root: PathBuf,
+    /// The *repository* the work tree belongs to: the main checkout's root
+    /// when `root` is a linked worktree, otherwise `root` itself. The
+    /// sidebar's grouping key — every worktree of one repo shares it, while
+    /// branch/diff state stays per work tree under `root`.
+    pub home: PathBuf,
     pub branch: String,
     pub counts: Option<(u32, u32)>,
 }
@@ -61,10 +67,44 @@ pub fn probe(cwd: &Path) -> Option<RepoSnapshot> {
     let root = PathBuf::from(root.trim_end_matches(['\n', '\r']));
     let branch = branch_name(cwd)?;
     Some(RepoSnapshot {
+        home: repo_home(cwd, &root),
         root,
         branch,
         counts: diff_numstat(cwd),
     })
+}
+
+/// The repository "home" every checkout of one repo shares: for a linked
+/// worktree (its git dir differs from the common git dir) the main work
+/// tree's root — the parent of `<main>/.git`; for the main checkout itself,
+/// a submodule, or any failure to tell, the work-tree root unchanged. A bare
+/// common dir (no trailing `.git` component, the bare-repo-plus-worktrees
+/// layout) anchors on the bare directory itself — still one shared key.
+fn repo_home(cwd: &Path, root: &Path) -> PathBuf {
+    let both = git(
+        cwd,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    );
+    let Some(both) = both else {
+        return root.to_path_buf();
+    };
+    let mut lines = both.lines();
+    let (Some(git_dir), Some(common)) = (lines.next(), lines.next()) else {
+        return root.to_path_buf();
+    };
+    if git_dir == common {
+        return root.to_path_buf();
+    }
+    let common = Path::new(common);
+    match (common.file_name(), common.parent()) {
+        (Some(name), Some(parent)) if name == ".git" => parent.to_path_buf(),
+        _ => common.to_path_buf(),
+    }
 }
 
 /// The process-wide snapshot store (a gpui [`Global`](gpui::Global)): pane
@@ -81,6 +121,10 @@ pub fn probe(cwd: &Path) -> Option<RepoSnapshot> {
 pub struct GitStatusCache {
     /// cwd → its work-tree root; `None` = probed and found not to be a repo.
     roots: HashMap<PathBuf, Option<PathBuf>>,
+    /// work-tree root → the repository home it belongs to (see
+    /// [`RepoSnapshot::home`]). Identity for a plain checkout; the main
+    /// root for a linked worktree, so the sidebar groups them together.
+    homes: HashMap<PathBuf, PathBuf>,
     /// root → the snapshot every pane in that tree shares.
     status: HashMap<PathBuf, GitStatus>,
     /// cwds with a probe currently in flight, so concurrent triggers fold
@@ -102,13 +146,22 @@ impl GitStatusCache {
         self.status.get(root).cloned()
     }
 
-    /// What the cache *knows* about `cwd`'s work-tree root, three-valued for
-    /// the sidebar's repo grouping: `None` = no probe has answered yet (the
-    /// caller should keep whatever grouping it had, not reshuffle on a guess);
-    /// `Some(None)` = probed and confirmed outside any work tree;
-    /// `Some(Some(root))` = probed and inside the repo at `root`.
-    pub fn known_root_for(&self, cwd: &Path) -> Option<Option<PathBuf>> {
-        self.roots.get(cwd).cloned()
+    /// What the cache *knows* about the repository `cwd` belongs to,
+    /// three-valued for the sidebar's repo grouping: `None` = no probe has
+    /// answered yet (the caller should keep whatever grouping it had, not
+    /// reshuffle on a guess); `Some(None)` = probed and confirmed outside any
+    /// work tree; `Some(Some(home))` = probed and inside the repo at `home`.
+    /// `home` is the repository home, not the work-tree root — a linked
+    /// worktree answers with the main checkout's root, so every worktree of
+    /// one repo lands in one sidebar group.
+    pub fn known_repo_for(&self, cwd: &Path) -> Option<Option<PathBuf>> {
+        let root = self.roots.get(cwd)?;
+        Some(root.as_ref().map(|root| {
+            self.homes
+                .get(root)
+                .cloned()
+                .unwrap_or_else(|| root.clone())
+        }))
     }
 
     /// Claim a probe for `cwd`. `false` means one is already in flight — the
@@ -146,6 +199,7 @@ impl GitStatusCache {
                         removed,
                     },
                 );
+                self.homes.insert(snap.root.clone(), snap.home);
                 self.roots.insert(cwd.to_path_buf(), Some(snap.root));
             }
             // Not a repo (or the dir vanished). The root's entry stays for
@@ -249,8 +303,19 @@ mod tests {
     fn snap(root: &str, branch: &str, counts: Option<(u32, u32)>) -> RepoSnapshot {
         RepoSnapshot {
             root: PathBuf::from(root),
+            home: PathBuf::from(root),
             branch: branch.into(),
             counts,
+        }
+    }
+
+    /// A snapshot for a linked worktree: its own root, a shared repo home.
+    fn wt_snap(root: &str, home: &str, branch: &str) -> RepoSnapshot {
+        RepoSnapshot {
+            root: PathBuf::from(root),
+            home: PathBuf::from(home),
+            branch: branch.into(),
+            counts: Some((0, 0)),
         }
     }
 
@@ -310,12 +375,12 @@ mod tests {
         assert!(cache.status_for(b).is_some());
     }
 
-    /// The three-valued `known_root_for` the sidebar's repo grouping reads:
-    /// unprobed → `None`, probed-and-in-a-repo → `Some(Some(root))`,
+    /// The three-valued `known_repo_for` the sidebar's repo grouping reads:
+    /// unprobed → `None`, probed-and-in-a-repo → `Some(Some(home))`,
     /// probed-and-not-a-repo → `Some(None)`. The three cases are what let a
     /// sticky group key hold across an in-flight cd instead of flickering.
     #[test]
-    fn known_root_for_is_three_valued() {
+    fn known_repo_for_is_three_valued() {
         let mut cache = GitStatusCache::default();
         let (repo, plain, unseen) = (
             Path::new("/repo/a"),
@@ -325,14 +390,35 @@ mod tests {
         cache.finish_probe(repo, Some(snap("/repo", "main", Some((1, 0)))));
         cache.finish_probe(plain, None);
 
-        // Inside a work tree: the resolved root, wrapped twice.
+        // Inside a work tree: the resolved repo home, wrapped twice.
         assert_eq!(
-            cache.known_root_for(repo),
+            cache.known_repo_for(repo),
             Some(Some(PathBuf::from("/repo")))
         );
         // Probed and confirmed outside any repo: a definite "not a repo".
-        assert_eq!(cache.known_root_for(plain), Some(None));
+        assert_eq!(cache.known_repo_for(plain), Some(None));
         // Never probed: no answer yet — the caller keeps its sticky key.
-        assert_eq!(cache.known_root_for(unseen), None);
+        assert_eq!(cache.known_repo_for(unseen), None);
+    }
+
+    /// Linked worktrees of one repository share a *group* (`known_repo_for`
+    /// answers the main root for both) while their *status* stays per work
+    /// tree — different branches never clobber each other.
+    #[test]
+    fn worktrees_share_a_repo_but_not_a_status() {
+        let mut cache = GitStatusCache::default();
+        let (main, wt) = (Path::new("/repo"), Path::new("/repo/.wt/feat"));
+        cache.finish_probe(main, Some(wt_snap("/repo", "/repo", "main")));
+        cache.finish_probe(wt, Some(wt_snap("/repo/.wt/feat", "/repo", "feat/x")));
+
+        // One sidebar group…
+        assert_eq!(
+            cache.known_repo_for(main),
+            Some(Some(PathBuf::from("/repo")))
+        );
+        assert_eq!(cache.known_repo_for(wt), Some(Some(PathBuf::from("/repo"))));
+        // …two independent branch lines.
+        assert_eq!(cache.status_for(main).unwrap().branch, "main");
+        assert_eq!(cache.status_for(wt).unwrap().branch, "feat/x");
     }
 }

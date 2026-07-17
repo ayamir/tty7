@@ -101,13 +101,14 @@ pub struct Tab {
     /// switching back restores it; closing the tab drops it. Only the active
     /// tab's overlay is rendered. See [`crate::ui::diff_overlay`].
     pub(crate) diff_overlay: Option<crate::ui::diff_overlay::DiffOverlayState>,
-    /// The sidebar group this tab last *definitively* belonged to: the git
-    /// work-tree root of its first pane's cwd (deliberately not the focused
-    /// pane's — switching focus between splits must not relocate the row), or
-    /// `None` for outside any repo (the "Scratch" group). Sticky on purpose:
-    /// it only moves when
+    /// The sidebar group this tab last *definitively* belonged to: the
+    /// repository home of its first pane's cwd — the main checkout's root, so
+    /// linked worktrees of one repo share a group (deliberately not the
+    /// focused pane's cwd — switching focus between splits must not relocate
+    /// the row), or `None` for outside any repo (the "Scratch" group). Sticky
+    /// on purpose: it only moves when
     /// the git cache has a landed answer for the current cwd
-    /// ([`GitStatusCache::known_root_for`](crate::terminal::git_status::GitStatusCache::known_root_for)
+    /// ([`GitStatusCache::known_repo_for`](crate::terminal::git_status::GitStatusCache::known_repo_for)
     /// returns `Some`), so a cd whose probe is still in flight — or a pane
     /// with no cwd reported yet — keeps the row where it was instead of
     /// flickering through the Scratch group and back. A `RefCell` because the
