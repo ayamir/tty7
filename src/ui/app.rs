@@ -2499,6 +2499,30 @@ impl Tty7App {
         }
     }
 
+    /// "Mark as Unread" (tab context menu): re-flag every finished (`Done`)
+    /// agent turn in the tab as unread, so the avatar's green dot swells back
+    /// into its count badge until the user next looks at those panes. The
+    /// active tab's focus target is told the dismissed menu is about to hand
+    /// focus back to it, so that focus-in doesn't immediately re-read the mark
+    /// (see `TerminalView::mark_agent_result_unread`).
+    pub(crate) fn mark_tab_unread(&mut self, index: usize, cx: &mut Context<Self>) {
+        use crate::core::cli_agent::AgentStatus;
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let refocus = (index == self.active).then(|| tab.focus_target()).flatten();
+        for leaf in tab.pane.leaves() {
+            let refocus_incoming = refocus.as_ref() == Some(&leaf);
+            leaf.update(cx, |view, cx| {
+                if view.agent_session().map(|s| s.status) == Some(AgentStatus::Done) {
+                    view.mark_agent_result_unread(refocus_incoming);
+                    cx.notify();
+                }
+            });
+        }
+        cx.notify();
+    }
+
     /// The cwd of the tab's label-driving terminal (focused leaf, else first) —
     /// what the tab context menu's "Copy Working Directory" copies and "New
     /// Worktree Tab" derives the repo from.
