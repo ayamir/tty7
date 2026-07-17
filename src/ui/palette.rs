@@ -21,7 +21,6 @@ use gpui_component::{
 
 use uuid::Uuid;
 
-use crate::core::config::Config;
 use crate::core::ssh_profile::parse_quick_connect;
 
 /// What a command actually does. Most variants map to an existing `Tty7App`
@@ -234,7 +233,7 @@ impl Command {
     /// preset. The active theme is marked with a check so the list doubles as a
     /// "which theme am I on?" indicator.
     pub fn theme_commands(cx: &App) -> Vec<Command> {
-        let active = cx.global::<Config>().theme_preset.clone();
+        let active = crate::ui::theme::effective_preset_id(cx);
         crate::ui::presets::all(cx)
             .into_iter()
             .enumerate()
