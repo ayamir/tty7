@@ -6,7 +6,7 @@
 
 use gpui::{
     App, Axis, Context, FontWeight, MouseButton, MouseDownEvent, SharedString, Window, div,
-    prelude::*, px,
+    linear_color_stop, linear_gradient, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
@@ -735,50 +735,76 @@ impl Tty7App {
                 })
                 // Clickable / editable label region.
                 .child(label_region)
-                // Trailing slot: normally the close affordance — kept out of the
-                // way (opacity 0) on every chip, active or not, and fades in on
-                // chip hover, so a row of tabs reads clean instead of
-                // three-icons-per-chip busy. Space is reserved either way, so
-                // nothing shifts on hover. While the shortcut hints are armed,
-                // the same slot shows the tab's ⌘N badge instead.
-                .child(if show_badges && i < 9 {
+                // Trailing ⌘N badge: while the shortcut hints are armed the
+                // badge takes an in-flow 20px slot (the strip reflows once as
+                // the hints arm/disarm — a deliberate, all-chips-at-once modal
+                // moment). It can't float like the close button below: badges
+                // also show on unhovered inactive chips, which are transparent
+                // over the window background (possibly a gradient or image), so
+                // there's no solid colour to back an overlay with.
+                .when(show_badges && i < 9, |chip| {
                     // Bare digit, no keycap box — the hint blends into the chip
-                    // rather than reading as another button. Sized to the exact
-                    // 20px square of the close button it stands in for, so the
-                    // swap can never change the chip's width (an ellipsized
-                    // label would otherwise reflow and the strip would jitter).
-                    div()
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .size(px(20.))
-                        .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(if is_active {
-                            cx.theme().foreground
-                        } else {
-                            cx.theme().muted_foreground
-                        })
-                        .child(tab_badge_label(i))
-                        .into_any_element()
-                } else {
-                    div()
-                        .flex_shrink_0()
-                        .opacity(0.)
-                        .group_hover(SharedString::from(format!("tab-chip-{i}")), |s| {
-                            s.opacity(1.)
-                        })
-                        .child(
-                            Button::new(("tab-close", i))
-                                .icon(IconName::Close)
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.close_tab(i, window, cx);
-                                })),
-                        )
-                        .into_any_element()
+                    // rather than reading as another button.
+                    chip.child(
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(20.))
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(if is_active {
+                                cx.theme().foreground
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .child(tab_badge_label(i)),
+                    )
+                })
+                // Close affordance: out of flow, so the label runs the full
+                // chip width instead of always reserving a 20px slot for a
+                // button that's invisible until hover. On hover the ✕ floats
+                // over the label's right edge (Safari-style) on a solid backing
+                // in the chip's current fill — `secondary` on the active chip,
+                // `muted` on an inactive one, whose hover fill is exactly what
+                // the ✕'s visibility implies — with a short gradient run-in so
+                // covered text fades out instead of hard-cutting mid-glyph.
+                // Nothing reflows on hover.
+                .when(!(show_badges && i < 9), |chip| {
+                    let backing = if is_active {
+                        cx.theme().secondary
+                    } else {
+                        cx.theme().muted
+                    };
+                    let mut fade_from = backing;
+                    fade_from.a = 0.;
+                    chip.child(
+                        h_flex()
+                            .absolute()
+                            .top(px(5.))
+                            .right(px(6.))
+                            .opacity(0.)
+                            .group_hover(SharedString::from(format!("tab-chip-{i}")), |s| {
+                                s.opacity(1.)
+                            })
+                            .child(div().w(px(10.)).h(px(20.)).bg(linear_gradient(
+                                90.,
+                                linear_color_stop(fade_from, 0.),
+                                linear_color_stop(backing, 1.),
+                            )))
+                            .child(
+                                div().bg(backing).child(
+                                    Button::new(("tab-close", i))
+                                        .icon(IconName::Close)
+                                        .ghost()
+                                        .xsmall()
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.close_tab(i, window, cx);
+                                        })),
+                                ),
+                            ),
+                    )
                 });
 
             // Per-tab right-click menu (rename / worktree / split / copy cwd /
