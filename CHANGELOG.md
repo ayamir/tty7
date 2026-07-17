@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [26.7.1] - 2026-07-17
+
+### Added
+
+- **Follow the OS appearance** — a "Sync with system" mode with separate
+  light and dark theme slots: the theme flips live when the OS switches
+  appearance, native chrome follows along, and picking a theme while
+  syncing writes the slot matching the current mode. Old configs are
+  unchanged (sync defaults off). (#121)
+- **Mark as Unread on tabs** — the tab context menu can re-flag a finished
+  agent result you've already looked at, re-arming the unread badge on the
+  Done dot. Agent tabs only; disabled while the agent is still working.
+  (#120)
+
+### Changed
+
+- **"Duo" logo refresh** — a new brand mark (two offset session panes,
+  mint behind ink, with a prompt chevron) replaces the orange window
+  identity across every icon asset: app icon, logo, tray glyph, favicon,
+  and social preview. Bare macOS binaries (`cargo run`) now show the icon
+  in the Dock too. (#124)
+
+### Fixed
+
+- **Linked git worktrees group under their main repository** — the sidebar
+  keys groups on the repository home instead of each worktree's own root,
+  so a repo and its worktrees share one header while branch status stays
+  per-worktree. (#118)
+- **macOS tray icon stays a template image in every state** — the
+  attention state no longer swaps in a grey non-template glyph that was
+  illegible on many menu-bar appearances; agent status lives in the
+  tooltip and tray menu. (#122)
+- **No more console-window flashes from Windows agent hooks** — each hook
+  emitter frees its throwaway console before it can paint (debug builds
+  only; release builds were unaffected). (#119)
+
 ## [26.7.0] - 2026-07-16
 
 First CalVer release: versions are now `YY.M.PATCH`, so the number says when

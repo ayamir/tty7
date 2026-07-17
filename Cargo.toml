@@ -1,6 +1,6 @@
 [package]
 name = "tty7"
-version = "26.7.0"
+version = "26.7.1"
 edition = "2024"
 description = "A terminal workbench: shells, persistent sessions, SSH, coding agents — GPU-rendered on Zed's gpui, pure Rust"
 repository = "https://github.com/l0ng-ai/tty7"
