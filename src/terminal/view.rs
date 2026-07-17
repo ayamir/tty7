@@ -247,6 +247,13 @@ pub struct TerminalView {
     /// while this is true, so a result you've already seen stops nagging. Blue
     /// (working) / amber (waiting) are unaffected — they track live state.
     agent_result_unread: bool,
+    /// One-shot guard for a manual "Mark as Unread" on the pane the dismissed
+    /// context menu is about to refocus: closing the menu returns window focus
+    /// to that pane, and the resulting focus-in would instantly clear the mark
+    /// the user just made. Armed by [`mark_agent_result_unread`]
+    /// (Self::mark_agent_result_unread); the next focus-in consumes it instead
+    /// of clearing, so the mark survives until the user genuinely comes back.
+    keep_unread_on_focus: bool,
     /// The cwd this pane's git line reads from (and last scheduled a probe
     /// for), so the poll loop only reprobes when the working directory
     /// actually changes. The snapshot itself lives in the process-wide
@@ -824,8 +831,14 @@ impl TerminalView {
                 view.focused = true;
                 view.cursor_visible = true;
                 // Looking at the pane marks its finished turn read, so the tab
-                // avatar's green Done dot clears.
-                view.agent_result_unread = false;
+                // avatar's green Done dot clears — unless this focus-in is
+                // just the context menu handing focus back after a manual
+                // "Mark as Unread" (the one-shot guard eats it).
+                if view.keep_unread_on_focus {
+                    view.keep_unread_on_focus = false;
+                } else {
+                    view.agent_result_unread = false;
+                }
                 view.report_focus_change(true);
                 cx.notify();
             }),
@@ -944,6 +957,7 @@ impl TerminalView {
             agent_turn_started: None,
             agent_was_rich: false,
             agent_result_unread: false,
+            keep_unread_on_focus: false,
             git_status_cwd: None,
             cmd: CmdEditor::new(),
             typeahead: Typeahead::new(),
@@ -1026,6 +1040,16 @@ impl TerminalView {
     /// for any `Done`.
     pub fn agent_result_unread(&self) -> bool {
         self.agent_result_unread
+    }
+
+    /// Re-flag this pane's finished turn as unread — the tab context menu's
+    /// "Mark as Unread". `refocus_incoming` is true for the pane the dismissed
+    /// menu is about to hand window focus back to (the active tab's focused
+    /// leaf): that focus-in is the menu closing, not the user reading the
+    /// result, so it must not clear the mark it just made.
+    pub fn mark_agent_result_unread(&mut self, refocus_incoming: bool) {
+        self.agent_result_unread = true;
+        self.keep_unread_on_focus = refocus_incoming;
     }
 
     /// The git snapshot for this pane's cwd (branch + working-tree diff), for
@@ -2549,9 +2573,13 @@ impl TerminalView {
         match status {
             Some(AgentStatus::Done) if prev != Some(AgentStatus::Done) => {
                 self.agent_result_unread = !self.focused;
+                self.keep_unread_on_focus = false;
             }
             Some(AgentStatus::Done) => {}
-            _ => self.agent_result_unread = false,
+            _ => {
+                self.agent_result_unread = false;
+                self.keep_unread_on_focus = false;
+            }
         }
 
         let rich = session.as_ref().is_some_and(|s| s.rich);

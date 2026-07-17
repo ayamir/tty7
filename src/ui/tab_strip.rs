@@ -403,6 +403,27 @@ impl Tty7App {
             }
         }));
 
+        // Mark as Unread — re-arm the avatar's green Done badge so a result
+        // you want to revisit nags again. Only agent tabs get the entry, and
+        // only a settled (`Done`) tab has a finished turn to mark; a busier
+        // status (working/waiting) owns the dot anyway, so the entry disables
+        // rather than promising a badge that can't show yet.
+        let tab = this.tabs.get(index);
+        if tab.is_some_and(|t| t.agent(cx).is_some()) {
+            let done = tab.and_then(|t| t.agent_status(cx))
+                == Some(crate::core::cli_agent::AgentStatus::Done);
+            menu = menu.item(
+                PopupMenuItem::new("Mark as Unread")
+                    .disabled(!done)
+                    .on_click({
+                        let app = app.clone();
+                        move |_, _window, cx| {
+                            let _ = app.update(cx, |this, cx| this.mark_tab_unread(index, cx));
+                        }
+                    }),
+            );
+        }
+
         // Worktree: an isolated checkout of this tab's repo on a fresh branch,
         // opened as a new tab — parallel-agent fuel. Only offered when the
         // tab's cwd actually sits in a git repository (a filesystem-only
