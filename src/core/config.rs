@@ -852,6 +852,27 @@ mod tests {
     }
 
     #[test]
+    fn theme_follow_system_defaults_and_round_trips() {
+        // Old configs (no follow-system keys) must land on off + the built-in
+        // light/dark pair, so nothing changes until the user opts in.
+        let cfg: Config = serde_json::from_str(r#"{"theme_preset":"dracula"}"#).unwrap();
+        assert!(!cfg.theme_follow_system);
+        assert_eq!(cfg.theme_preset_light, "light");
+        assert_eq!(cfg.theme_preset_dark, "dark");
+        assert_eq!(cfg.theme_preset, "dracula");
+
+        let mut cfg = Config::default();
+        cfg.theme_follow_system = true;
+        cfg.theme_preset_light = "one_light".to_string();
+        cfg.theme_preset_dark = "dracula".to_string();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert!(back.theme_follow_system);
+        assert_eq!(back.theme_preset_light, "one_light");
+        assert_eq!(back.theme_preset_dark, "dracula");
+    }
+
+    #[test]
     fn font_features_are_optional_and_parse_as_gpui_features() {
         let cfg: Config =
             serde_json::from_str(r#"{"font_features":{"calt":true,"liga":1}}"#).unwrap();

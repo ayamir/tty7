@@ -360,8 +360,8 @@ pub(crate) struct SettingsState {
     /// Global window-opacity slider (Appearance's Window section). Shows the
     /// effective value; dragging sets the config override.
     pub(crate) window_opacity_slider: Entity<SliderState>,
-    /// The color editor for the active editable theme, or `None` when the active
-    /// theme is read-only (a built-in / import) or the system is being followed.
+    /// The color editor for the effective (on-screen) theme, or `None` when
+    /// that theme is read-only (a built-in / import).
     pub(crate) theme_editor: Option<ThemeEditor>,
     /// Whether the theme picker panel is open beside the content pane
     /// (Appearance section only). Toggled from the theme card(s).

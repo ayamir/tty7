@@ -1137,10 +1137,11 @@ impl Tty7App {
     }
 
     /// Turn "sync with system appearance" on/off (the Appearance switch).
-    /// Flipping it never visibly changes the theme by itself: turning it on
-    /// seeds the slot matching the manual theme's own brightness with that
-    /// theme, and turning it off adopts whatever is on screen as the manual
-    /// choice.
+    /// Turning it off never visibly changes the theme: whatever is on screen
+    /// is adopted as the manual choice. Turning it on seeds the slot matching
+    /// the manual theme's own brightness with that theme — so the look only
+    /// changes when the OS is currently in the *other* mode, where switching
+    /// to that mode's slot is exactly what the feature promises.
     pub(crate) fn set_theme_follow_system(
         &mut self,
         on: bool,
