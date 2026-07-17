@@ -1,4 +1,5 @@
-//! Local project file tree (left column of the terminal body).
+//! Local project file tree (the code overlay's left column — see
+//! `code_editor::render_code_overlay` for the panel that hosts it).
 //!
 //! Modelled on Warp's Project Explorer: lazily-loaded directories, gitignore
 //! awareness (ignored entries render dimmed, not hidden), a filesystem watcher
@@ -98,7 +99,6 @@ impl TreeEdit {
 
 /// State for the file-tree panel, held on [`Tty7App`].
 pub(crate) struct FileTreeState {
-    pub(crate) open: bool,
     pub(crate) roots: Vec<PathBuf>,
     expanded: HashSet<PathBuf>,
     /// Lazily-loaded listing per directory; invalidated by watcher events.
@@ -138,7 +138,6 @@ impl FileTreeState {
         })
         .detach();
         Self {
-            open: false,
             roots: Vec::new(),
             expanded: HashSet::new(),
             children: HashMap::new(),
@@ -356,21 +355,6 @@ pub(crate) fn shell_quote(path: &Path) -> String {
 // ---------------------------------------------------------------------------
 
 impl Tty7App {
-    /// `ToggleFileTree`: show/hide the panel, re-deriving roots on open.
-    pub(crate) fn toggle_file_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.file_tree.open {
-            self.file_tree.open = false;
-            self.file_tree.editing = None;
-            self.file_tree.editing_subs.clear();
-            cx.notify();
-            return;
-        }
-        self.file_tree.open = true;
-        self.file_tree_refresh_roots(window, cx);
-        self.file_tree.focus_handle.focus(window, cx);
-        cx.notify();
-    }
-
     /// Derive the root set from the active tab's panes: each pane cwd maps to
     /// its repo root (or itself outside a repo); home as the last resort.
     pub(crate) fn file_tree_refresh_roots(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -412,7 +396,9 @@ impl Tty7App {
         paths: &HashSet<PathBuf>,
         cx: &mut Context<Self>,
     ) {
-        if !self.file_tree.open {
+        // The tree only renders inside the code overlay; skip churn while it
+        // is closed (the caches rebuild lazily on the next open anyway).
+        if !self.editor.open {
             return;
         }
         let gitignore_touched = paths
@@ -733,15 +719,13 @@ enum TreeEditKind {
 // ---------------------------------------------------------------------------
 
 impl Tty7App {
-    /// The tree column (left of the terminal body), or `None` when hidden.
-    pub(crate) fn render_file_tree(
+    /// The file-tree column: the code overlay's left side (the overlay
+    /// renders the divider and the editor to its right).
+    pub(crate) fn render_file_tree_column(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if !self.file_tree.open {
-            return None;
-        }
+    ) -> AnyElement {
         self.file_tree.ensure_loaded();
         let width = self.file_tree.width.get().clamp(MIN_WIDTH, MAX_WIDTH);
         let rows = self.file_tree.visible_rows();
@@ -758,29 +742,19 @@ impl Tty7App {
                     .flat_map(|row| self.render_tree_row(row, window, cx)),
             );
 
-        let panel = v_flex()
+        v_flex()
             .id("file-tree-panel")
             .flex_none()
             .h_full()
             .w(px(width))
             .bg(cx.theme().background)
-            .border_r_1()
-            .border_color(cx.theme().border)
             .track_focus(&self.file_tree.focus_handle)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 this.file_tree_key_down(ev, window, cx);
             }))
             .child(self.render_tree_header(cx))
-            .child(list);
-
-        Some(
-            h_flex()
-                .flex_none()
-                .h_full()
-                .child(panel)
-                .child(self.render_tree_divider(cx))
-                .into_any_element(),
-        )
+            .child(list)
+            .into_any_element()
     }
 
     /// Panel header: title + refresh / new-file / hidden-files toggle.
@@ -823,17 +797,6 @@ impl Tty7App {
                     })
                     .on_click(cx.listener(|this, _, _w, cx| {
                         this.file_tree.show_hidden = !this.file_tree.show_hidden;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new("tree-close")
-                    .icon(IconName::Close)
-                    .ghost()
-                    .xsmall()
-                    .tooltip("Close file tree")
-                    .on_click(cx.listener(|this, _, _w, cx| {
-                        this.file_tree.open = false;
                         cx.notify();
                     })),
             )
@@ -1078,7 +1041,7 @@ impl Tty7App {
     }
 
     /// The draggable divider on the tree's right edge.
-    fn render_tree_divider(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_tree_divider(&self, cx: &mut Context<Self>) -> AnyElement {
         let width = self.file_tree.width.clone();
         let dragging = self.file_tree.dragging.clone();
         let idle = cx.theme().border;

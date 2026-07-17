@@ -2308,7 +2308,14 @@ impl Tty7App {
             // In sidebar mode, pull the newly active row into view (a no-op when
             // the strip is horizontal — the handle tracks no painted list then).
             self.sidebar_scroll.scroll_to_item(index);
-            self.focus_active(window, cx);
+            if self.editor.open {
+                // Code panel up: the tree follows the incoming tab's repos, and
+                // focus stays on the panel (the terminal is covered).
+                self.file_tree_refresh_roots(window, cx);
+                self.file_tree.focus_handle.focus(window, cx);
+            } else {
+                self.focus_active(window, cx);
+            }
             self.save_session(cx);
             cx.notify();
         }
@@ -2809,8 +2816,7 @@ impl Tty7App {
             OpenSettings => self.toggle_settings(window, cx),
             RestartDaemon => self.restart_daemon(window, cx),
             ToggleSftp => self.toggle_sftp(window, cx),
-            ToggleFileTree => self.toggle_file_tree(window, cx),
-            ToggleEditor => self.toggle_editor_panel(cx),
+            ToggleCodePanel => self.toggle_code_panel(window, cx),
             RestartSshSession => self.restart_ssh_session(window, cx),
             SetTheme(i) => {
                 if let Some(id) = crate::ui::presets::all(cx).get(i).map(|t| t.id.clone()) {
@@ -4121,32 +4127,18 @@ impl Render for Tty7App {
             .when_some(self.render_worktree_prompt_overlay(cx), |this, el| {
                 this.child(el)
             })
+            // Code panel: a full-body overlay ([file tree | editor], IDE-style)
+            // that covers the terminal like the settings/diff overlays do — the
+            // terminal underneath keeps its size, so toggling never reflows it.
+            // Covers only the body: the tab sidebar stays visible and switches
+            // tabs (which re-roots the tree) while the panel is up.
+            .when_some(self.render_code_overlay(window, cx), |this, el| {
+                this.child(el)
+            })
             // Working-tree diff overlay (clicked from a sidebar git line) —
             // last child, so it paints over every pane-contextual element
             // above. It covers only the body: the sidebar stays interactive.
             .when_some(self.render_diff_overlay(cx), |this, el| this.child(el));
-
-        // The code-panel row: [file tree | terminal body | editor]. The two
-        // side columns are optional (toggled); the terminal keeps the middle.
-        let file_tree_col = self.render_file_tree(window, cx);
-        let editor_col = self.render_editor_panel(window, cx);
-        let body_area = div()
-            .flex_1()
-            .min_h_0()
-            .w_full()
-            .flex()
-            .flex_row()
-            .when_some(file_tree_col, |this, el| this.child(el))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .child(body_area),
-            )
-            .when_some(editor_col, |this, el| this.child(el));
 
         // The two layouts. Horizontal (default): a column of [title bar / body].
         // Vertical: the rail is a full-height *left column* that reaches the very
@@ -4357,14 +4349,9 @@ impl Render for Tty7App {
                 cx.listener(|this, _: &RestartDaemon, window, cx| this.restart_daemon(window, cx)),
             )
             .on_action(cx.listener(|this, _: &ToggleSftp, window, cx| this.toggle_sftp(window, cx)))
-            .on_action(
-                cx.listener(|this, _: &ToggleFileTree, window, cx| {
-                    this.toggle_file_tree(window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &ToggleEditor, _window, cx| this.toggle_editor_panel(cx)),
-            )
+            .on_action(cx.listener(|this, _: &ToggleCodePanel, window, cx| {
+                this.toggle_code_panel(window, cx)
+            }))
             .on_action(
                 cx.listener(|this, _: &EditorSave, window, cx| this.editor_save_active(window, cx)),
             )

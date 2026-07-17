@@ -193,12 +193,9 @@ pub(crate) fn default_bindings() -> Vec<(&'static str, &'static str)> {
         // No default chord — reachable from the command palette ("SFTP Panel") and
         // bindable in Settings like any other action.
         ("ToggleSftp", ""),
-        // Project file tree, VS Code's explorer chord. ⌘⇧E is free (no existing
-        // binding or preset uses it).
-        ("ToggleFileTree", "secondary-shift-e"),
-        // No default chord — the panel opens itself when a file is opened from
-        // the tree; reachable from the palette and bindable in Settings.
-        ("ToggleEditor", ""),
+        // The code panel (file tree + editor overlay), on VS Code's explorer
+        // chord. ⌘⇧E is free (no existing binding or preset uses it).
+        ("ToggleCodePanel", "secondary-shift-e"),
         // Save the editor's active file. ⌘S is free — the terminal has no save.
         ("EditorSave", "secondary-s"),
         // LSP navigation in the editor panel, on the VS Code chords.
@@ -494,8 +491,7 @@ fn make_binding(action: &str, keystroke: &str) -> Option<KeyBinding> {
         "ClearScrollback" => KeyBinding::new(keystroke, ClearScrollback, Some("Terminal")),
         "OpenSettings" => KeyBinding::new(keystroke, OpenSettings, None),
         "ToggleSftp" => KeyBinding::new(keystroke, ToggleSftp, None),
-        "ToggleFileTree" => KeyBinding::new(keystroke, ToggleFileTree, None),
-        "ToggleEditor" => KeyBinding::new(keystroke, ToggleEditor, None),
+        "ToggleCodePanel" => KeyBinding::new(keystroke, ToggleCodePanel, None),
         "EditorSave" => KeyBinding::new(keystroke, EditorSave, None),
         "EditorGotoDefinition" => KeyBinding::new(keystroke, EditorGotoDefinition, None),
         "EditorFindReferences" => KeyBinding::new(keystroke, EditorFindReferences, None),

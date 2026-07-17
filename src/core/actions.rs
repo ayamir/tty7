@@ -59,10 +59,9 @@ actions!(
         RestartDaemon,
         // Toggle the SFTP file panel for the focused native-SSH pane (WS5).
         ToggleSftp,
-        // Toggle the local project file tree (left column of the body).
-        ToggleFileTree,
-        // Toggle the code-editor panel (right column of the body).
-        ToggleEditor,
+        // Toggle the code panel: a full-body overlay of [file tree | editor]
+        // covering the terminal (settings-overlay style).
+        ToggleCodePanel,
         // Save the editor panel's active file (⌘S).
         EditorSave,
         // LSP jump to the definition of the symbol at the editor cursor (F12).

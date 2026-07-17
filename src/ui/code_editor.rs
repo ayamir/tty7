@@ -1,29 +1,30 @@
-//! Docked code-editor panel (right side of the terminal body).
+//! The code panel: a full-body overlay of `[file tree | editor]` that covers
+//! the terminal, settings-overlay style.
 //!
-//! A lightweight "look at / touch up code without leaving the terminal" editor,
-//! modelled on Warp's code panel rather than a full IDE. The text engine is
-//! `gpui_component::input::InputState` in CodeEditor mode, which brings rope
-//! storage, tree-sitter syntax highlighting, line numbers, indent guides, code
-//! folding, auto-indent, undo/redo and an in-buffer search/replace bar. This
-//! module owns everything around that engine: the open-file set and tab strip,
-//! dirty tracking and save, external-modification reload (via `notify`), and
-//! the panel chrome (resizable divider, unsaved-close confirmation).
+//! A lightweight "look at / touch up code without leaving the terminal"
+//! editor, not a full IDE. The text engine is `gpui_component::input::
+//! InputState` in CodeEditor mode, which brings rope storage, tree-sitter
+//! syntax highlighting, line numbers, indent guides, code folding,
+//! auto-indent, undo/redo and an in-buffer search/replace bar. This module
+//! owns everything around that engine: the open-file set and tab strip, dirty
+//! tracking and save, external-modification reload (via `notify`), the
+//! unsaved-close confirmation, and the overlay chrome itself (the file-tree
+//! column comes from `ui::file_tree`).
 //!
-//! Layout: the panel is a right-hand column of the terminal body (a sibling of
-//! the pane tree, like the file tree on the left), so terminals and code stay
-//! side by side — the Warp mental model, without generalizing the split-pane
-//! tree away from `Entity<TerminalView>`.
+//! Layout: overlaying the body (like Settings and the diff overlay) rather
+//! than docking a side column means toggling never resizes the terminal — no
+//! PTY resize, no reflow — and the editor gets the full body width. The tab
+//! sidebar stays visible; switching tabs re-roots the tree. One entry point:
+//! the title-bar tile in `tab_strip` (`ToggleCodePanel`, ⌘⇧E; Esc closes).
 
-use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::time::SystemTime;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Bounds, Context, Entity, Focusable as _, MouseButton, MouseMoveEvent, MouseUpEvent,
-    Pixels, PromptLevel, SharedString, Subscription, Window, canvas, div, px,
+    AnyElement, Context, Entity, Focusable as _, MouseButton, PromptLevel, SharedString,
+    Subscription, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState, TabSize};
@@ -32,13 +33,6 @@ use gpui_component::{
 };
 
 use crate::ui::app::Tty7App;
-
-/// Width band for the editor column, as a fraction of the window body. The
-/// divider drag clamps into this so neither the terminal nor the editor can be
-/// squeezed into an unusable sliver.
-const MIN_WIDTH_FRAC: f32 = 0.2;
-const MAX_WIDTH_FRAC: f32 = 0.8;
-const DEFAULT_WIDTH_FRAC: f32 = 0.45;
 
 /// Refuse to open files larger than this: the component's code editor is rated
 /// to ~50K lines, and a multi-megabyte blob is almost never what a terminal
@@ -92,11 +86,6 @@ pub(crate) struct EditorPanelState {
     pub(crate) open: bool,
     pub(crate) files: Vec<OpenFile>,
     pub(crate) active: usize,
-    /// Editor column width as a fraction of the body; shared cell so the
-    /// divider drag closure can update it mid-render (same pattern as the
-    /// split-pane ratio and the tab sidebar width).
-    pub(crate) width_frac: Rc<Cell<f32>>,
-    dragging: Rc<Cell<bool>>,
     /// Watches the parent directories of open files for external changes.
     /// Rebuilt whenever the open set changes; `None` while nothing is open.
     watcher: Option<notify::RecommendedWatcher>,
@@ -146,8 +135,6 @@ impl EditorPanelState {
             open: false,
             files: Vec::new(),
             active: 0,
-            width_frac: Rc::new(Cell::new(DEFAULT_WIDTH_FRAC)),
-            dragging: Rc::new(Cell::new(false)),
             watcher: None,
             events_tx: tx,
             lsp: crate::ui::lsp::LspRegistry::new(window, cx),
@@ -411,10 +398,24 @@ impl Tty7App {
         cx.notify();
     }
 
-    /// Show/hide the editor column. Opening with no files is allowed — the
-    /// empty state points at the file tree.
-    pub(crate) fn toggle_editor_panel(&mut self, cx: &mut Context<Self>) {
-        self.editor.open = !self.editor.open;
+    /// `ToggleCodePanel` (⌘⇧E / the title-bar tree icon / Esc): flip the
+    /// code overlay. Opening re-roots the file tree from the active tab's
+    /// panes and focuses the panel; closing hands focus back to the terminal.
+    pub(crate) fn toggle_code_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor.open {
+            self.editor.open = false;
+            self.file_tree.editing = None;
+            self.focus_active(window, cx);
+            cx.notify();
+            return;
+        }
+        self.editor.open = true;
+        self.file_tree_refresh_roots(window, cx);
+        if self.editor.active_file().is_some() {
+            self.focus_editor(window, cx);
+        } else {
+            self.file_tree.focus_handle.focus(window, cx);
+        }
         cx.notify();
     }
 
@@ -734,9 +735,10 @@ impl Tty7App {
 // ---------------------------------------------------------------------------
 
 impl Tty7App {
-    /// The editor column (right of the terminal body), or `None` when hidden.
-    /// Rendered as `[divider | tabs / banner / editor]`.
-    pub(crate) fn render_editor_panel(
+    /// The code panel: a full-body overlay of `[file tree | editor]` covering
+    /// the terminal (settings/diff-overlay style), or `None` while closed.
+    /// The terminal underneath keeps its size — toggling never reflows it.
+    pub(crate) fn render_code_overlay(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -744,11 +746,6 @@ impl Tty7App {
         if !self.editor.open {
             return None;
         }
-        let width = self
-            .editor
-            .width_frac
-            .get()
-            .clamp(MIN_WIDTH_FRAC, MAX_WIDTH_FRAC);
         let body = match self.editor.active_file() {
             None => self.render_editor_empty(cx).into_any_element(),
             // Markdown preview replaces the buffer with a rendered view.
@@ -782,15 +779,10 @@ impl Tty7App {
             .map(|_| self.render_editor_conflict_banner(cx));
         let references = self.render_editor_references(cx);
 
-        let panel = v_flex()
-            .id("code-editor-panel")
-            .flex_none()
+        let editor_col = v_flex()
+            .flex_1()
+            .min_w_0()
             .h_full()
-            .w(gpui::relative(width))
-            .min_w(px(240.))
-            .bg(cx.theme().background)
-            .border_l_1()
-            .border_color(cx.theme().border)
             .child(self.render_editor_tabs(window, cx))
             .when_some(conflict_banner, |this, b| this.child(b))
             .child(div().flex_1().min_h_0().child(body))
@@ -798,10 +790,22 @@ impl Tty7App {
 
         Some(
             h_flex()
-                .flex_none()
-                .h_full()
-                .child(self.render_editor_divider(cx))
-                .child(panel)
+                .id("code-panel")
+                .absolute()
+                .inset_0()
+                // The overlay must swallow input to the terminal behind it.
+                .occlude()
+                .bg(cx.theme().background)
+                // Escape (not consumed by the editor's own search/completion
+                // handling, which stops propagation) drops back to the terminal.
+                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                    if ev.keystroke.key == "escape" {
+                        this.toggle_code_panel(window, cx);
+                    }
+                }))
+                .child(self.render_file_tree_column(window, cx))
+                .child(self.render_tree_divider(cx))
+                .child(editor_col)
                 .into_any_element(),
         )
     }
@@ -928,10 +932,9 @@ impl Tty7App {
                     .icon(IconName::Close)
                     .ghost()
                     .small()
-                    .tooltip("Close editor panel")
-                    .on_click(cx.listener(|this, _, _w, cx| {
-                        this.editor.open = false;
-                        cx.notify();
+                    .tooltip("Back to Terminal (Esc)")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_code_panel(window, cx);
                     })),
             )
     }
@@ -1052,87 +1055,6 @@ impl Tty7App {
                         }
                     })),
             )
-            .into_any_element()
-    }
-
-    /// The draggable divider between the terminal body and the editor column.
-    /// Same canvas + window-mouse-listener pattern as the split-pane divider.
-    fn render_editor_divider(&self, cx: &mut Context<Self>) -> AnyElement {
-        let width_frac = self.editor.width_frac.clone();
-        let dragging = self.editor.dragging.clone();
-        let idle = cx.theme().border;
-        let active = cx.theme().drag_border;
-
-        // Measured bounds of the whole body row (terminal + editor), captured
-        // by the backing canvas so the drag maps pointer → width fraction.
-        let container: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
-        let backing = canvas(
-            {
-                let container = container.clone();
-                move |bounds, _window, _cx| container.set(Some(bounds))
-            },
-            {
-                let container = container.clone();
-                let width_frac = width_frac.clone();
-                let dragging = dragging.clone();
-                move |_bounds, _state, window, _cx| {
-                    window.on_mouse_event({
-                        let container = container.clone();
-                        let width_frac = width_frac.clone();
-                        let dragging = dragging.clone();
-                        move |ev: &MouseMoveEvent, _phase, window, _cx| {
-                            if !dragging.get() {
-                                return;
-                            }
-                            let Some(b) = container.get() else { return };
-                            // The canvas only spans the divider itself; use the
-                            // window width as the drag reference instead.
-                            let total = window.viewport_size().width;
-                            if total.as_f32() <= 0.0 {
-                                return;
-                            }
-                            let from_right = (total - ev.position.x).max(px(0.));
-                            let frac = (from_right / total).clamp(MIN_WIDTH_FRAC, MAX_WIDTH_FRAC);
-                            let _ = b;
-                            width_frac.set(frac);
-                            window.refresh();
-                        }
-                    });
-                    window.on_mouse_event({
-                        let dragging = dragging.clone();
-                        move |_ev: &MouseUpEvent, _phase, window, _cx| {
-                            if dragging.get() {
-                                dragging.set(false);
-                                window.refresh();
-                            }
-                        }
-                    });
-                }
-            },
-        )
-        .absolute()
-        .size_full();
-
-        let line = if dragging.get() { active } else { idle };
-        div()
-            .id("editor-divider")
-            .relative()
-            .flex_none()
-            .w(px(5.))
-            .h_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor_col_resize()
-            .child(backing)
-            .child(div().w(px(1.)).h_full().bg(line))
-            .on_mouse_down(MouseButton::Left, {
-                let dragging = dragging.clone();
-                move |_ev, window, _cx| {
-                    dragging.set(true);
-                    window.refresh();
-                }
-            })
             .into_any_element()
     }
 }

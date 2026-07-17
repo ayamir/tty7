@@ -11,7 +11,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex};
+use gpui_component::{ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex};
 
 use crate::core::actions::{OpenSettings, TogglePalette};
 use crate::core::config::Config;
@@ -812,6 +812,27 @@ impl Tty7App {
             .and_then(|t| t.pane.focused_or_first(window, cx))
             .map(|leaf| leaf.read(cx).focus_handle.clone())
             .unwrap_or_else(|| self.home_focus.clone());
+        // Code-panel toggle: the one on-screen entry point for the file-tree +
+        // editor overlay (⌘⇧E). A global title-bar tile rather than a per-pane
+        // affordance, so heavy split layouts don't grow a forest of icons; lit
+        // (selected) while the overlay is up. Present in both tab-bar modes —
+        // the sidebar layout keeps this strip as the right column's chrome.
+        let code_open = self.editor.open;
+        let code_button = div().occlude().flex_shrink_0().child(
+            Button::new("titlebar-code-panel")
+                .icon(Icon::new(IconName::FolderClosed).size(px(15.)))
+                .ghost()
+                .xsmall()
+                .w(px(30.))
+                .h(px(30.))
+                .rounded_lg()
+                .selected(code_open)
+                .tooltip("Code Panel")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_code_panel(window, cx);
+                })),
+        );
+
         let menu_button = div().occlude().flex_shrink_0().child(
             Button::new("titlebar-menu")
                 .icon(Icon::new(IconName::Ellipsis).size(px(15.)))
@@ -860,6 +881,7 @@ impl Tty7App {
             // leaving just the "⋯" overflow menu on a thin strip.
             .when(show_chips, move |this| this.child(add_button))
             .child(div().flex_1())
+            .child(code_button)
             .child(menu_button)
     }
 }
