@@ -101,8 +101,8 @@ pub(super) fn grid_smart_range<T: EventListener>(
     }
 
     // 3) CJK prose has no separators to walk — the whole clause is one run —
-    //    so segment it with the OS tokenizer (dictionary-based on macOS)
-    //    instead of selecting the entire unbroken run.
+    //    so segment it with a dictionary instead of selecting the entire
+    //    unbroken run. No segmenter available means the run stands as-is.
     if is_cjk(chars[click_idx])
         && let Some((s, e)) = cjk_word_range(&text, click_idx)
     {
@@ -129,29 +129,34 @@ pub(super) fn is_cjk(c: char) -> bool {
     )
 }
 
-/// Whether the char routes to jieba: Han ideographs and CJK punctuation,
-/// where jieba's Chinese dictionary beats the system tokenizer. Kana and
-/// Hangul stay with the platform tokenizer (jieba has no Japanese/Korean
-/// dictionary and would return the whole run).
-fn prefers_jieba(c: char) -> bool {
+/// Kana or Hangul — the scripts jieba has no dictionary for. A run holding
+/// either is left unsegmented rather than handed to jieba, which shreds it
+/// into single characters (`です` → `で` `す`); selecting the whole run is the
+/// friendlier failure.
+#[cfg(not(target_os = "macos"))]
+fn is_kana_or_hangul(c: char) -> bool {
     matches!(
         u32::from(c),
-        0x3400..=0x9FFF        // Han ideographs (unified + ext A)
-        | 0xF900..=0xFAFF      // compatibility ideographs
-        | 0x20000..=0x3134F    // ideograph extensions
-        | 0x3000..=0x303F      // CJK punctuation
-        | 0xFF00..=0xFFEF      // full-width forms
+        0x1100..=0x11FF        // Hangul Jamo
+        | 0x3040..=0x30FF      // Hiragana + Katakana
+        | 0x31F0..=0x31FF      // Katakana phonetic extensions
+        | 0xA960..=0xA97F      // Hangul Jamo Extended-A
+        | 0xAC00..=0xD7FF      // Hangul syllables + Jamo Extended-B
+        | 0xFF66..=0xFF9F      // half-width Katakana
     )
 }
 
-/// The jieba segmenter, built once. Building the 350k-entry table takes a
-/// few hundred ms, hence [`warm`] to move that off the first double-click.
-static JIEBA: std::sync::OnceLock<jieba_rs::Jieba> = std::sync::OnceLock::new();
+/// The jieba segmenter, built once on a background thread. The table costs
+/// ~55 MB resident and ~130 ms to build, so it is constructed only if a CJK
+/// double-click actually happens — see [`jieba_word_range`].
+#[cfg(not(target_os = "macos"))]
+static JIEBA: OnceLock<jieba_rs::Jieba> = OnceLock::new();
 
 /// Kick off dictionary construction on a background thread (idempotent).
-/// Called when a terminal view is created, so the table is ready long before
-/// the first CJK double-click; a click that races it just blocks briefly.
-pub(crate) fn warm() {
+/// Never called eagerly: the first CJK double-click triggers it and settles
+/// for the unsegmented run, so the UI thread never blocks on the build.
+#[cfg(not(target_os = "macos"))]
+fn warm() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         std::thread::spawn(|| {
@@ -160,28 +165,30 @@ pub(crate) fn warm() {
     });
 }
 
-/// Dictionary-based word bounds for CJK text: the inclusive char range of
-/// the word containing char index `click`. Chinese goes through jieba (full
-/// dictionary, all platforms); Kana/Hangul fall back to the platform
-/// tokenizer (CFStringTokenizer on macOS), and elsewhere the caller keeps
-/// the whole run.
+/// Dictionary-based word bounds for CJK text: the inclusive char range of the
+/// word containing char index `click`, or `None` to keep the whole run.
+///
+/// The OS tokenizer wins wherever there is one. macOS's CFStringTokenizer
+/// carries a Chinese lexicon that matches jieba on most prose, is locale-
+/// independent, handles Japanese and Korean properly, and costs nothing —
+/// jieba is only worth its ~55 MB on platforms with no such API.
 pub(super) fn cjk_word_range(text: &str, click: usize) -> Option<(usize, usize)> {
-    let chars: Vec<char> = text.chars().collect();
-    let c = *chars.get(click)?;
-    if prefers_jieba(c)
-        && let Some(r) = jieba_word_range(&chars, click)
-    {
-        return Some(r);
-    }
     #[cfg(target_os = "macos")]
-    if let Some(r) = tokenizer::word_range(text, click) {
-        return Some(r);
+    {
+        tokenizer::word_range(text, click)
     }
-    None
+    #[cfg(not(target_os = "macos"))]
+    {
+        let chars: Vec<char> = text.chars().collect();
+        chars.get(click)?;
+        jieba_word_range(&chars, click)
+    }
 }
 
 /// Segment the contiguous CJK run around `click` with jieba and return the
-/// token containing it.
+/// token containing it. `None` — meaning "select the whole run" — when the
+/// dictionary isn't built yet or the run isn't Chinese.
+#[cfg(not(target_os = "macos"))]
 fn jieba_word_range(chars: &[char], click: usize) -> Option<(usize, usize)> {
     let mut rs = click;
     while rs > 0 && is_cjk(chars[rs - 1]) {
@@ -191,8 +198,19 @@ fn jieba_word_range(chars: &[char], click: usize) -> Option<(usize, usize)> {
     while re + 1 < chars.len() && is_cjk(chars[re + 1]) {
         re += 1;
     }
+    // Japanese/Korean: jieba's Chinese dictionary would cut the run into
+    // single characters, which is worse than not segmenting at all.
+    if chars[rs..=re].iter().copied().any(is_kana_or_hangul) {
+        return None;
+    }
+    // Building the table takes ~130 ms — far too long to hold the UI thread
+    // on a click. Start it in the background and let this one click select
+    // the whole run; every later click finds the table ready.
+    let Some(jieba) = JIEBA.get() else {
+        warm();
+        return None;
+    };
     let run: String = chars[rs..=re].iter().collect();
-    let jieba = JIEBA.get_or_init(jieba_rs::Jieba::new);
     // Token start/end are Unicode char offsets into `run`.
     let rel = click - rs;
     jieba
@@ -588,6 +606,14 @@ mod tests {
     /// alacritty's stock separator set, which is also the config default.
     const SEPS: &str = ",│`|:\"' ()[]{}<>\t";
 
+    /// In production the jieba table builds lazily off-thread and the racing
+    /// click settles for the whole run; tests want it ready up front. No-op on
+    /// macOS, where CFStringTokenizer needs no warm-up.
+    fn ensure_segmenter() {
+        #[cfg(not(target_os = "macos"))]
+        let _ = JIEBA.get_or_init(jieba_rs::Jieba::new);
+    }
+
     fn range(text: &str, click: usize) -> Option<(usize, usize)> {
         let chars: Vec<char> = text.chars().collect();
         smart_range(text, &chars, click, SEPS)
@@ -767,6 +793,7 @@ mod tests {
 
     #[test]
     fn cjk_segmentation_selects_a_dictionary_word_not_the_whole_run() {
+        ensure_segmenter();
         let text = "run 北京欢迎你 done";
         let chars: Vec<char> = text.chars().collect();
         let click = chars.iter().position(|&c| c == '京').unwrap();
@@ -777,23 +804,45 @@ mod tests {
 
     #[test]
     fn cjk_segmentation_survives_surrogate_pairs_before_the_click() {
-        // The emoji before the run must not skew the char↔offset mapping.
-        let text = "🙂 你好世界";
-        let chars: Vec<char> = text.chars().collect();
-        let click = chars.iter().position(|&c| c == '好').unwrap();
-        let (s, e) = cjk_word_range(text, click).expect("segmented range");
-        let sel: String = chars[s..=e].iter().collect();
-        assert_eq!(sel, "你好");
+        // The emoji is two UTF-16 units: a tokenizer offset table that counted
+        // chars instead would shift every index after it. Both backends agree
+        // on `世界`, so a skewed mapping shows up as a different token.
+        ensure_segmenter();
+        for text in ["你好世界", "🙂 你好世界", "🙂🙂🙂 你好世界"] {
+            let chars: Vec<char> = text.chars().collect();
+            let click = chars.iter().position(|&c| c == '世').unwrap();
+            let (s, e) = cjk_word_range(text, click).expect("segmented range");
+            let sel: String = chars[s..=e].iter().collect();
+            assert_eq!(sel, "世界", "{text:?} segmented wrong");
+        }
     }
 
     #[test]
     fn cjk_punctuation_is_its_own_token() {
+        ensure_segmenter();
         let text = "比赛，天气";
         let chars: Vec<char> = text.chars().collect();
         let click = chars.iter().position(|&c| c == '，').unwrap();
         let (s, e) = cjk_word_range(text, click).expect("segmented range");
         let sel: String = chars[s..=e].iter().collect();
         assert_eq!(sel, "，");
+    }
+
+    /// Japanese must not be run through jieba's Chinese dictionary — it cuts
+    /// kana into single characters, which is worse than leaving the run whole.
+    /// macOS hands it to CFStringTokenizer, which segments it properly.
+    #[test]
+    fn japanese_is_not_shredded_into_single_kana() {
+        ensure_segmenter();
+        let text = "日本語の文章です";
+        let chars: Vec<char> = text.chars().collect();
+        let click = chars.iter().position(|&c| c == 'で').unwrap();
+        // macOS yields a real token, never a lone kana; elsewhere the run
+        // comes back unsegmented and the caller selects all of it.
+        if let Some((s, e)) = cjk_word_range(text, click) {
+            let sel: String = chars[s..=e].iter().collect();
+            assert_eq!(sel, "です");
+        }
     }
 
     #[test]

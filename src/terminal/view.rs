@@ -711,9 +711,6 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<Self> {
-        // Build the CJK segmentation dictionary off-thread now, so the first
-        // double-click on Chinese text doesn't pay the ~0.5s table build.
-        super::smart_select::warm();
         // Provisional size; corrected on the first prepaint once we can measure.
         // The PTY lives in the daemon now. On session restore (`restore_pane`),
         // re-`attach` to the still-running pane so its process + scrollback come
@@ -2852,8 +2849,9 @@ impl TerminalView {
                 self.editor_drag_word = None;
             }
             2 => {
-                let seps = &cx.global::<Config>().word_separators;
-                self.cmd.select_word_at(idx, seps);
+                let cfg = cx.global::<Config>();
+                let (seps, smart) = (cfg.word_separators.clone(), cfg.smart_select);
+                self.cmd.select_word_at(idx, &seps, smart);
                 // Drag now grows the selection by whole words around this one.
                 self.editor_selecting = true;
                 self.editor_drag_word = self.cmd.selection();
@@ -2884,8 +2882,9 @@ impl TerminalView {
         };
         // A drag begun on a double-click extends by whole words; otherwise by char.
         if let Some((s, e)) = self.editor_drag_word {
-            let seps = &cx.global::<Config>().word_separators;
-            self.cmd.extend_word_to(s, e, idx, seps);
+            let cfg = cx.global::<Config>();
+            let (seps, smart) = (cfg.word_separators.clone(), cfg.smart_select);
+            self.cmd.extend_word_to(s, e, idx, &seps, smart);
         } else {
             self.cmd.extend_to(idx);
         }
