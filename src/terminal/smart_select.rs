@@ -602,6 +602,7 @@ pub(super) fn narrow_to_script(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritty_terminal::event::VoidListener;
 
     /// alacritty's stock separator set, which is also the config default.
     const SEPS: &str = ",│`|:\"' ()[]{}<>\t";
@@ -617,6 +618,149 @@ mod tests {
     fn range(text: &str, click: usize) -> Option<(usize, usize)> {
         let chars: Vec<char> = text.chars().collect();
         smart_range(text, &chars, click, SEPS)
+    }
+
+    // ---- Grid-level tests ----
+    //
+    // The functions above operate on a plain `&str`; everything below drives a
+    // real `Term` through the VT parser instead, because the grid is where the
+    // index arithmetic actually gets hard: wide CJK glyphs occupy two cells
+    // (the second a spacer), soft-wrapped rows have to be stitched back into
+    // one logical line, and OSC 8 runs can straddle both.
+
+    /// A `cols`×`rows` terminal with `input` fed through the VT parser, so the
+    /// grid holds exactly what a PTY would have produced.
+    fn term_with(cols: usize, rows: usize, input: &str) -> Term<VoidListener> {
+        let config = alacritty_terminal::term::Config {
+            semantic_escape_chars: SEPS.to_string(),
+            ..Default::default()
+        };
+        let mut term = Term::new(
+            config,
+            &crate::terminal::size::TermSize::new(cols, rows),
+            VoidListener,
+        );
+        let mut parser: alacritty_terminal::vte::ansi::Processor =
+            alacritty_terminal::vte::ansi::Processor::new();
+        parser.advance(&mut term, input.as_bytes());
+        term
+    }
+
+    /// The text a double-click at `(line, col)` would select, or `None` when
+    /// no smart candidate applies and the caller keeps the stock word.
+    fn grid_select(term: &Term<VoidListener>, line: i32, col: usize) -> Option<String> {
+        let r = grid_smart_range(term, Point::new(Line(line), Column(col)))?;
+        Some(term.bounds_to_string(r.start, r.end))
+    }
+
+    /// Column of the first occurrence of `needle` on row 0 — keeps the tests
+    /// from hard-coding offsets that shift when the fixture text changes.
+    fn col_of(row: &str, needle: &str) -> usize {
+        row.find(needle).expect("needle in fixture")
+    }
+
+    #[test]
+    fn osc8_hyperlink_selects_the_declared_extent_not_the_visible_word() {
+        // The link text has a space in it: only the OSC 8 run knows where the
+        // link really ends, which is the whole point of checking it first.
+        let term = term_with(
+            40,
+            3,
+            "go \x1b]8;;https://example.com/x\x1b\\click here\x1b]8;;\x1b\\ now",
+        );
+        let line = "go click here now";
+        assert_eq!(
+            grid_select(&term, 0, col_of(line, "here")).as_deref(),
+            Some("click here"),
+        );
+        // A cell outside the run must not pick the link up.
+        assert_ne!(
+            grid_select(&term, 0, col_of(line, "now")).as_deref(),
+            Some("click here"),
+        );
+    }
+
+    #[test]
+    fn osc8_hyperlink_follows_a_soft_wrap() {
+        // 30 chars of link text in 20 columns: the run fills row 0 and spills
+        // 10 cells onto row 1. Stopping at the row edge would truncate the
+        // selection to the visible first half.
+        let term = term_with(
+            20,
+            4,
+            "\x1b]8;;https://e.com\x1b\\aaaaaaaaaabbbbbbbbbbcccccccccc\x1b]8;;\x1b\\",
+        );
+        let whole = "aaaaaaaaaabbbbbbbbbbcccccccccc";
+        // Click on the wrapped remainder (row 1) — walks backwards over the wrap.
+        assert_eq!(grid_select(&term, 1, 2).as_deref(), Some(whole));
+        // ...and from the first row, walking forwards over it.
+        assert_eq!(grid_select(&term, 0, 3).as_deref(), Some(whole));
+    }
+
+    #[test]
+    fn soft_wrapped_url_is_stitched_back_into_one_selection() {
+        // No OSC 8 here — the URL is recovered from the joined logical line,
+        // so this exercises `logical_line_at`'s wrap walk rather than the
+        // hyperlink path.
+        let term = term_with(20, 4, "see https://example.com/deep/path here");
+        let whole = "https://example.com/deep/path";
+        // Row 0 holds "see https://example.", row 1 the "com/deep/path here"
+        // remainder. Clicking the head joins forwards over the wrap...
+        assert_eq!(
+            grid_select(&term, 0, col_of("see https://example", "example")).as_deref(),
+            Some(whole),
+        );
+        // ...and clicking the tail joins backwards, which is the direction a
+        // click on a continuation row depends on entirely.
+        assert_eq!(
+            grid_select(&term, 1, col_of("com/deep/path here", "deep")).as_deref(),
+            Some(whole),
+        );
+    }
+
+    #[test]
+    fn wide_glyph_and_its_spacer_resolve_to_the_same_word() {
+        // Each Han char occupies two cells; the second carries WIDE_CHAR_SPACER
+        // and has no `c` of its own. Clicking either half must select the same
+        // segmented word — an off-by-one in the spacer branch shows up here.
+        ensure_segmenter();
+        let term = term_with(40, 3, "run 北京欢迎你 done");
+        // "run " is 4 cells, then 北 at col 4 (spacer at 5), 京 at 6 (spacer 7).
+        let expected = grid_select(&term, 0, 4);
+        assert_eq!(expected.as_deref(), Some("北京"), "click on 北");
+        assert_eq!(
+            grid_select(&term, 0, 5).as_deref(),
+            expected.as_deref(),
+            "spacer of 北"
+        );
+        assert_eq!(
+            grid_select(&term, 0, 6).as_deref(),
+            Some("北京"),
+            "click on 京"
+        );
+        assert_eq!(
+            grid_select(&term, 0, 7).as_deref(),
+            Some("北京"),
+            "spacer of 京"
+        );
+    }
+
+    #[test]
+    fn wide_glyph_wrapping_to_the_next_row_keeps_its_word_intact() {
+        // An odd column count leaves one cell at the end of the row: the wide
+        // char can't fit, so alacritty pads with LEADING_WIDE_CHAR_SPACER and
+        // moves the glyph to the next row. The logical line must still join.
+        ensure_segmenter();
+        let term = term_with(9, 4, "abcdefgh北京欢迎你");
+        // 北 is pushed to row 1 col 0 by the leading spacer at row 0 col 8.
+        assert_eq!(grid_select(&term, 1, 0).as_deref(), Some("北京"));
+    }
+
+    #[test]
+    fn click_past_the_last_column_yields_no_range() {
+        let term = term_with(10, 2, "hello");
+        assert!(grid_smart_range(&term, Point::new(Line(0), Column(10))).is_none());
+        assert!(grid_smart_range(&term, Point::new(Line(0), Column(99))).is_none());
     }
 
     fn selected(text: &str, click: usize) -> Option<String> {
