@@ -445,10 +445,29 @@ pub(super) fn quote_range(chars: &[char], click: usize) -> Option<(usize, usize)
     }
 }
 
+/// Whether a candidate span is an acceptable match for its bracket pair.
+///
+/// Every pair but `<>` is accepted outright — `( a )` is a legitimate subshell,
+/// `[ 1 ]` a legitimate index. `<` and `>` are different: they are comparison
+/// and redirection operators at least as often as delimiters, and the bracket
+/// path returns before the `extends` guard that keeps every other candidate
+/// additive, so a bad match here has no safety net. Require the span to hug its
+/// contents, which real delimiters do (`Vec<String>`, `<div>`, `<user@host>`,
+/// `<info>`) and a comparison doesn't (`a < b > c`, `x <= 0 || y > 9`).
+///
+/// Redirections need no special handling: `2>&1` or `cmd > out` have no
+/// partner to match, so the scan already fails.
+fn pair_is_plausible(chars: &[char], open: char, s: usize, e: usize) -> bool {
+    if open != '<' {
+        return true;
+    }
+    e > s + 1 && !chars[s + 1].is_whitespace() && !chars[e - 1].is_whitespace()
+}
+
 /// Select through a matching bracket: `click` on an opener scans forward,
 /// on a closer scans backward, nesting-aware. Inclusive char range covering
-/// both brackets, or `None` when the clicked char isn't a bracket or the
-/// match isn't on the logical line.
+/// both brackets, or `None` when the clicked char isn't a bracket, the match
+/// isn't on the logical line, or the span fails [`pair_is_plausible`].
 pub(super) fn bracket_range(chars: &[char], click: usize) -> Option<(usize, usize)> {
     let c = *chars.get(click)?;
     if let Some((open, close)) = BRACKET_PAIRS.iter().find(|(o, _)| *o == c) {
@@ -459,7 +478,7 @@ pub(super) fn bracket_range(chars: &[char], click: usize) -> Option<(usize, usiz
             } else if ch == *close {
                 depth -= 1;
                 if depth == 0 {
-                    return Some((click, i));
+                    return pair_is_plausible(chars, *open, click, i).then_some((click, i));
                 }
             }
         }
@@ -474,7 +493,7 @@ pub(super) fn bracket_range(chars: &[char], click: usize) -> Option<(usize, usiz
             } else if ch == *open {
                 depth -= 1;
                 if depth == 0 {
-                    return Some((i, click));
+                    return pair_is_plausible(chars, *open, i, click).then_some((i, click));
                 }
             }
         }
@@ -927,6 +946,48 @@ mod tests {
         assert_eq!(bracket_range(&chars, 7), Some((1, 7)));
         assert_eq!(bracket_range(&chars, 3), Some((3, 5)));
         assert_eq!(bracket_range(&chars, 0), None);
+    }
+
+    #[test]
+    fn angle_brackets_pair_only_when_they_hug_their_contents() {
+        // Real delimiters: generics, tags, placeholders, bracketed addresses.
+        for (text, want) in [
+            ("let v: Vec<String> = x", "<String>"),
+            ("<div class=\"row\">hi", "<div class=\"row\">"),
+            ("usage: tty7 <command> [opts]", "<command>"),
+            ("From: Jo <j@example.com> ok", "<j@example.com>"),
+            ("map: HashMap<K, V> here", "<K, V>"),
+        ] {
+            let chars: Vec<char> = text.chars().collect();
+            let click = chars.iter().position(|&c| c == '<').unwrap();
+            let (s, e) = bracket_range(&chars, click).unwrap_or_else(|| panic!("{text}"));
+            let got: String = chars[s..=e].iter().collect();
+            assert_eq!(got, want, "{text}");
+        }
+        // Comparison operators must not pair across half a line — a space just
+        // inside either end is the tell.
+        for text in [
+            "if a < b then c > d",
+            "awk '{ if ($1 > 100 && $2 < 5) print }'",
+            "WHERE a < 10 AND b > 20",
+            "empty <> pair",
+        ] {
+            let chars: Vec<char> = text.chars().collect();
+            for (i, &c) in chars.iter().enumerate() {
+                if c == '<' || c == '>' {
+                    assert_eq!(bracket_range(&chars, i), None, "{text} at {i}");
+                }
+            }
+        }
+        // Redirections never had a partner to match in the first place.
+        for text in ["cargo build 2>&1 | tee out", "grep -rn foo src/ > /tmp/o"] {
+            let chars: Vec<char> = text.chars().collect();
+            for (i, &c) in chars.iter().enumerate() {
+                if c == '<' || c == '>' {
+                    assert_eq!(bracket_range(&chars, i), None, "{text} at {i}");
+                }
+            }
+        }
     }
 
     #[test]
