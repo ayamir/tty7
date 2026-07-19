@@ -132,14 +132,21 @@ pub struct PaneInfo {
     pub alive: bool,
 }
 
-/// A foreground remote session the daemon can prove from the local process table.
+/// A pane whose filesystem is not the host's — either a remote session, or a
+/// local one behind a boundary the host's own tools can't follow (WSL).
+///
+/// The common consequence, whatever the kind, is that the pane's cwd names a
+/// path in *that* namespace: see `TerminalView::local_cwd`, which is what keeps
+/// a local `git` / `read_dir` / spawn away from it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteContext {
     pub kind: RemoteKind,
     /// Original foreground argv. Kept so follow-up operations can preserve ssh
-    /// config flags such as `-F`, `-p`, and `-J` rather than guessing.
+    /// config flags such as `-F`, `-p`, and `-J` rather than guessing. Empty
+    /// for kinds that aren't detected from a foreground process.
     pub argv: Vec<String>,
-    /// The destination token (`host`, `user@host`, or ssh config alias).
+    /// The destination token: `host`, `user@host`, or ssh config alias for the
+    /// ssh kinds; the distro name for [`RemoteKind::Wsl`].
     pub target: String,
 }
 
@@ -154,6 +161,15 @@ pub enum RemoteKind {
     /// (`daemon::ssh`). Forwarding / SFTP reach the connection through the
     /// in-memory registry.
     NativeSsh,
+    /// A `wsl.exe` pane: not remote in the network sense, but its shell lives
+    /// inside a distro with its own filesystem namespace, so a cwd it reports
+    /// (`/home/me/proj`) means nothing to the Windows-side host — and on
+    /// Windows is *drive-relative* rather than invalid, so it silently resolves
+    /// to `C:\home\me\proj`. Set at spawn time from the `ShellSpec`, not
+    /// detected from the process table. Nothing SSH-specific applies to it:
+    /// callers that mean "an SSH pane" must test the kind, not merely that a
+    /// `RemoteContext` is present.
+    Wsl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1543,6 +1559,13 @@ mod tests {
                 kind: RemoteKind::Ssh,
                 argv: vec!["ssh".into(), "-p".into(), "2222".into(), "dev".into()],
                 target: "dev".into(),
+            })),
+            // A WSL pane's context rides the same wire; `kind` is serialized
+            // kebab-case, so this pins the encoding of the new variant.
+            DaemonMsg::RemoteContext(Some(RemoteContext {
+                kind: RemoteKind::Wsl,
+                argv: Vec::new(),
+                target: "Ubuntu-24.04".into(),
             })),
             DaemonMsg::RemoteContext(None),
             DaemonMsg::Agent(Some(crate::core::cli_agent::CLIAgent::Claude)),

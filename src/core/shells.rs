@@ -308,6 +308,14 @@ pub fn git_bash_path() -> Option<PathBuf> {
     find_git_bash()
 }
 
+/// Installed WSL distributions. Exposed only to tests, for the same reason as
+/// [`git_bash_path`]: the live-PTY check needs a real distro to launch into,
+/// and skips itself when there is none.
+#[cfg(all(windows, test))]
+pub fn wsl_distros() -> Vec<String> {
+    list_wsl_distros()
+}
+
 /// Git Bash from the usual Git-for-Windows install roots (machine-wide x64,
 /// x86, and the per-user installer's home).
 #[cfg(windows)]

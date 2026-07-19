@@ -163,7 +163,7 @@ fn apply_shell_integration(
     // sentinel builder. Integrations that need argv (fish `-C`, bash `--rcfile`,
     // PowerShell flags) must use an explicit command builder first. Env-only zsh
     // integration keeps the default login-shell path.
-    if integration.force_non_login || (cmd.is_default_prog() && !integration.args.is_empty()) {
+    if integration.replaces_argv || (cmd.is_default_prog() && !integration.args.is_empty()) {
         *cmd = CommandBuilder::new(resolved_program);
     }
     cmd.args(&integration.args);
@@ -184,22 +184,66 @@ fn build_spawn_config(
     shell: Option<ShellSpec>,
 ) -> anyhow::Result<SpawnConfig> {
     let initial_cwd = initial_working_directory(cwd);
-    let (cmd, integration_dir) = build_shell_command(shell, &initial_cwd)?;
+    // Resolved here rather than inside `build_shell_command` because the WSL tag
+    // must be read off the shell we *actually* launch. `shell` is only the
+    // per-spawn override; `config.json` supplies the program when it is `None`,
+    // and a `wsl.exe` configured there is just as much a WSL pane as one picked
+    // from the dropdown.
+    let configured = choose_shell(shell, crate::core::config::shell_command());
+    let remote = wsl_remote_context(configured.as_ref());
+    let (cmd, integration_dir) = build_shell_command(configured, &initial_cwd)?;
     Ok(SpawnConfig {
         cmd,
         initial_cwd,
         integration_dir,
-        remote: None,
+        remote,
     })
 }
 
+/// Tag a `wsl.exe` pane as living in another filesystem namespace, from the
+/// resolved shell rather than the process table — `wsl.exe` is exactly what tty7
+/// launched, so there is nothing to detect.
+///
+/// This is what makes `TerminalView::local_cwd` decline the distro's cwd, and
+/// so what keeps the local git probe, path completion, link resolution and cwd
+/// inheritance away from a path that means nothing on this side (and that
+/// Windows would read as drive-relative). It is set whether or not shell
+/// integration succeeded: an unintegrated WSL pane reports no cwd today, but if
+/// it ever does the gate must already be in place.
+///
+/// Takes the post-[`choose_shell`] program, not the per-spawn override: a
+/// `wsl.exe` written into `config.json` reaches the same integration and so must
+/// reach the same tag.
+fn wsl_remote_context(shell: Option<&ChosenShell>) -> Option<RemoteContext> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let chosen = shell?;
+    let base = std::path::Path::new(&chosen.program)
+        .file_name()?
+        .to_str()?
+        .to_ascii_lowercase();
+    if base.strip_suffix(".exe").unwrap_or(&base) != "wsl" {
+        return None;
+    }
+    Some(RemoteContext {
+        kind: RemoteKind::Wsl,
+        argv: Vec::new(),
+        // The distro, when the args name one; otherwise `wsl.exe` picks the
+        // default and we have no name for it without another probe. Shared with
+        // the integration so the two can't disagree about which distro an argv
+        // names — they are handed the very same args.
+        target: shell_integration::wsl_distro(&chosen.args).unwrap_or_default(),
+    })
+}
+
+/// Build the argv for a spawn from an already-resolved shell (see
+/// [`choose_shell`]); `None` means the platform default (the login shell on
+/// Unix, PowerShell on Windows).
 fn build_shell_command(
-    shell: Option<ShellSpec>,
+    configured: Option<ChosenShell>,
     initial_cwd: &Option<PathBuf>,
 ) -> anyhow::Result<(CommandBuilder, Option<PathBuf>)> {
-    // Build the shell command; `None` means the platform default (the login
-    // shell on Unix, PowerShell on Windows).
-    let configured = choose_shell(shell, crate::core::config::shell_command());
     let mut cmd = match &configured {
         Some(chosen) => {
             let mut c = CommandBuilder::new(&chosen.program);
@@ -218,12 +262,14 @@ fn build_shell_command(
         None => default_shell_name(&cmd),
     };
 
-    // Shell integration: inject OSC 7 / OSC 133 hooks (zsh/fish/bash/PowerShell
-    // — see `daemon::shell_integration`). Best effort — `None` (an unsupported
-    // shell, or a bash/PowerShell with unpreservable custom args) means we launch
-    // bare.
+    // Shell integration: inject OSC 7 / OSC 133 hooks (zsh/fish/bash/PowerShell,
+    // and through `wsl.exe` into a distro — see `daemon::shell_integration`).
+    // Best effort — `None` (an unsupported shell, or one with unpreservable
+    // custom args) means we launch bare. The args go in because the WSL path
+    // reads the distro out of them.
     let integration = shell_integration::setup(
         Some(&resolved_program),
+        configured.as_ref().map_or(&[][..], |c| c.args.as_slice()),
         has_custom_args(configured.as_ref()),
     );
     if let Some(integration) = &integration {
@@ -938,15 +984,23 @@ impl DaemonPane {
                                     std::time::Instant::now() + REMOTE_CONTEXT_POLL_INTERVAL;
                             }
                             let remote = if poll_now {
-                                // A native-SSH pane already carries its own remote
-                                // context; process-table detection must not clobber
-                                // it (this pane *is* SSH). Only a plain PTY pane gets
-                                // foreground `ssh` detection.
+                                // A pane tty7 itself spawned as remote (native SSH,
+                                // or WSL) already carries its own context from the
+                                // spawn spec; process-table detection must not
+                                // clobber it. Only `Ssh` — the kind this very probe
+                                // produces — may be replaced, so a pane that has
+                                // since left a foreground `ssh` clears correctly.
+                                //
+                                // Testing `!= Ssh` rather than `== NativeSsh` is
+                                // load-bearing for WSL: `wsl.exe` is not `ssh`, so
+                                // the probe returns `None` and would blank the
+                                // context on the very next poll — twice a second,
+                                // each time also clearing the pane's cwd.
                                 let managed = {
                                     let st = state.lock().unwrap();
                                     st.remote
                                         .as_ref()
-                                        .is_some_and(|remote| remote.kind == RemoteKind::NativeSsh)
+                                        .is_some_and(|remote| remote.kind != RemoteKind::Ssh)
                                 };
                                 (!managed).then(&foreground_remote)
                             } else {
@@ -2316,13 +2370,87 @@ mod tests {
         assert!(!has_custom_args(None));
     }
 
+    /// A WSL pane must be tagged as living in another filesystem namespace, so
+    /// `TerminalView::local_cwd` declines the distro's cwd and the local git
+    /// probe / completion / link resolution / cwd inheritance never see a path
+    /// that means nothing here — and that Windows would read as drive-relative
+    /// (`/home/me` -> `C:\home\me`) rather than reject.
+    #[cfg(windows)]
+    #[test]
+    fn wsl_panes_are_tagged_as_a_foreign_filesystem() {
+        let spec = |program: &str, args: Vec<&str>| ChosenShell {
+            program: program.to_string(),
+            args: args.into_iter().map(str::to_string).collect(),
+            args_are_tty7_defaults: true,
+        };
+
+        // The dropdown's WSL row.
+        let ctx = wsl_remote_context(Some(&spec(
+            "wsl.exe",
+            vec!["--distribution", "Ubuntu-24.04", "--cd", "~"],
+        )))
+        .expect("wsl.exe must be tagged");
+        assert_eq!(ctx.kind, RemoteKind::Wsl);
+        // The distro rides along as the target so the UI has a name for it.
+        assert_eq!(ctx.target, "Ubuntu-24.04");
+        // Nothing reads `argv` for this kind; it is not an ssh invocation.
+        assert!(ctx.argv.is_empty());
+
+        // Short flag, and no flag at all (wsl.exe then picks the default
+        // distro — still a WSL pane, just one we have no name for).
+        assert_eq!(
+            wsl_remote_context(Some(&spec("wsl.exe", vec!["-d", "Debian"])))
+                .expect("short flag")
+                .target,
+            "Debian"
+        );
+        assert_eq!(
+            wsl_remote_context(Some(&spec("wsl.exe", vec![])))
+                .expect("default distro is still WSL")
+                .target,
+            ""
+        );
+        // The `--distribution=NAME` spelling too — the tag reads the distro with
+        // the integration's own parser, so the two cannot disagree about an argv
+        // they are both handed.
+        assert_eq!(
+            wsl_remote_context(Some(&spec("wsl.exe", vec!["--distribution=Arch"])))
+                .expect("joined flag")
+                .target,
+            "Arch"
+        );
+        // Case- and suffix-insensitive, like every other Windows program name.
+        assert!(wsl_remote_context(Some(&spec(r"C:\Windows\System32\WSL.EXE", vec![]))).is_some());
+
+        // Regression: the tag is read off the *resolved* shell, not the
+        // per-spawn override. A `wsl.exe` written into `config.json` reaches
+        // `setup_wsl` with no override in play (empty args, so nothing custom to
+        // preserve), so the distro starts reporting its own cwd — and an
+        // untagged pane would hand `/home/me/proj` straight to the local git
+        // probe, which Windows resolves drive-relative to `C:\home\me\proj`.
+        let from_config = choose_shell(None, Some(("wsl.exe".to_string(), Vec::new())));
+        assert_eq!(
+            wsl_remote_context(from_config.as_ref()).map(|c| c.kind),
+            Some(RemoteKind::Wsl),
+            "a configured wsl.exe is as much a WSL pane as a dropdown one"
+        );
+
+        // Everything else is a local pane and must not be tagged — tagging it
+        // would silently disable its git status, completion and cwd inheritance.
+        assert!(wsl_remote_context(Some(&spec("powershell.exe", vec![]))).is_none());
+        assert!(
+            wsl_remote_context(Some(&spec(r"C:\Program Files\Git\bin\bash.exe", vec![]))).is_none()
+        );
+        assert!(wsl_remote_context(None).is_none());
+    }
+
     #[test]
     fn arg_based_integration_rebuilds_default_shell_builder() {
         let mut cmd = CommandBuilder::new_default_prog();
         let injection = shell_integration::Injection {
             env: std::collections::HashMap::new(),
             args: vec!["-C".to_string(), "echo ready".to_string()],
-            force_non_login: false,
+            replaces_argv: false,
             dir: None,
         };
 
@@ -2345,7 +2473,7 @@ mod tests {
         let injection = shell_integration::Injection {
             env,
             args: Vec::new(),
-            force_non_login: false,
+            replaces_argv: false,
             dir: None,
         };
 
