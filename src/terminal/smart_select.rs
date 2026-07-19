@@ -425,22 +425,45 @@ pub(super) fn pair_range(chars: &[char], click: usize) -> Option<(usize, usize)>
     bracket_range(chars, click).or_else(|| quote_range(chars, click))
 }
 
+/// Whether the `'` at `i` is a contraction apostrophe rather than a quote.
+///
+/// A delimiter has whitespace, punctuation, or a line edge on at least one
+/// side; a contraction is welded into a word on both (`it's`, `isn't`,
+/// `won't`). Only `'` needs this — `"` and `` ` `` don't appear inside words.
+fn is_contraction(chars: &[char], i: usize) -> bool {
+    if chars[i] != '\'' {
+        return false;
+    }
+    let flanked = |j: Option<usize>| {
+        j.and_then(|j| chars.get(j))
+            .is_some_and(|c| c.is_alphanumeric())
+    };
+    flanked(i.checked_sub(1)) && flanked(Some(i + 1))
+}
+
 /// Select through a matching symmetric quote (`'`, `"`, `` ` ``). Open and
 /// close are the same char, so direction comes from parity: an even count of
 /// that quote before the click means it opens (match forward), odd means it
-/// closes (match backward). Apostrophes in prose skew the parity, but a
-/// missing match just falls through to `None`.
+/// closes (match backward).
+///
+/// Contraction apostrophes are excluded throughout — clicking one falls
+/// through to the stock word, and they count neither toward the parity nor as
+/// a candidate match. Without that, `it's a test, isn't it` pairs the two
+/// contractions and a double-click on either selects `'s a test, isn'`. This
+/// path returns before the `extends` guard that keeps other candidates
+/// additive (see [`pair_is_plausible`]), so a bad match here has no safety net.
 pub(super) fn quote_range(chars: &[char], click: usize) -> Option<(usize, usize)> {
     let q = *chars.get(click)?;
-    if !SYMMETRIC_QUOTES.contains(&q) {
+    if !SYMMETRIC_QUOTES.contains(&q) || is_contraction(chars, click) {
         return None;
     }
-    let before = chars[..click].iter().filter(|&&c| c == q).count();
+    let quote_at = |i: usize| chars[i] == q && !is_contraction(chars, i);
+    let before = (0..click).filter(|&i| quote_at(i)).count();
     if before % 2 == 0 {
-        let close = (click + 1..chars.len()).find(|&i| chars[i] == q)?;
+        let close = (click + 1..chars.len()).find(|&i| quote_at(i))?;
         Some((click, close))
     } else {
-        let open = (0..click).rev().find(|&i| chars[i] == q)?;
+        let open = (0..click).rev().find(|&i| quote_at(i))?;
         Some((open, click))
     }
 }
@@ -919,6 +942,38 @@ mod tests {
         assert_eq!(quote_range(&chars, 4), None);
         // Non-quote chars never match.
         assert_eq!(quote_range(&chars, 1), None);
+    }
+
+    #[test]
+    fn contraction_apostrophes_do_not_pair() {
+        let chars: Vec<char> = "it's a test, isn't it".chars().collect();
+        // Clicking either contraction falls through to the stock word.
+        assert_eq!(quote_range(&chars, 2), None);
+        assert_eq!(quote_range(&chars, 16), None);
+        // And the whole line yields no smart candidate at all, so the
+        // double-click keeps alacritty's `it's`.
+        let text = "it's a test, isn't it";
+        assert_eq!(range(text, 2), None);
+    }
+
+    #[test]
+    fn contractions_do_not_skew_a_real_quote() {
+        // The apostrophes inside the quoted span must not flip the parity or
+        // steal the match from the genuine delimiters.
+        let chars: Vec<char> = "echo 'it isn't so' done".chars().collect();
+        let open = 5;
+        let close = chars.iter().rposition(|&c| c == '\'').unwrap();
+        assert_eq!(quote_range(&chars, open), Some((open, close)));
+        assert_eq!(quote_range(&chars, close), Some((open, close)));
+    }
+
+    #[test]
+    fn trailing_apostrophe_still_closes() {
+        // `dogs'` — the apostrophe has a word char only on its left, so it is
+        // a delimiter, not a contraction.
+        let chars: Vec<char> = "the 'dogs' bark".chars().collect();
+        assert_eq!(quote_range(&chars, 4), Some((4, 9)));
+        assert_eq!(quote_range(&chars, 9), Some((4, 9)));
     }
 
     #[test]
