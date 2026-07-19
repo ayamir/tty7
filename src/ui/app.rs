@@ -3048,9 +3048,9 @@ impl Tty7App {
         // which is what a review pass wants. Both invocations are quick; the
         // prompt builder caps runaway diffs.
         let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&cwd)
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(args).current_dir(&cwd);
+            crate::core::proc::hide_console(&mut cmd)
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
