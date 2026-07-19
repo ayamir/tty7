@@ -2667,12 +2667,7 @@ impl Tty7App {
     /// for the worktree operations, which shell out to a local `git`. "Copy
     /// Working Directory" deliberately keeps using `tab_cwd`: copying a remote
     /// pane's remote path is exactly what the user wants there.
-    fn tab_local_cwd(
-        &self,
-        index: usize,
-        window: &Window,
-        cx: &App,
-    ) -> Option<std::path::PathBuf> {
+    fn tab_local_cwd(&self, index: usize, window: &Window, cx: &App) -> Option<std::path::PathBuf> {
         self.tabs
             .get(index)?
             .pane

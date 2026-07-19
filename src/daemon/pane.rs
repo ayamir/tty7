@@ -212,7 +212,17 @@ fn initial_working_directory(cwd: Option<PathBuf>) -> Option<PathBuf> {
     // client didn't pass an explicit cwd (tab-inherit / session restore still
     // win). Inherit -> `forced` is `None`, so we keep the fallback as before.
     let forced = crate::core::config::working_directory_base();
-    cwd.or(forced).or(fallback)
+    // Whatever wins must actually be a directory *here*. A client cwd is only
+    // as good as the OSC 7 that produced it, and a shell that reports a path
+    // this machine cannot resolve — a remote namespace, or an msys path like
+    // `/c/Users/x` that Windows reads as drive-relative — would otherwise turn
+    // a new tab or split into a hard spawn failure ("The directory name is
+    // invalid") instead of quietly falling back. Cheap to check, and it bounds
+    // the whole class rather than one shell's spelling at a time.
+    [cwd, forced, fallback]
+        .into_iter()
+        .flatten()
+        .find(|d| d.is_dir())
 }
 
 fn apply_common_command_setup(cmd: &mut CommandBuilder, initial_cwd: &Option<PathBuf>) {
@@ -1736,6 +1746,16 @@ fn apply_remote_context(st: &mut PaneState, remote: Option<RemoteContext>) {
     if st.remote == remote {
         return;
     }
+    // The cwd belonged to whichever side we are leaving, and it does not
+    // survive the crossing: a remote path is meaningless locally, and a local
+    // one is meaningless on the remote. Drop it so the pane reports no cwd
+    // until the new shell's OSC 7 lands, rather than attributing the old
+    // namespace's directory to the new one — otherwise a local shell without
+    // shell integration keeps serving the remote's last path to the local
+    // `git` probe for the rest of its life.
+    // `DaemonMsg::Cwd` carries a bare path with no "cleared" form, so the
+    // client mirrors this on its own when it sees the `RemoteContext` below.
+    st.cwd = None;
     if let Some(sub) = &st.subscriber {
         let _ = sub.send(DaemonMsg::RemoteContext(remote.clone()));
     }
@@ -2102,6 +2122,48 @@ fn proc_name(pid: i32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    /// A cwd the client reports is only as trustworthy as the OSC 7 behind it.
+    /// Passing one this machine cannot resolve straight to `cmd.cwd()` turns a
+    /// new tab or split into a hard spawn failure, so anything that isn't a
+    /// real directory here must fall through to the next candidate instead.
+    #[test]
+    fn initial_working_directory_skips_paths_that_are_not_directories() {
+        let real = std::env::temp_dir();
+        assert!(real.is_dir(), "temp dir should exist");
+
+        // A usable client cwd still wins outright.
+        assert_eq!(
+            initial_working_directory(Some(real.clone())),
+            Some(real.clone())
+        );
+
+        // A remote-namespace path, and the msys shape Windows reads as
+        // drive-relative: neither resolves here, so neither may be used.
+        for bogus in [
+            "/home/someone/definitely-not-here",
+            "/c/Users/definitely-not-here",
+        ] {
+            let got = initial_working_directory(Some(PathBuf::from(bogus)));
+            assert_ne!(
+                got.as_deref(),
+                Some(Path::new(bogus)),
+                "{bogus} is not a directory here and must not be handed to spawn"
+            );
+            // Whatever we fall back to must itself be usable.
+            if let Some(d) = got {
+                assert!(d.is_dir(), "fallback {d:?} must be a real directory");
+            }
+        }
+
+        // A file is not a directory either.
+        let file = real.join("tty7-iwd-probe");
+        std::fs::write(&file, b"x").expect("write probe file");
+        let got = initial_working_directory(Some(file.clone()));
+        assert_ne!(got.as_deref(), Some(file.as_path()));
+        let _ = std::fs::remove_file(&file);
+    }
 
     /// End-to-end check of the *live* agent-detection chain this feature rides
     /// on macOS/Linux: spawn a real PTY child whose `argv[0]` names a coding

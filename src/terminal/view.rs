@@ -2600,11 +2600,22 @@ impl TerminalView {
         // doesn't (Windows). The claim dies with the session (`session-end`
         // clears it, and the agent leaving the foreground drops the whole
         // state), so an exited agent falls back to the pane's real directory.
+        // The agent's report goes through the same remote gate as the pane's own
+        // cwd. A native-SSH pane keeps sentinel-sourced agent state on purpose
+        // (`spawn_native_ssh`), so an agent running *on the remote host* reports
+        // a remote path — and being first in the chain it would win over
+        // `local_cwd` unconditionally and hand that path straight to the local
+        // `git`, which is the collision `local_cwd` exists to prevent.
         let cwd_now = self
-            .terminal
-            .agent_session()
-            .and_then(|s| s.cwd)
-            .or_else(|| self.local_cwd());
+            .remote_context()
+            .is_none()
+            .then(|| {
+                self.terminal
+                    .agent_session()
+                    .and_then(|s| s.cwd)
+                    .or_else(|| self.cwd())
+            })
+            .flatten();
         if cwd_now.as_ref() != self.git_status_cwd.as_ref() || cmd_finished || turn_finished {
             self.refresh_git_status(cwd_now, cx);
         }
@@ -3344,17 +3355,17 @@ impl TerminalView {
         }
 
         // Fresh completion. Path candidates come off the local filesystem, so
-        // the cwd must be a local one; on a remote pane this falls back to
-        // tty7's own dir, which is what already happened there before OSC 7
-        // landed. Command/history completion is unaffected either way. Real
-        // remote-aware path completion would need the listing to come from the
-        // remote and is out of scope here.
-        let Some(cwd) = self.local_cwd().or_else(|| std::env::current_dir().ok()) else {
-            return;
+        // they need a local cwd — a remote pane passes `None` and gets command
+        // completion only. Falling back to tty7's own directory there would
+        // offer *this* machine's filenames for insertion into a remote command
+        // line, where they don't exist.
+        let cwd = match self.remote_context() {
+            Some(_) => None,
+            None => self.local_cwd().or_else(|| std::env::current_dir().ok()),
         };
         let line = self.cmd.text();
         let cursor = self.cmd.cursor();
-        let Some(comp) = super::completion::complete(&line, cursor, &cwd) else {
+        let Some(comp) = super::completion::complete(&line, cursor, cwd.as_deref()) else {
             return;
         };
 
@@ -3404,6 +3415,9 @@ impl TerminalView {
 
         // Kick off each generator on the background executor and merge results
         // back on the main thread, tagged with this session's generation.
+        // Generators are local shell-outs and only ever come from `complete`'s
+        // `Some(cwd)` branch, so a remote pane has none to run.
+        let Some(cwd) = cwd else { return };
         for pending in comp.pending {
             let script = pending.script;
             let cwd = cwd.clone();

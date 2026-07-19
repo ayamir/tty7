@@ -668,6 +668,17 @@ impl RemoteTerminal {
                             }
                             DaemonMsg::RemoteContext(ctx) => {
                                 flush_batch!();
+                                // Crossing the local/remote boundary invalidates
+                                // the cwd: it names a directory in the namespace
+                                // we just left. Drop it so the pane reports none
+                                // until the new shell's OSC 7 lands — otherwise
+                                // an `exit` from `ssh` leaves the remote's last
+                                // path in place, and a local shell without shell
+                                // integration never overwrites it, so the local
+                                // `git` probe keeps running against it.
+                                if let Ok(mut guard) = cwd.lock() {
+                                    *guard = None;
+                                }
                                 if let Ok(mut guard) = remote.lock() {
                                     *guard = ctx;
                                 }
