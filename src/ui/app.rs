@@ -2073,11 +2073,14 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) {
         // Inherit the cwd of the active tab's focused terminal so the new tab
-        // opens in the same directory the user is currently working in.
+        // opens in the same directory the user is currently working in. Local
+        // cwds only: the new tab is a local shell, and an inherited cwd wins
+        // over every fallback in `pane::initial_working_directory`, so a remote
+        // path would be handed straight to the spawn as a working directory.
         let cwd = self.tabs.get(self.active).and_then(|t| {
             t.pane
                 .focused_or_first(window, cx)
-                .and_then(|leaf| leaf.read(cx).cwd())
+                .and_then(|leaf| leaf.read(cx).local_cwd())
         });
         let tab = new_terminal(self.font_size, cwd, None, shell, window, cx);
         // Leaving the current tab for the new one; snapshot its focused pane
@@ -2172,8 +2175,10 @@ impl Tty7App {
         };
         // The new pane inherits the cwd — and the shell, when the pane being
         // split was opened with an explicit pick (a WSL/fish tab splits into
-        // more WSL/fish, not back to the default).
-        let cwd = target.read(cx).cwd();
+        // more WSL/fish, not back to the default). Local cwds only: the
+        // native-SSH branch below has the daemon discard it regardless, and the
+        // local branch would otherwise spawn against a remote path.
+        let cwd = target.read(cx).local_cwd();
         // Splitting a native-SSH pane opens another SSH pane on the same
         // connection rather than dropping back to a local shell. Re-resolve the
         // persisted (secret-free) spec from its saved profile so keychain
@@ -2470,7 +2475,7 @@ impl Tty7App {
         // Capture the tab's cwd *before* its panes are killed (the daemon can't
         // report it afterwards): if it sat in a tty7-managed worktree, the
         // cleanup offer below needs it.
-        let worktree_cwd = self.tab_cwd(index, window, cx);
+        let worktree_cwd = self.tab_local_cwd(index, window, cx);
         // Snapshot the tab (layout + each pane's current cwd + name) onto the
         // recently-closed stack so Cmd+Shift+T can bring it back.
         let snapshot = tab_to_session(&self.tabs[index], cx);
@@ -2517,11 +2522,14 @@ impl Tty7App {
         let Some(cwd) = cwd else { return };
         // Every leaf of every surviving tab, not just focused panes — a shell
         // tucked away in a split occupies the worktree all the same.
+        // Local paths only: this list is what stops a worktree being removed
+        // out from under a live shell, and a remote cwd can neither occupy a
+        // local worktree nor be compared against one meaningfully.
         let open_cwds: Vec<std::path::PathBuf> = self
             .tabs
             .iter()
             .flat_map(|tab| tab.pane.leaves())
-            .filter_map(|leaf| leaf.read(cx).cwd())
+            .filter_map(|leaf| leaf.read(cx).local_cwd())
             .collect();
         cx.spawn(async move |this, cx| {
             let Some(wt) = cx
@@ -2655,6 +2663,23 @@ impl Tty7App {
             .and_then(|leaf| leaf.read(cx).cwd())
     }
 
+    /// [`tab_cwd`](Self::tab_cwd) restricted to a directory on this machine —
+    /// for the worktree operations, which shell out to a local `git`. "Copy
+    /// Working Directory" deliberately keeps using `tab_cwd`: copying a remote
+    /// pane's remote path is exactly what the user wants there.
+    fn tab_local_cwd(
+        &self,
+        index: usize,
+        window: &Window,
+        cx: &App,
+    ) -> Option<std::path::PathBuf> {
+        self.tabs
+            .get(index)?
+            .pane
+            .focused_or_first(window, cx)
+            .and_then(|leaf| leaf.read(cx).local_cwd())
+    }
+
     /// "New Worktree Tab": probe the repository containing the tab's cwd for
     /// defaults (a fresh generated name, the current branch as start point) on
     /// the background executor, then open the confirmation sheet
@@ -2666,7 +2691,7 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(cwd) = self.tab_cwd(index, window, cx) else {
+        let Some(cwd) = self.tab_local_cwd(index, window, cx) else {
             window.push_notification("This tab has no working directory yet", cx);
             return;
         };
@@ -3039,7 +3064,10 @@ impl Tty7App {
             .tabs
             .get(self.active)
             .and_then(|t| t.pane.focused_or_first(window, cx))
-            .and_then(|view| view.read(cx).cwd());
+            // Local `git` shell-out, so a remote pane's cwd is not usable —
+            // it reports "no known directory" rather than silently diffing
+            // whatever the path collides with locally.
+            .and_then(|view| view.read(cx).local_cwd());
         let Some(cwd) = cwd else {
             crate::terminal::notify_desktop(Some("tty7"), "This pane has no known directory.");
             return;
@@ -4519,7 +4547,13 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
         Pane::Leaf(view) => {
             let view = view.read(cx);
             SessionPane::Leaf {
-                cwd: view.cwd(),
+                // Local cwd only. A restored pane whose daemon pane is gone
+                // respawns on the *default local shell* (a shell pick isn't
+                // persisted), so a remote cwd would come back paired with a
+                // local shell that cannot chdir into it. Native-SSH panes
+                // reconnect from `ssh_spec` and the daemon discards the cwd
+                // for them anyway (`server::SpawnNativeSsh`).
+                cwd: view.local_cwd(),
                 pane_id: Some(view.pane_id),
                 // Persist the secret-free native-SSH spec so a *dead* pane can be
                 // reconnected on restore (FR-E4/C2); `None` for local panes. A

@@ -1065,6 +1065,26 @@ impl TerminalView {
         self.terminal.remote_context()
     }
 
+    /// The pane's cwd *only when it names a directory on this machine* — the
+    /// accessor every local filesystem or `Command` use must go through.
+    ///
+    /// A remote pane's OSC 7 reports a path in the remote's namespace
+    /// (`/home/me/proj` from an SSH host). Feeding that to a local `git` or
+    /// `read_dir` is meaningless, and on Windows it is worse than meaningless:
+    /// `/home/me/proj` is not an absolute path there but a *drive-relative*
+    /// one, so it silently resolves to `C:\home\me\proj`. That usually just
+    /// fails an `exists()` check — but if such a directory happens to exist,
+    /// the pane reports an unrelated local repo's branch and diff as its own.
+    /// Correctness must not rest on that collision never happening.
+    ///
+    /// Note this gates on the pane being remote, not on the shape of the path:
+    /// a local shell may legitimately sit in a directory whose name looks
+    /// remote, and Git Bash reports genuinely local paths (via `pwd -W`) that
+    /// merely originate from a POSIX-looking shell.
+    pub fn local_cwd(&self) -> Option<std::path::PathBuf> {
+        self.remote_context().is_none().then(|| self.cwd())?
+    }
+
     /// The coding agent running in this pane's foreground, or `None` when none
     /// is. Identity comes from the daemon's foreground-`argv` detection (plus
     /// the sentinel event channel, which can brand wrappers argv can't see
@@ -2584,7 +2604,7 @@ impl TerminalView {
             .terminal
             .agent_session()
             .and_then(|s| s.cwd)
-            .or_else(|| self.cwd());
+            .or_else(|| self.local_cwd());
         if cwd_now.as_ref() != self.git_status_cwd.as_ref() || cmd_finished || turn_finished {
             self.refresh_git_status(cwd_now, cx);
         }
@@ -2595,8 +2615,11 @@ impl TerminalView {
     /// brackets the flight (`begin_probe`/`finish_probe`): a probe already in
     /// flight for the same cwd absorbs this trigger instead of spawning a
     /// duplicate `git` shell-out, and reruns once when it lands. With no cwd
-    /// (e.g. a native-SSH pane pre-OSC-7, where a local `git` would be
-    /// meaningless) the pane simply stops reading a status.
+    /// (e.g. a remote pane, where a local `git` would be meaningless) the pane
+    /// simply stops reading a status. Callers must source the cwd from
+    /// [`local_cwd`](Self::local_cwd): a remote pane *does* get a cwd once its
+    /// OSC 7 lands, so "remote panes have no cwd" holds only before that and
+    /// cannot be what keeps the local probe away from a remote path.
     ///
     /// [`GitStatusCache`]: crate::terminal::git_status::GitStatusCache
     fn refresh_git_status(&mut self, cwd: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
@@ -3320,8 +3343,13 @@ impl TerminalView {
             return;
         }
 
-        // Fresh completion.
-        let Some(cwd) = self.cwd().or_else(|| std::env::current_dir().ok()) else {
+        // Fresh completion. Path candidates come off the local filesystem, so
+        // the cwd must be a local one; on a remote pane this falls back to
+        // tty7's own dir, which is what already happened there before OSC 7
+        // landed. Command/history completion is unaffected either way. Real
+        // remote-aware path completion would need the listing to come from the
+        // remote and is out of scope here.
+        let Some(cwd) = self.local_cwd().or_else(|| std::env::current_dir().ok()) else {
             return;
         };
         let line = self.cmd.text();
@@ -3868,7 +3896,11 @@ impl TerminalView {
             text.push(term.grid()[line][Column(c)].c);
         }
         drop(term);
-        let cwd = self.cwd();
+        // A relative path in the output is resolved against the cwd and
+        // stat-checked, then handed to the local file opener — so a remote
+        // pane's cwd must not be used. There, only absolute-looking local hits
+        // and URLs remain clickable.
+        let cwd = self.local_cwd();
         if let Some(link) = super::search::link_at(&text, col, cwd.as_deref(), true) {
             match link.target {
                 LinkTarget::Url(url) => self.open_url(&url, cx),
@@ -4020,7 +4052,9 @@ impl TerminalView {
             text.push(term.grid()[line][Column(c)].c);
         }
         drop(term);
-        let cwd = self.cwd();
+        // Same gate as the click path above — hover must not underline a link
+        // the click cannot open.
+        let cwd = self.local_cwd();
         let link =
             super::search::link_at(&text, col, cwd.as_deref(), include_files).or_else(|| {
                 include_loopback.then(|| {
