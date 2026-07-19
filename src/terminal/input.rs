@@ -126,8 +126,21 @@ pub(super) fn reshape_option_keystroke(
 ///
 /// Chords are deliberately excluded: Ctrl/Cmd/Fn belong to the encoders below,
 /// and Option is owned by [`reshape_option_keystroke`]'s Meta policy.
-#[cfg(target_os = "macos")]
-pub(super) fn defer_to_ime(ks: &gpui::Keystroke) -> bool {
+///
+/// REPORT_ALL_KEYS_AS_ESC is excluded too: it asks for every key as
+/// `CSI <code>;<mods>[;<text>]u`, and the IME path terminates in
+/// `write_gap_text`, which writes raw UTF-8 with no Kitty awareness. Under that
+/// mode text keys must stay on the [`keystroke_to_bytes`] path so they get
+/// encoded. Disambiguate-only sessions are unaffected — [`encode_kitty`]
+/// declines unmodified text keys there, so the IME route is equivalent.
+///
+/// Compiled under `test` on every platform so the routing rule is covered by
+/// CI everywhere, not just on the macOS runner.
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn defer_to_ime(ks: &gpui::Keystroke, kitty: KittyFlags) -> bool {
+    if kitty.report_all_keys {
+        return false;
+    }
     let m = &ks.modifiers;
     if m.control || m.platform || m.function || m.alt {
         return false;
@@ -564,7 +577,16 @@ impl InputHandler for TerminalInputHandler {
         false
     }
 
-    fn prefers_ime_for_printable_keys(&mut self, window: &mut Window, _cx: &mut App) -> bool {
+    fn prefers_ime_for_printable_keys(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        // REPORT_ALL_KEYS_AS_ESC wants every key as `CSI <code>;<mods>[;<text>]u`,
+        // which only `keystroke_to_bytes` produces — the IME path commits raw
+        // UTF-8. Keep printable keys on the dispatch path so they get encoded,
+        // matching the same gate in `on_key_down`. CJK composition and "escape
+        // every key" are mutually exclusive by construction; an app that asks
+        // for the latter gets it.
+        if self.view.read(cx).kitty_flags().report_all_keys {
+            return false;
+        }
         // While a multi-key keybinding is mid-sequence — e.g. the tmux preset's
         // `ctrl-b` prefix is held pending — the next key belongs to the keymap,
         // not the IME. macOS otherwise diverts printable keys straight to the IME
@@ -596,8 +618,28 @@ impl InputHandler for TerminalInputHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{KittyFlags, keystroke_to_bytes, reshape_option_keystroke, tab_bytes};
+    use super::{
+        KittyFlags, defer_to_ime, keystroke_to_bytes, reshape_option_keystroke, tab_bytes,
+    };
     use gpui::{Keystroke, Modifiers};
+
+    /// Kitty full mode: every key escaped, with the produced text attached.
+    fn full_mode() -> KittyFlags {
+        KittyFlags {
+            disambiguate: true,
+            report_all_keys: true,
+            report_text: true,
+        }
+    }
+
+    /// Level 1 only — the mode a shell leaves on after a TUI exits.
+    fn disambiguate_only() -> KittyFlags {
+        KittyFlags {
+            disambiguate: true,
+            report_all_keys: false,
+            report_text: false,
+        }
+    }
 
     /// The legacy call shape used by the pre-existing tests: encode with the Kitty
     /// protocol off, exercising exactly the byte output shells see by default.
@@ -611,6 +653,73 @@ mod tests {
             key: key.to_string(),
             key_char: key_char.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn plain_text_defers_to_the_ime_unless_kitty_wants_every_key() {
+        let plain = Modifiers::default();
+        let a = ks(plain, "a", Some("a"));
+
+        // Default and disambiguate-only: text belongs to the IME, which is the
+        // only path that carries a synthesized event's real Unicode payload.
+        assert!(defer_to_ime(&a, KittyFlags::default()));
+        assert!(defer_to_ime(&a, disambiguate_only()));
+
+        // Full mode: the IME commits raw UTF-8, so deferring would drop the
+        // `CSI 97;1;97u` the app negotiated for. Stay on the encoder path.
+        assert!(!defer_to_ime(&a, full_mode()));
+        assert_eq!(
+            keystroke_to_bytes(&a, full_mode()),
+            Some(b"\x1b[97;1;97u".to_vec()),
+        );
+
+        // Space is text too, and follows the same rule.
+        let space = ks(plain, "space", Some(" "));
+        assert!(defer_to_ime(&space, KittyFlags::default()));
+        assert!(!defer_to_ime(&space, full_mode()));
+    }
+
+    #[test]
+    fn shifted_text_follows_the_same_ime_rule() {
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let upper = ks(shift, "a", Some("A"));
+        assert!(defer_to_ime(&upper, KittyFlags::default()));
+        assert!(!defer_to_ime(&upper, full_mode()));
+    }
+
+    #[test]
+    fn non_text_keys_never_defer_to_the_ime() {
+        let plain = Modifiers::default();
+        // No `key_char` at all — arrows, F-keys, backspace, escape.
+        assert!(!defer_to_ime(
+            &ks(plain, "left", None),
+            KittyFlags::default()
+        ));
+        assert!(!defer_to_ime(
+            &ks(plain, "backspace", None),
+            KittyFlags::default()
+        ));
+        // Control chars are filtered even when a `key_char` is present.
+        assert!(!defer_to_ime(
+            &ks(plain, "enter", Some("\n")),
+            KittyFlags::default()
+        ));
+        assert!(!defer_to_ime(
+            &ks(plain, "tab", Some("\t")),
+            KittyFlags::default()
+        ));
+        // Chords belong to the encoders, not the IME.
+        let ctrl = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        assert!(!defer_to_ime(
+            &ks(ctrl, "c", Some("c")),
+            KittyFlags::default()
+        ));
     }
 
     #[test]

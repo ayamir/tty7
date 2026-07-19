@@ -1372,10 +1372,18 @@ impl TerminalView {
         // `key_char` from the virtual keycode, which is a lie for synthesized
         // events). Decline the key without consuming it and gpui hands the
         // native event to the input context, which delivers the real text via
-        // `commit_text`. A pending multi-key chord is the exception: that key
-        // belongs to the keymap, matching `prefers_ime_for_printable_keys`.
+        // `commit_text`.
+        //
+        // Kitty's REPORT_ALL_KEYS_AS_ESC is the exception — `defer_to_ime`
+        // declines under it so the key reaches the encoder below.
+        //
+        // A pending multi-key chord is already handled before this point: a key
+        // that completes a sequence is dispatched as an action and never
+        // reaches `on_key_down`. The check below is belt-and-braces (gpui takes
+        // `pending_input` earlier in `dispatch_key_event`, so it never fires
+        // here) and mirrors `prefers_ime_for_printable_keys`, which *is* live.
         #[cfg(target_os = "macos")]
-        if !window.has_pending_keystrokes() && super::input::defer_to_ime(ks) {
+        if !window.has_pending_keystrokes() && super::input::defer_to_ime(ks, self.kitty_flags()) {
             return;
         }
 
@@ -2070,7 +2078,7 @@ impl TerminalView {
     /// local `Term`'s mode bits (the reader thread keeps them current by advancing
     /// the emulator over all child output). Consulted by the key encoder so TUIs
     /// that opt into the protocol get `CSI u` reports.
-    fn kitty_flags(&self) -> super::input::KittyFlags {
+    pub(super) fn kitty_flags(&self) -> super::input::KittyFlags {
         super::input::KittyFlags::from_mode(self.terminal.term.lock().mode())
     }
 
