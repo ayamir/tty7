@@ -319,17 +319,13 @@ fn find_git_bash() -> Option<PathBuf> {
 }
 
 /// Installed WSL distribution names via `wsl.exe -l -q`, or empty when WSL is
-/// absent. `CREATE_NO_WINDOW` keeps the probe from flashing a console window
-/// (we're a GUI process).
+/// absent. [`hide_console`](crate::core::proc::hide_console) keeps the probe
+/// from flashing a console window (we're a GUI process).
 #[cfg(windows)]
 fn list_wsl_distros() -> Vec<String> {
-    use std::os::windows::process::CommandExt as _;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let Ok(output) = std::process::Command::new("wsl.exe")
-        .args(["-l", "-q"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-    else {
+    let mut cmd = std::process::Command::new("wsl.exe");
+    cmd.args(["-l", "-q"]);
+    let Ok(output) = crate::core::proc::hide_console(&mut cmd).output() else {
         return Vec::new();
     };
     if !output.status.success() {

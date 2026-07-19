@@ -18,6 +18,7 @@ pub mod config;
 #[allow(dead_code)]
 pub mod keychain;
 pub mod osc;
+pub mod proc;
 pub mod session;
 pub mod shells;
 pub mod ssh_config;
