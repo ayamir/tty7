@@ -182,6 +182,19 @@ pub struct Config {
     /// the clipboard is never overwritten by a stray selection unless opted
     /// into.
     pub copy_on_select: bool,
+    /// Double-click smart selection: expand the selection to the whole URL,
+    /// email address, file path, or matching bracket pair under the cursor
+    /// when the plain word sits inside one. On by default; off restores the
+    /// bare word-boundary double-click.
+    #[serde(default = "default_true")]
+    pub smart_select: bool,
+    /// Characters (besides whitespace) that end a double-click word
+    /// selection, in both the terminal grid and the prompt's command editor.
+    /// The default mirrors alacritty's semantic escape set — note `/ . - _`
+    /// are *not* separators, so paths select as one word. JSON-only (no GUI
+    /// widget yet).
+    #[serde(default = "default_word_separators")]
+    pub word_separators: String,
     /// Window state at launch: normal / maximized / fullscreen.
     #[serde(default, deserialize_with = "de_lenient")]
     pub startup_mode: StartupMode,
@@ -494,6 +507,8 @@ impl Default for Config {
             mouse_reporting: true,
             clipboard_trim_trailing_spaces: false,
             copy_on_select: false,
+            smart_select: true,
+            word_separators: default_word_separators(),
             startup_mode: StartupMode::Normal,
             remember_window_size: true,
             working_directory: WorkingDirectory::default(),
@@ -760,6 +775,13 @@ fn default_preset() -> String {
 /// behavior instead of deserializing to `false`).
 fn default_true() -> bool {
     true
+}
+
+/// Serde default for [`Config::word_separators`]: alacritty's stock semantic
+/// escape set, the boundary characters double-click word selection used
+/// before this was configurable.
+fn default_word_separators() -> String {
+    ",│`|:\"' ()[]{}<>\t".to_string()
 }
 
 /// Serde default for [`Config::notify_threshold_secs`]: the 10-second floor a

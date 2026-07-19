@@ -1367,6 +1367,26 @@ impl TerminalView {
             return;
         }
 
+        // On macOS all ordinary text goes out through the IME, never through
+        // `key_char` — see `input::defer_to_ime` for why (gpui reconstructs
+        // `key_char` from the virtual keycode, which is a lie for synthesized
+        // events). Decline the key without consuming it and gpui hands the
+        // native event to the input context, which delivers the real text via
+        // `commit_text`.
+        //
+        // Kitty's REPORT_ALL_KEYS_AS_ESC is the exception — `defer_to_ime`
+        // declines under it so the key reaches the encoder below.
+        //
+        // A pending multi-key chord is already handled before this point: a key
+        // that completes a sequence is dispatched as an action and never
+        // reaches `on_key_down`. The check below is belt-and-braces (gpui takes
+        // `pending_input` earlier in `dispatch_key_event`, so it never fires
+        // here) and mirrors `prefers_ime_for_printable_keys`, which *is* live.
+        #[cfg(target_os = "macos")]
+        if !window.has_pending_keystrokes() && super::input::defer_to_ime(ks, self.kitty_flags()) {
+            return;
+        }
+
         // While idle at the prompt, our local command editor owns the keyboard:
         // editing keys act on the in-memory line and Enter ships it to the PTY.
         // Printable text is delivered through the IME path (`commit_text`), so we
@@ -2058,7 +2078,7 @@ impl TerminalView {
     /// local `Term`'s mode bits (the reader thread keeps them current by advancing
     /// the emulator over all child output). Consulted by the key encoder so TUIs
     /// that opt into the protocol get `CSI u` reports.
-    fn kitty_flags(&self) -> super::input::KittyFlags {
+    pub(super) fn kitty_flags(&self) -> super::input::KittyFlags {
         super::input::KittyFlags::from_mode(self.terminal.term.lock().mode())
     }
 
@@ -2849,7 +2869,9 @@ impl TerminalView {
                 self.editor_drag_word = None;
             }
             2 => {
-                self.cmd.select_word_at(idx);
+                let cfg = cx.global::<Config>();
+                let (seps, smart) = (cfg.word_separators.clone(), cfg.smart_select);
+                self.cmd.select_word_at(idx, &seps, smart);
                 // Drag now grows the selection by whole words around this one.
                 self.editor_selecting = true;
                 self.editor_drag_word = self.cmd.selection();
@@ -2880,7 +2902,9 @@ impl TerminalView {
         };
         // A drag begun on a double-click extends by whole words; otherwise by char.
         if let Some((s, e)) = self.editor_drag_word {
-            self.cmd.extend_word_to(s, e, idx);
+            let cfg = cx.global::<Config>();
+            let (seps, smart) = (cfg.word_separators.clone(), cfg.smart_select);
+            self.cmd.extend_word_to(s, e, idx, &seps, smart);
         } else {
             self.cmd.extend_to(idx);
         }
@@ -3637,18 +3661,51 @@ impl TerminalView {
         row: usize,
         left: bool,
         clicks: usize,
+        shift: bool,
         cx: &mut Context<Self>,
     ) {
+        let smart = cx.global::<Config>().smart_select;
         let mut term = self.terminal.term.lock();
         let display_offset = term.grid().display_offset() as i32;
         let point = Point::new(Line(row as i32 - display_offset), Column(col));
         let side = if left { Side::Left } else { Side::Right };
+        // Shift+click extends the existing selection to the click instead of
+        // starting over (à la iTerm2). A plain click always leaves a
+        // collapsed Simple selection behind, so the anchor is wherever the
+        // last gesture ended.
+        if shift && clicks == 1 && term.selection.is_some() {
+            if let Some(sel) = term.selection.as_mut() {
+                sel.update(point, side);
+            }
+            drop(term);
+            self.selecting = true;
+            cx.notify();
+            return;
+        }
         let ty = match clicks {
             2 => SelectionType::Semantic, // word
             n if n >= 3 => SelectionType::Lines,
             _ => SelectionType::Simple,
         };
-        term.selection = Some(Selection::new(ty, point, side));
+        let mut selection = Selection::new(ty, point, side);
+        // Double-click smart selection: a URL / path / email / bracket pair /
+        // CJK word containing the clicked word replaces the plain word span.
+        // Boundary-flanked candidates anchor a Semantic selection (keeping
+        // the drag gesture word-wise); exact ones use Simple so alacritty
+        // can't re-expand the endpoints past the smart boundary.
+        if clicks == 2
+            && smart
+            && let Some(r) = super::smart_select::grid_smart_range(&term, point)
+        {
+            let ty = if r.exact {
+                SelectionType::Simple
+            } else {
+                SelectionType::Semantic
+            };
+            selection = Selection::new(ty, r.start, Side::Left);
+            selection.update(r.end, Side::Right);
+        }
+        term.selection = Some(selection);
         drop(term);
         self.selecting = true;
         cx.notify();
@@ -6060,6 +6117,34 @@ mod gpui_tests {
         }
     }
 
+    /// Deliver one printable character the way the running platform actually
+    /// does. macOS hands all text to the input context, which arrives as
+    /// `commit_text` (see `input::defer_to_ime`); elsewhere it travels the
+    /// `on_key_down` / `key_char` path. Tests that assert on *text* input must
+    /// go through here, or they exercise a path the platform never takes.
+    fn type_char(
+        view: &mut TerminalView,
+        ch: &str,
+        window: &mut Window,
+        cx: &mut Context<TerminalView>,
+    ) {
+        if cfg!(target_os = "macos") {
+            let _ = window;
+            view.commit_text(ch, cx);
+        } else {
+            let ev = KeyDownEvent {
+                keystroke: gpui::Keystroke {
+                    modifiers: gpui::Modifiers::default(),
+                    key: ch.to_string(),
+                    key_char: Some(ch.to_string()),
+                },
+                is_held: false,
+                prefer_character_input: false,
+            };
+            view.on_key_down(&ev, window, cx);
+        }
+    }
+
     fn next_input_until_timeout(daemon: &mut UnixStream) -> Option<Vec<u8>> {
         use std::io::ErrorKind;
 
@@ -6131,16 +6216,7 @@ mod gpui_tests {
                     !view.input_active(),
                     "shell vi-mode lets the shell line editor own prompt input"
                 );
-                let a = KeyDownEvent {
-                    keystroke: gpui::Keystroke {
-                        modifiers: gpui::Modifiers::default(),
-                        key: "a".to_string(),
-                        key_char: Some("a".to_string()),
-                    },
-                    is_held: false,
-                    prefer_character_input: false,
-                };
-                view.on_key_down(&a, window, cx);
+                type_char(view, "a", window, cx);
                 assert_eq!(
                     view.cmd.text(),
                     "",
@@ -6206,16 +6282,7 @@ mod gpui_tests {
 
         window
             .update(cx, |view, window, cx| {
-                let i = KeyDownEvent {
-                    keystroke: gpui::Keystroke {
-                        modifiers: gpui::Modifiers::default(),
-                        key: "i".to_string(),
-                        key_char: Some("i".to_string()),
-                    },
-                    is_held: false,
-                    prefer_character_input: false,
-                };
-                view.on_key_down(&i, window, cx);
+                type_char(view, "i", window, cx);
             })
             .unwrap();
         assert_eq!(
@@ -6908,7 +6975,7 @@ mod gpui_tests {
         let drag_hello = |cx: &mut TestAppContext| {
             window
                 .update(cx, |view, _, cx| {
-                    view.on_select_start(0, 0, true, 1, cx);
+                    view.on_select_start(0, 0, true, 1, false, cx);
                     view.on_select_update(4, 0, false, cx);
                     view.on_select_end(cx);
                 })
@@ -6973,7 +7040,7 @@ mod gpui_tests {
             .update(cx, |view, window, cx| {
                 // Mouse-select "hello" (copy-on-select is off by default, so
                 // the selection survives mouse-up).
-                view.on_select_start(0, 0, true, 1, cx);
+                view.on_select_start(0, 0, true, 1, false, cx);
                 view.on_select_update(4, 0, false, cx);
                 view.on_select_end(cx);
                 assert!(view.has_selection(), "the drag must leave a selection");

@@ -8,11 +8,14 @@
 //!
 //! `CREATE_NO_WINDOW` suppresses the console entirely; stdout/stderr pipes are
 //! unaffected, so output capture keeps working. Every non-PTY `Command` in the
-//! app should go through [`hide_console`] before it runs. PTY children are not
-//! in scope — the daemon owns those and passes its own flags (see
-//! [`crate::daemon::spawn`]).
+//! app should go through [`hide_console`] (or [`hide_console_tokio`] for the
+//! async flavor) before it runs. PTY children are not in scope — the daemon
+//! owns those and passes its own flags (see [`crate::daemon::spawn`]).
 
 use std::process::Command;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Suppress the console window Windows would otherwise allocate for a console
 /// subsystem child. No-op on Unix, so callers stay `cfg`-free.
@@ -20,7 +23,17 @@ pub fn hide_console(cmd: &mut Command) -> &mut Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// [`hide_console`] for `tokio::process::Command`. Separate because tokio's
+/// builder is a distinct type with its own `creation_flags`, not a `Deref` to
+/// the std one.
+pub fn hide_console_tokio(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    #[cfg(windows)]
+    {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
