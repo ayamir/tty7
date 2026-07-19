@@ -2051,7 +2051,9 @@ fn strip_uri_drive_slash(path: &str) -> &str {
 }
 
 /// Parse an OSC 7 `file://HOST/PATH` (or bare absolute path) payload.
-fn parse_osc7(payload: &[u8]) -> Option<PathBuf> {
+/// `pub(crate)` so the shell-integration tests can round-trip what the snippets
+/// actually emit through the parser that consumes it.
+pub(crate) fn parse_osc7(payload: &[u8]) -> Option<PathBuf> {
     let rest = payload.strip_prefix(b"7;")?;
     let path_bytes: &[u8] = if let Some(after) = rest.strip_prefix(b"file://") {
         let idx = after.iter().position(|&c| c == b'/')?;

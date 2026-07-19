@@ -274,7 +274,26 @@ if [[ $- == *i* ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
     fi
   }
   # Escape literal `%` as %25 — the daemon percent-decodes the OSC 7 payload.
-  __tty7_report_cwd() { builtin printf '\e]7;file://%s%s\a' "${HOSTNAME:-localhost}" "${PWD//\%/%25}"; }
+  #
+  # Under Git Bash (msys) `$PWD` is an msys path — `/c/Users/x`, and `/tmp` for
+  # mounts with no drive at all. The daemon runs Windows-side, where `/c/Users/x`
+  # is not absolute but *drive-relative*, so it resolves to a bogus `C:\c\Users\x`
+  # (see `pane::strip_uri_drive_slash`, which only un-prefixes `/C:/…`). `pwd -W`
+  # is msys's own translation to the real Windows path and maps msys-only mounts
+  # correctly (`/tmp` -> `C:/Users/x/AppData/Local/Temp`). It has no leading
+  # slash, so add one to make it the absolute-path shape a file: URI expects.
+  # Branch once at install time rather than on every prompt.
+  if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; then
+    __tty7_report_cwd() {
+      local d
+      d="$(builtin pwd -W 2>/dev/null)" || d="$PWD"
+      [[ -z "$d" ]] && d="$PWD"
+      [[ "$d" != /* ]] && d="/$d"
+      builtin printf '\e]7;file://%s%s\a' "${HOSTNAME:-localhost}" "${d//\%/%25}"
+    }
+  else
+    __tty7_report_cwd() { builtin printf '\e]7;file://%s%s\a' "${HOSTNAME:-localhost}" "${PWD//\%/%25}"; }
+  fi
 
   # Own hook for D, prepended to precmd_functions (same rationale as the zsh
   # path): the app flips back to prompt-editing on D, so it must fire the
@@ -1096,8 +1115,25 @@ mod tests {
                 "Git Bash must report {mark}; got:\n{text}"
             );
         }
-        // cwd reporting rides along on the same hooks.
-        assert!(text.contains("]7;file://"), "expected OSC 7; got:\n{text}");
+        // cwd reporting rides along on the same hooks. Assert the *decoded*
+        // path, not just the marker's presence: Git Bash's `$PWD` is an msys
+        // path (`/c/Users/x`) that Windows resolves drive-relative to a
+        // non-existent `C:\c\Users\x`, which silently disables the git-status
+        // probe and breaks split/new-tab. Round-tripping through the daemon's
+        // own parser is what proves the two halves agree.
+        let payload = text
+            .split("\u{1b}]")
+            .find(|s| s.starts_with("7;file://"))
+            .and_then(|s| s.split(['\u{7}', '\u{1b}']).next())
+            .unwrap_or_else(|| panic!("expected OSC 7; got:\n{text}"));
+        let cwd = crate::daemon::pane::parse_osc7(payload.as_bytes())
+            .unwrap_or_else(|| panic!("daemon could not parse OSC 7 payload {payload:?}"));
+        assert!(
+            cwd.exists(),
+            "Git Bash reported a cwd the Windows side cannot resolve: {cwd:?} \
+             (from {payload:?}) — a drive-relative msys path, so `pwd -W` \
+             translation regressed"
+        );
     }
 
     #[test]
@@ -1364,6 +1400,48 @@ mod tests {
                 "{shell} must not emit the raw $PWD in its OSC 7 report"
             );
         }
+        // bash's msys branch reports `pwd -W` output rather than $PWD, so it
+        // needs the same escaping on its own variable.
+        assert!(
+            BASH_INTEGRATION.contains(r"${d//\%/%25}"),
+            "bash's msys OSC 7 reporter must %-escape the literal percent too"
+        );
+    }
+
+    /// Under Git Bash `$PWD` is an msys path (`/c/Users/x`). Windows reads that
+    /// as drive-relative, so it would land on `C:\c\Users\x` — a directory that
+    /// does not exist, silently killing the git-status probe and path completion,
+    /// and actively breaking split/new-tab (the client cwd wins over every
+    /// fallback in `pane::initial_working_directory`, so the next shell is
+    /// spawned with a bogus working directory). `pwd -W` is msys's translation
+    /// to the real Windows path.
+    #[test]
+    fn bash_reports_a_windows_path_under_msys() {
+        let s = BASH_INTEGRATION;
+        assert!(
+            s.contains(r#"if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]"#),
+            "bash must detect msys/cygwin to pick its cwd reporter"
+        );
+        assert!(
+            s.contains("builtin pwd -W"),
+            "bash's msys branch must translate the cwd with `pwd -W`"
+        );
+        // `pwd -W` yields `C:/Users/x` with no leading slash; a file: URI needs
+        // one so the daemon's `strip_uri_drive_slash` recognises the drive.
+        assert!(
+            s.contains(r#"[[ "$d" != /* ]] && d="/$d""#),
+            "bash's msys branch must make the translated path URI-absolute"
+        );
+        // Both `pwd -W` failing and it returning empty must fall back to $PWD
+        // rather than reporting an empty cwd.
+        assert!(
+            s.contains(r#"d="$(builtin pwd -W 2>/dev/null)" || d="$PWD""#),
+            "bash's msys branch must fall back to $PWD when `pwd -W` fails"
+        );
+        assert!(
+            s.contains(r#"[[ -z "$d" ]] && d="$PWD""#),
+            "bash's msys branch must fall back to $PWD when `pwd -W` is empty"
+        );
     }
 
     #[test]
