@@ -815,8 +815,11 @@ fn shell_kind(program: Option<&str>) -> Option<ShellKind> {
 /// form a user-configured shell may use. Absent means "the default distro",
 /// which is also what `wsl.exe` does with no flag — so `None` is a valid answer,
 /// not a failure.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn wsl_distro(args: &[String]) -> Option<String> {
+///
+/// Shared with `pane::wsl_remote_context`, which names the same distro in the
+/// pane's [`RemoteContext`](crate::daemon::protocol::RemoteContext) from the
+/// same argv: two parsers for one flag would be free to disagree.
+pub(crate) fn wsl_distro(args: &[String]) -> Option<String> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "--distribution" || a == "-d" {
