@@ -102,6 +102,33 @@ fn default_shell_name(cmd: &CommandBuilder) -> String {
     cmd.get_shell()
 }
 
+/// The shell a spawn resolved to, plus who authored its args.
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+struct ChosenShell {
+    program: String,
+    args: Vec<String>,
+    /// True when `args` are tty7's own defaults from shell discovery rather
+    /// than the user's, so shell integration may replace them. See
+    /// [`ShellSpec::args_are_tty7_defaults`].
+    args_are_tty7_defaults: bool,
+}
+
+/// Whether the chosen shell carries args tty7 must not second-guess, which is
+/// what makes `shell_integration::setup` decline bash and PowerShell (their
+/// injections replace argv rather than extend it). Two things have to hold for
+/// the args to be off-limits:
+///
+///  - there are some — an empty `args: []` (just picking the program) leaves
+///    nothing for bash's `--rcfile … -i` to conflict with; and
+///  - the *user* wrote them. The new-tab dropdown's args are tty7's own
+///    (`core::shells::detect_shells`), so integration is free to express the
+///    same intent its own way: Git Bash's `-i -l` means "interactive login
+///    shell", exactly what `setup_bash` rebuilds out of `--rcfile … -i` plus a
+///    replayed login-file chain. See [`ShellSpec::args_are_tty7_defaults`].
+fn has_custom_args(chosen: Option<&ChosenShell>) -> bool {
+    chosen.is_some_and(|c| !c.args.is_empty() && !c.args_are_tty7_defaults)
+}
+
 /// Which shell a spawn launches, by precedence: the explicit per-spawn override
 /// (the new-tab dropdown) > the configured `shell` in `config.json` > `None`,
 /// meaning the platform default (`default_prog()`). Kept as a function so the
@@ -109,8 +136,21 @@ fn default_shell_name(cmd: &CommandBuilder) -> String {
 fn choose_shell(
     spawn_override: Option<ShellSpec>,
     configured: Option<(String, Vec<String>)>,
-) -> Option<(String, Vec<String>)> {
-    spawn_override.map(|s| (s.program, s.args)).or(configured)
+) -> Option<ChosenShell> {
+    spawn_override
+        .map(|s| ChosenShell {
+            program: s.program,
+            args: s.args,
+            args_are_tty7_defaults: s.args_are_tty7_defaults,
+        })
+        .or_else(|| {
+            // Straight from `config.json` — the user wrote these.
+            configured.map(|(program, args)| ChosenShell {
+                program,
+                args,
+                args_are_tty7_defaults: false,
+            })
+        })
 }
 
 fn apply_shell_integration(
@@ -161,9 +201,9 @@ fn build_shell_command(
     // shell on Unix, PowerShell on Windows).
     let configured = choose_shell(shell, crate::core::config::shell_command());
     let mut cmd = match &configured {
-        Some((program, args)) => {
-            let mut c = CommandBuilder::new(program);
-            c.args(args);
+        Some(chosen) => {
+            let mut c = CommandBuilder::new(&chosen.program);
+            c.args(&chosen.args);
             c
         }
         None => default_prog(),
@@ -174,20 +214,18 @@ fn build_shell_command(
     // it's whatever `default_prog()` resolved (passwd/`$SHELL` on Unix,
     // `powershell.exe` on Windows — see `default_shell_name`).
     let resolved_program = match &configured {
-        Some((program, _)) => program.clone(),
+        Some(chosen) => chosen.program.clone(),
         None => default_shell_name(&cmd),
     };
 
     // Shell integration: inject OSC 7 / OSC 133 hooks (zsh/fish/bash/PowerShell
     // — see `daemon::shell_integration`). Best effort — `None` (an unsupported
     // shell, or a bash/PowerShell with unpreservable custom args) means we launch
-    // bare. A configured shell only counts as having "custom args" to preserve
-    // when it actually specifies any — an empty `args: []` (just picking the
-    // program) leaves nothing for bash's `--rcfile -i` to conflict with.
-    let has_custom_args = configured
-        .as_ref()
-        .is_some_and(|(_, args)| !args.is_empty());
-    let integration = shell_integration::setup(Some(&resolved_program), has_custom_args);
+    // bare.
+    let integration = shell_integration::setup(
+        Some(&resolved_program),
+        has_custom_args(configured.as_ref()),
+    );
     if let Some(integration) = &integration {
         apply_shell_integration(&mut cmd, &resolved_program, integration);
     }
@@ -2013,7 +2051,9 @@ fn strip_uri_drive_slash(path: &str) -> &str {
 }
 
 /// Parse an OSC 7 `file://HOST/PATH` (or bare absolute path) payload.
-fn parse_osc7(payload: &[u8]) -> Option<PathBuf> {
+/// `pub(crate)` so the shell-integration tests can round-trip what the snippets
+/// actually emit through the parser that consumes it.
+pub(crate) fn parse_osc7(payload: &[u8]) -> Option<PathBuf> {
     let rest = payload.strip_prefix(b"7;")?;
     let path_bytes: &[u8] = if let Some(after) = rest.strip_prefix(b"file://") {
         let idx = after.iter().position(|&c| c == b'/')?;
@@ -2163,18 +2203,55 @@ mod tests {
         let over = ShellSpec {
             program: "fish".into(),
             args: vec!["-l".into()],
+            args_are_tty7_defaults: true,
         };
         let cfg = ("zsh".to_string(), vec!["-i".to_string()]);
 
-        // Override wins even when a shell is configured.
+        // Override wins even when a shell is configured, carrying its
+        // arg-ownership flag through.
         assert_eq!(
             choose_shell(Some(over.clone()), Some(cfg.clone())),
-            Some(("fish".to_string(), vec!["-l".to_string()]))
+            Some(ChosenShell {
+                program: "fish".to_string(),
+                args: vec!["-l".to_string()],
+                args_are_tty7_defaults: true,
+            })
         );
-        // No override → the configured shell.
-        assert_eq!(choose_shell(None, Some(cfg.clone())), Some(cfg));
+        // No override → the configured shell, whose args are the user's and so
+        // are never tty7 defaults.
+        assert_eq!(
+            choose_shell(None, Some(cfg.clone())),
+            Some(ChosenShell {
+                program: "zsh".to_string(),
+                args: vec!["-i".to_string()],
+                args_are_tty7_defaults: false,
+            })
+        );
         // Neither → platform default.
         assert_eq!(choose_shell(None, None), None);
+    }
+
+    /// Only *user*-authored args block integration. Locks the contract stated
+    /// on [`has_custom_args`] — in particular that the Git Bash dropdown row's
+    /// `-i -l` does not, which is what lets it get shell integration at all.
+    #[test]
+    fn only_user_authored_args_block_shell_integration() {
+        let chosen = |args: Vec<&str>, tty7: bool| ChosenShell {
+            program: r"C:\Program Files\Git\bin\bash.exe".to_string(),
+            args: args.into_iter().map(str::to_string).collect(),
+            args_are_tty7_defaults: tty7,
+        };
+
+        // The Git Bash dropdown row: tty7 wrote `-i -l`, so `setup_bash` may
+        // replace them.
+        assert!(!has_custom_args(Some(&chosen(vec!["-i", "-l"], true))));
+        // The same args from the user's config.json are theirs to keep.
+        assert!(has_custom_args(Some(&chosen(vec!["-i", "-l"], false))));
+        // No args at all: nothing to preserve either way.
+        assert!(!has_custom_args(Some(&chosen(vec![], false))));
+        assert!(!has_custom_args(Some(&chosen(vec![], true))));
+        // Platform default — no configured shell at all.
+        assert!(!has_custom_args(None));
     }
 
     #[test]
