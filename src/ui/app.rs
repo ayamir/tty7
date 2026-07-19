@@ -3815,8 +3815,7 @@ impl Tty7App {
             .focused_or_first(window, cx)?;
         let pane = pane.read(cx);
         let remote = pane.remote_context()?;
-        (remote.kind != crate::daemon::protocol::RemoteKind::Wsl)
-            .then_some((pane.pane_id, remote))
+        (remote.kind != crate::daemon::protocol::RemoteKind::Wsl).then_some((pane.pane_id, remote))
     }
 
     /// The focused pane when it is a *connected native* SSH session — the gate for

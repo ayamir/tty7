@@ -851,10 +851,7 @@ fn wslenv_with(existing: Option<&str>, additions: &[&str]) -> String {
         let name = add.split('/').next().unwrap_or(add);
         // A name already present wins whatever flags the user gave it; ours is
         // additive, not a correction of their configuration.
-        if !out
-            .iter()
-            .any(|e| e.split('/').next().unwrap_or(e) == name)
-        {
+        if !out.iter().any(|e| e.split('/').next().unwrap_or(e) == name) {
             out.push((*add).to_string());
         }
     }
@@ -1466,10 +1463,7 @@ mod tests {
         assert!(shell_kind(Some("cmd.exe")).is_none());
         // `wsl.exe` is the launcher, not a shell — it maps to its own kind so
         // `setup` can reach through it into the distro.
-        assert!(matches!(
-            shell_kind(Some("wsl.exe")),
-            Some(ShellKind::Wsl)
-        ));
+        assert!(matches!(shell_kind(Some("wsl.exe")), Some(ShellKind::Wsl)));
         assert!(matches!(shell_kind(Some("wsl")), Some(ShellKind::Wsl)));
     }
 
@@ -1550,10 +1544,7 @@ mod tests {
         assert_eq!(wslenv_with(None, &["TTY7_RC/p"]), "TTY7_RC/p");
         assert_eq!(wslenv_with(Some(""), &["TTY7_RC/p"]), "TTY7_RC/p");
         // Already present: left exactly as the user spelled it, not duplicated.
-        assert_eq!(
-            wslenv_with(Some("TTY7_RC/l"), &["TTY7_RC/p"]),
-            "TTY7_RC/l"
-        );
+        assert_eq!(wslenv_with(Some("TTY7_RC/l"), &["TTY7_RC/p"]), "TTY7_RC/l");
     }
 
     /// Git Bash is spawned by its absolute `bash.exe` path, so `.exe` must be
