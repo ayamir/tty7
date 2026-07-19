@@ -105,6 +105,38 @@ pub(super) fn reshape_option_keystroke(
     }
 }
 
+/// True when a keystroke is ordinary text that macOS should deliver through the
+/// input context (`insertText:` → `replace_text_in_range` → `commit_text`)
+/// rather than the raw `key_char` path.
+///
+/// gpui derives `key_char` by running the event's *virtual keycode* back through
+/// the current layout (`chars_for_modified_key` in its macOS backend); it never
+/// reads the event's Unicode payload. That is fine for a physical keyboard, where
+/// the keycode is the truth, but wrong for any event whose text lives only in the
+/// payload — notably remote-control apps, which synthesize keystrokes as
+/// `CGEventCreateKeyboardEvent(src, 0, …)` + `CGEventKeyboardSetUnicodeString()`.
+/// Keycode 0 is `a`, so every remotely typed character arrived as `a`.
+///
+/// gpui already diverts printable keys to the input context, but only while a
+/// composing input source is active (`is_ime_input_source_active`), so the bug
+/// appeared and vanished depending on which input method was selected — and the
+/// plain ABC layout, the macOS default, always lost the text. Declining the key
+/// here instead makes the IME the single delivery path for text on macOS: gpui
+/// falls through to `handleEvent:`, and the Unicode payload survives.
+///
+/// Chords are deliberately excluded: Ctrl/Cmd/Fn belong to the encoders below,
+/// and Option is owned by [`reshape_option_keystroke`]'s Meta policy.
+#[cfg(target_os = "macos")]
+pub(super) fn defer_to_ime(ks: &gpui::Keystroke) -> bool {
+    let m = &ks.modifiers;
+    if m.control || m.platform || m.function || m.alt {
+        return false;
+    }
+    ks.key_char
+        .as_deref()
+        .is_some_and(|ch| !ch.is_empty() && ch.chars().all(|c| c >= '\u{20}' && c != '\u{7f}'))
+}
+
 /// Translate a GPUI keystroke into the bytes a PTY expects.
 ///
 /// When the app has enabled the Kitty keyboard protocol (`kitty.active()`) we try
@@ -520,6 +552,16 @@ impl InputHandler for TerminalInputHandler {
         _cx: &mut App,
     ) -> Option<usize> {
         None
+    }
+
+    fn apple_press_and_hold_enabled(&mut self) -> bool {
+        // A terminal wants auto-repeat, not the accent palette: holding `j` in
+        // vim scrolls, it does not offer `ĵ`. This used to be moot because
+        // `on_key_down` consumed printable keys before gpui consulted it; now
+        // that text defers to the IME (see `defer_to_ime`), gpui reaches its
+        // held-key branch, and answering `false` there makes it repeat the
+        // character instead of handing the key to press-and-hold.
+        false
     }
 
     fn prefers_ime_for_printable_keys(&mut self, window: &mut Window, _cx: &mut App) -> bool {

@@ -1367,6 +1367,18 @@ impl TerminalView {
             return;
         }
 
+        // On macOS all ordinary text goes out through the IME, never through
+        // `key_char` — see `input::defer_to_ime` for why (gpui reconstructs
+        // `key_char` from the virtual keycode, which is a lie for synthesized
+        // events). Decline the key without consuming it and gpui hands the
+        // native event to the input context, which delivers the real text via
+        // `commit_text`. A pending multi-key chord is the exception: that key
+        // belongs to the keymap, matching `prefers_ime_for_printable_keys`.
+        #[cfg(target_os = "macos")]
+        if !window.has_pending_keystrokes() && super::input::defer_to_ime(ks) {
+            return;
+        }
+
         // While idle at the prompt, our local command editor owns the keyboard:
         // editing keys act on the in-memory line and Enter ships it to the PTY.
         // Printable text is delivered through the IME path (`commit_text`), so we
@@ -6060,6 +6072,34 @@ mod gpui_tests {
         }
     }
 
+    /// Deliver one printable character the way the running platform actually
+    /// does. macOS hands all text to the input context, which arrives as
+    /// `commit_text` (see `input::defer_to_ime`); elsewhere it travels the
+    /// `on_key_down` / `key_char` path. Tests that assert on *text* input must
+    /// go through here, or they exercise a path the platform never takes.
+    fn type_char(
+        view: &mut TerminalView,
+        ch: &str,
+        window: &mut Window,
+        cx: &mut Context<TerminalView>,
+    ) {
+        if cfg!(target_os = "macos") {
+            let _ = window;
+            view.commit_text(ch, cx);
+        } else {
+            let ev = KeyDownEvent {
+                keystroke: gpui::Keystroke {
+                    modifiers: gpui::Modifiers::default(),
+                    key: ch.to_string(),
+                    key_char: Some(ch.to_string()),
+                },
+                is_held: false,
+                prefer_character_input: false,
+            };
+            view.on_key_down(&ev, window, cx);
+        }
+    }
+
     fn next_input_until_timeout(daemon: &mut UnixStream) -> Option<Vec<u8>> {
         use std::io::ErrorKind;
 
@@ -6131,16 +6171,7 @@ mod gpui_tests {
                     !view.input_active(),
                     "shell vi-mode lets the shell line editor own prompt input"
                 );
-                let a = KeyDownEvent {
-                    keystroke: gpui::Keystroke {
-                        modifiers: gpui::Modifiers::default(),
-                        key: "a".to_string(),
-                        key_char: Some("a".to_string()),
-                    },
-                    is_held: false,
-                    prefer_character_input: false,
-                };
-                view.on_key_down(&a, window, cx);
+                type_char(view, "a", window, cx);
                 assert_eq!(
                     view.cmd.text(),
                     "",
@@ -6206,16 +6237,7 @@ mod gpui_tests {
 
         window
             .update(cx, |view, window, cx| {
-                let i = KeyDownEvent {
-                    keystroke: gpui::Keystroke {
-                        modifiers: gpui::Modifiers::default(),
-                        key: "i".to_string(),
-                        key_char: Some("i".to_string()),
-                    },
-                    is_held: false,
-                    prefer_character_input: false,
-                };
-                view.on_key_down(&i, window, cx);
+                type_char(view, "i", window, cx);
             })
             .unwrap();
         assert_eq!(
