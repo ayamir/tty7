@@ -8,8 +8,9 @@
 .brooks-lint-history.json
 openwiki/.last-update.json
 
-# dev-build throwaway config dir (cargo dev)
-.tty7-dev/
+# dev-build throwaway config dirs (`cargo dev`, plus per-branch ones passed as
+# --config-dir so a test run can't disturb a real profile)
+.tty7-dev*/
 
 # Claude Code agent worktrees (transient)
 .claude/worktrees/
