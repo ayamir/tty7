@@ -897,9 +897,13 @@ impl Tty7App {
             .pl_0()
             .pr_2()
             // On Windows/Linux the window controls (─ ▢ ✕) sit on the right, right
-            // where the "⋯" lands; give it extra right breathing room there so it
-            // reads as a menu affordance, not a fourth window control.
-            .when(!cfg!(target_os = "macos"), |this| this.pr_3())
+            // where the "⋯" lands, so its inset has to match *their* rhythm: the
+            // 34px tiles put consecutive glyph centres 34px apart, and the "⋯"
+            // centre sits `15 + pr + 17` from the minimise glyph. `pr_1` (4px)
+            // lands at 36px — reading as part of the same row, with just enough
+            // slack to not be mistaken for a fourth window control. The old
+            // `pr_3` (12px) made it 44px, visibly adrift from the group.
+            .when(!cfg!(target_os = "macos"), |this| this.pr_1())
             .min_w_0()
             .child(chips)
             // In sidebar mode the rail owns "New Tab" (a "+" in its own top bar),
