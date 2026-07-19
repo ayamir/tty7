@@ -18,6 +18,7 @@
 - **Repo-grouped sidebar** — the left tab sidebar groups rows under a header per git repository, non-repo tabs in a trailing *Scratch* section; branch switches and in-repo `cd`s never move a row (`sidebar_grouping` in `config.json`: `repo` default, `none` for a flat list)
 - **Command palette** <kbd>⌘ P</kbd> · scrollback search <kbd>⌘ F</kbd>
 - **⌘-click links** · desktop notifications · copy on select (opt-in, Settings → Terminal → Clipboard)
+- **Smart double-click selection** — double-click grabs the whole URL, file path, bracket/quote pair, or dictionary-segmented CJK word under the cursor; Shift-click extends a selection (toggle in Settings → Terminal → Mouse; word separators via `word_separators` in `config.json`)
 - **Eight themes, plus your own** — YAML seed themes with solid, gradient, or image backgrounds; iTerm2 `.itermcolors` import; in-app color editor with a background-image picker
 - **Sync with system** — Settings → Appearance; pick separate light and dark themes and tty7 follows the OS appearance live (`theme_follow_system`, `theme_preset_light` / `theme_preset_dark` in `config.json`)
 - **Window opacity & blur** — Settings → Appearance → Window; applies to every theme, *Follow theme* returns to the theme's own `opacity` / `blur`

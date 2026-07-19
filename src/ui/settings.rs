@@ -179,6 +179,11 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: Terminal,
+            title: "Smart selection",
+            keywords: "double click word url path select semantic",
+        },
+        SearchEntry {
+            section: Terminal,
             title: "Copy on select",
             keywords: "clipboard selection yank",
         },
@@ -2763,6 +2768,7 @@ impl Tty7App {
         let clip_trim = cfg.clipboard_trim_trailing_spaces;
         let copy_on_select = cfg.copy_on_select;
         let mouse_reporting = cfg.mouse_reporting;
+        let smart_select = cfg.smart_select;
         let bell = cfg.bell;
         // Map the persisted threshold onto its preset radio index (nearest slot
         // for any off-preset value a hand-edit might leave).
@@ -2847,6 +2853,10 @@ impl Tty7App {
         let mouse_report_switch = Switch::new("term-mouse-report")
             .checked(mouse_reporting)
             .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_mouse_reporting(*on, cx)))
+            .into_any_element();
+        let smart_select_switch = Switch::new("term-smart-select")
+            .checked(smart_select)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_smart_select(*on, cx)))
             .into_any_element();
         let bell_idx = match bell {
             BellMode::None => 0,
@@ -2946,6 +2956,12 @@ impl Tty7App {
                 "Report mouse to apps",
                 "Let full-screen apps (vim, tmux) handle clicks and scrolling; hold Shift to keep a gesture local.",
                 mouse_report_switch,
+                cx,
+            ))
+            .child(self.settings_row(
+                "Smart selection",
+                "Double-click selects the whole URL, file path, email, or bracket pair under the cursor.",
+                smart_select_switch,
                 cx,
             ))
             .when_some(option_alt_row, |v, row| {

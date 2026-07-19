@@ -2849,7 +2849,9 @@ impl TerminalView {
                 self.editor_drag_word = None;
             }
             2 => {
-                self.cmd.select_word_at(idx);
+                let cfg = cx.global::<Config>();
+                let (seps, smart) = (cfg.word_separators.clone(), cfg.smart_select);
+                self.cmd.select_word_at(idx, &seps, smart);
                 // Drag now grows the selection by whole words around this one.
                 self.editor_selecting = true;
                 self.editor_drag_word = self.cmd.selection();
@@ -2880,7 +2882,9 @@ impl TerminalView {
         };
         // A drag begun on a double-click extends by whole words; otherwise by char.
         if let Some((s, e)) = self.editor_drag_word {
-            self.cmd.extend_word_to(s, e, idx);
+            let cfg = cx.global::<Config>();
+            let (seps, smart) = (cfg.word_separators.clone(), cfg.smart_select);
+            self.cmd.extend_word_to(s, e, idx, &seps, smart);
         } else {
             self.cmd.extend_to(idx);
         }
@@ -3637,18 +3641,51 @@ impl TerminalView {
         row: usize,
         left: bool,
         clicks: usize,
+        shift: bool,
         cx: &mut Context<Self>,
     ) {
+        let smart = cx.global::<Config>().smart_select;
         let mut term = self.terminal.term.lock();
         let display_offset = term.grid().display_offset() as i32;
         let point = Point::new(Line(row as i32 - display_offset), Column(col));
         let side = if left { Side::Left } else { Side::Right };
+        // Shift+click extends the existing selection to the click instead of
+        // starting over (à la iTerm2). A plain click always leaves a
+        // collapsed Simple selection behind, so the anchor is wherever the
+        // last gesture ended.
+        if shift && clicks == 1 && term.selection.is_some() {
+            if let Some(sel) = term.selection.as_mut() {
+                sel.update(point, side);
+            }
+            drop(term);
+            self.selecting = true;
+            cx.notify();
+            return;
+        }
         let ty = match clicks {
             2 => SelectionType::Semantic, // word
             n if n >= 3 => SelectionType::Lines,
             _ => SelectionType::Simple,
         };
-        term.selection = Some(Selection::new(ty, point, side));
+        let mut selection = Selection::new(ty, point, side);
+        // Double-click smart selection: a URL / path / email / bracket pair /
+        // CJK word containing the clicked word replaces the plain word span.
+        // Boundary-flanked candidates anchor a Semantic selection (keeping
+        // the drag gesture word-wise); exact ones use Simple so alacritty
+        // can't re-expand the endpoints past the smart boundary.
+        if clicks == 2
+            && smart
+            && let Some(r) = super::smart_select::grid_smart_range(&term, point)
+        {
+            let ty = if r.exact {
+                SelectionType::Simple
+            } else {
+                SelectionType::Semantic
+            };
+            selection = Selection::new(ty, r.start, Side::Left);
+            selection.update(r.end, Side::Right);
+        }
+        term.selection = Some(selection);
         drop(term);
         self.selecting = true;
         cx.notify();
@@ -6908,7 +6945,7 @@ mod gpui_tests {
         let drag_hello = |cx: &mut TestAppContext| {
             window
                 .update(cx, |view, _, cx| {
-                    view.on_select_start(0, 0, true, 1, cx);
+                    view.on_select_start(0, 0, true, 1, false, cx);
                     view.on_select_update(4, 0, false, cx);
                     view.on_select_end(cx);
                 })
@@ -6973,7 +7010,7 @@ mod gpui_tests {
             .update(cx, |view, window, cx| {
                 // Mouse-select "hello" (copy-on-select is off by default, so
                 // the selection survives mouse-up).
-                view.on_select_start(0, 0, true, 1, cx);
+                view.on_select_start(0, 0, true, 1, false, cx);
                 view.on_select_update(4, 0, false, cx);
                 view.on_select_end(cx);
                 assert!(view.has_selection(), "the drag must leave a selection");
