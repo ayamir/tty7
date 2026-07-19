@@ -810,20 +810,6 @@ fn shell_kind(program: Option<&str>) -> Option<ShellKind> {
     }
 }
 
-/// The shell kind named by a path *inside a distro*, where the Windows-specific
-/// disambiguation in [`shell_kind`] must not apply: `/bin/bash` there is
-/// genuinely bash, not the WSL launcher, even though the daemon asking the
-/// question is a Windows process.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn inner_shell_kind(path: &str) -> Option<ShellKind> {
-    match Path::new(path).file_name()?.to_str()? {
-        "zsh" => Some(ShellKind::Zsh),
-        "bash" => Some(ShellKind::Bash),
-        "fish" => Some(ShellKind::Fish),
-        _ => None,
-    }
-}
-
 /// The distro named by a `wsl.exe` argv, if any. tty7's own launch args spell it
 /// `--distribution <name>` (`core::shells::detect_shells`); `-d` is the short
 /// form a user-configured shell may use. Absent means "the default distro",
@@ -1075,75 +1061,59 @@ fn setup_bash() -> Option<Injection> {
     })
 }
 
-/// The login shell of record inside `distro`, probed once and cached — the
-/// daemon would otherwise pay a `wsl.exe` startup on every WSL pane spawn.
-///
-/// `getent passwd` rather than `$SHELL`: the latter is whatever the launching
-/// environment exported, which for a shell `wsl.exe` starts for a probe is not
-/// necessarily the user's configured login shell. `$(id -u)` rather than
-/// `$(id -un)` keeps the command free of nested quotes.
-#[cfg(windows)]
-fn wsl_login_shell(distro: Option<&str>) -> Option<String> {
-    use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
-
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = distro.unwrap_or_default().to_string();
-    if let Some(hit) = cache.lock().ok()?.get(&key) {
-        return hit.clone();
-    }
-
-    let mut cmd = std::process::Command::new("wsl.exe");
-    if let Some(d) = distro {
-        cmd.args(["--distribution", d]);
-    }
-    cmd.args(["-e", "sh", "-c", "getent passwd $(id -u) | cut -d: -f7"]);
-    // `hide_console` keeps the probe from flashing a console window — tty7 is a
-    // GUI process (see `core::proc`).
-    let probed = crate::core::proc::hide_console(&mut cmd)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            (!s.is_empty()).then_some(s)
-        });
-    cache.lock().ok()?.insert(key, probed.clone());
-    probed
-}
-
 /// Env var carrying the rcfile path across the Windows/WSL boundary. Listed in
 /// `WSLENV` with the `/p` flag so WSL rewrites it to the distro's view of the
 /// path (`C:\Users\…` -> `/mnt/c/Users/…`), which is why we don't hardcode the
 /// `/mnt` automount root ourselves — it is configurable in `/etc/wsl.conf`.
 const WSL_RCFILE_ENV: &str = "TTY7_RC";
 
+/// Pick the distro's shell and exec it, *inside the distro*.
+///
+/// Deliberately not a Windows-side probe. Spawning `wsl.exe` to ask which shell
+/// a distro uses blocks the whole spawn path: the client waits synchronously for
+/// the daemon's `Spawn` reply (see `terminal::remote::spawn`), so on a cold WSL
+/// start — seconds, while the distro boots — the entire window freezes. Folding
+/// the decision into the one `wsl.exe` invocation we were always going to make
+/// costs nothing and cannot block, because there is no second invocation.
+///
+/// `$SHELL` rather than `getent passwd`: WSL populates it from the user's passwd
+/// entry, so inside the distro it already *is* the login shell of record — the
+/// same source `shell_kind` trusts on Unix. Written without a variable
+/// assignment so the whole thing stays one `case`, which keeps it robust to the
+/// layers of quoting between here and `sh`.
+const WSL_EXEC_SCRIPT: &str = concat!(
+    r#"case "${SHELL:-}" in "#,
+    r#"*/bash) exec "$SHELL" --rcfile "$TTY7_RC" -i ;; "#,
+    r#"*) exec "${SHELL:-/bin/sh}" -l ;; "#,
+    "esac"
+);
+
 /// Reach through `wsl.exe` to the distro's own shell.
 ///
 /// `wsl.exe` is a launcher, not a shell: injecting into it directly would never
-/// reach the thing that draws the prompt. So we probe the distro's login shell,
-/// write the matching integration rcfile on the Windows side, and hand `wsl.exe`
-/// an explicit command that starts that shell with our rcfile — the distro's
-/// own startup chain replayed inside it exactly as on any other bash.
+/// reach the thing that draws the prompt. So we write the integration rcfile on
+/// the Windows side and hand `wsl.exe` a command that starts the distro's shell
+/// with it — the distro's own startup chain replayed inside it exactly as on any
+/// other bash.
 ///
-/// The argv shape is `[<launch flags>] -- sh -c 'exec <shell> --rcfile "$RC" -i'`
-/// rather than `-- <shell> --rcfile <path>` because the path only exists as an
-/// env var *inside* the distro after `WSLENV` translation, and `wsl.exe` execs
-/// its command directly without a shell to expand it. The one-shot `sh` costs a
+/// The argv shape is `[<launch flags>] -- sh -c <script>` rather than
+/// `-- <shell> --rcfile <path>` because the path only exists as an env var
+/// *inside* the distro after `WSLENV` translation, and `wsl.exe` execs its
+/// command directly without a shell to expand it. The one-shot `sh` costs a
 /// process and `exec`s away immediately.
 ///
-/// Only bash is wired up. zsh and fish inside a distro are reachable the same
-/// way (`ZDOTDIR` would need translating too; fish's `-C` needs no file at all),
-/// but each needs its own verification pass, and declining simply leaves those
-/// panes launching bare — the behavior every WSL pane had before this.
+/// Only bash is wired up. A distro on zsh or fish falls through to
+/// [`WSL_EXEC_SCRIPT`]'s second arm and launches as a plain login shell — the
+/// behavior every WSL pane had before this, just reached one `exec` later. They
+/// are integrable the same way (`ZDOTDIR` would need translating too; fish's
+/// `-C` needs no file at all), but each needs its own verification pass.
+///
+/// The rcfile is written unconditionally, before we know the shell — it is a
+/// local write into a throwaway dir the terminal already cleans up on drop, and
+/// paying it always is what buys the decision being free.
 #[cfg(windows)]
 fn setup_wsl(args: &[String]) -> Option<Injection> {
     let distro = wsl_distro(args);
-    let login_shell = wsl_login_shell(distro.as_deref())?;
-    if !matches!(inner_shell_kind(&login_shell), Some(ShellKind::Bash)) {
-        return None;
-    }
-
     let dir = throwaway_dir("tty7-wslrc-")?;
     let rcfile = dir.join("bashrc");
     std::fs::write(&rcfile, bash_rcfile()).ok()?;
@@ -1163,11 +1133,7 @@ fn setup_wsl(args: &[String]) -> Option<Injection> {
     argv.push("--".to_string());
     argv.push("sh".to_string());
     argv.push("-c".to_string());
-    // `$RC` is quoted: the rcfile sits under the Windows temp dir, whose path
-    // contains the account name and so may contain spaces.
-    argv.push(format!(
-        "exec {login_shell} --rcfile \"${WSL_RCFILE_ENV}\" -i"
-    ));
+    argv.push(WSL_EXEC_SCRIPT.to_string());
 
     let mut env = HashMap::new();
     env.insert(
@@ -1422,8 +1388,11 @@ mod tests {
     /// mangle its quoting, and the distro's own `/etc/profile` + `~/.bashrc`
     /// running before our hooks layer on top.
     ///
-    /// Skips when WSL isn't installed or the distro's login shell isn't one we
-    /// wire up, so it's a no-op on a machine without them.
+    /// Also covers the in-distro shell pick: this machine's distro runs bash, so
+    /// reaching the marks at all means [`WSL_EXEC_SCRIPT`]'s `case` took its
+    /// bash arm after surviving Windows argv quoting.
+    ///
+    /// Skips when WSL isn't installed, so it's a no-op on a machine without it.
     #[cfg(windows)]
     #[test]
     fn wsl_reports_the_full_prompt_cycle_over_a_real_pty() {
@@ -1438,10 +1407,7 @@ mod tests {
             "--cd".into(),
             "~".into(),
         ];
-        let Some(injection) = setup(Some("wsl.exe"), &args, false) else {
-            eprintln!("skipping: {distro}'s login shell has no integration");
-            return;
-        };
+        let injection = setup(Some("wsl.exe"), &args, false).expect("wsl integration");
         let text = prompt_cycle_over_pty("wsl.exe", &injection);
 
         for mark in ["133;A", "133;B", "133;C", "133;D;1"] {
@@ -1504,28 +1470,44 @@ mod tests {
         assert!(matches!(shell_kind(Some("wsl")), Some(ShellKind::Wsl)));
     }
 
+    /// Regression: `setup_wsl` used to probe the distro's login shell with a
+    /// synchronous `wsl.exe` call. The client waits for the daemon's `Spawn`
+    /// reply (`terminal::remote::spawn`), so on a cold WSL start — seconds,
+    /// while the distro boots — that froze the entire window.
+    ///
+    /// Naming a distro that cannot exist is the deterministic form of the
+    /// check: if anything asked the distro a question, this could not succeed.
+    /// A timing bound would only catch it on a cold machine.
+    #[cfg(windows)]
     #[test]
-    fn inner_shell_kind_reads_distro_paths_without_the_windows_bash_guard() {
-        // `shell_kind` declines a Windows `bash` it can't prove is msys, since
-        // `C:\Windows\System32\bash.exe` is the WSL launcher. That guard must
-        // not apply to a path reported from *inside* a distro, where
-        // `/bin/bash` is unambiguously bash.
-        assert!(matches!(
-            inner_shell_kind("/bin/bash"),
-            Some(ShellKind::Bash)
-        ));
-        assert!(matches!(
-            inner_shell_kind("/usr/bin/zsh"),
-            Some(ShellKind::Zsh)
-        ));
-        assert!(matches!(
-            inner_shell_kind("/usr/bin/fish"),
-            Some(ShellKind::Fish)
-        ));
-        // A login shell we have no integration for declines rather than
-        // guessing; the pane then launches bare.
-        assert!(inner_shell_kind("/usr/sbin/nologin").is_none());
-        assert!(inner_shell_kind("/bin/sh").is_none());
+    fn wsl_setup_never_contacts_the_distro() {
+        let args: Vec<String> = vec![
+            "--distribution".into(),
+            "tty7-no-such-distro-exists".into(),
+            "--cd".into(),
+            "~".into(),
+        ];
+        let inj = setup(Some("wsl.exe"), &args, false)
+            .expect("setup must not depend on reaching the distro");
+
+        // The launch flags are rebuilt, not appended to, and the command sits
+        // after `--`.
+        let sep = inj.args.iter().position(|a| a == "--").expect("`--`");
+        assert_eq!(
+            &inj.args[..sep],
+            &[
+                "--distribution".to_string(),
+                "tty7-no-such-distro-exists".to_string(),
+                "--cd".to_string(),
+                "~".to_string()
+            ]
+        );
+        assert_eq!(inj.args[sep + 1], "sh");
+        assert_eq!(inj.args[sep + 2], "-c");
+        // The shell decision is inside the script, not resolved out here.
+        assert!(inj.args[sep + 3].contains("$SHELL"));
+        assert!(inj.args[sep + 3].contains("--rcfile"));
+        assert!(inj.replaces_argv);
     }
 
     #[test]
