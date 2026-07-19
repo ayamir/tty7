@@ -3733,8 +3733,14 @@ impl Tty7App {
                 }
             };
             Some(rgb)
-        } else if v.remote_context().is_some() {
-            // A foreground `ssh` typed into a shell: a plain neutral dot.
+        } else if v
+            .remote_context()
+            .is_some_and(|r| r.kind != crate::daemon::protocol::RemoteKind::Wsl)
+        {
+            // A foreground `ssh` typed into a shell: a plain neutral dot. The
+            // kind check matters: a WSL pane also carries a `RemoteContext` (so
+            // its cwd is treated as foreign — see `local_cwd`), but it is not an
+            // SSH session and this dot means "SSH".
             Some(0x9CA3AF)
         } else {
             None
@@ -3792,6 +3798,11 @@ impl Tty7App {
         cx.notify();
     }
 
+    /// The focused pane when it is an SSH session of either kind.
+    ///
+    /// Not every pane carrying a `RemoteContext` is one: a WSL pane has one too,
+    /// so that its cwd is treated as foreign (see `TerminalView::local_cwd`),
+    /// and it must not reach anything SSH-shaped from here.
     pub(crate) fn active_ssh_pane(
         &self,
         window: &Window,
@@ -3803,7 +3814,9 @@ impl Tty7App {
             .pane
             .focused_or_first(window, cx)?;
         let pane = pane.read(cx);
-        Some((pane.pane_id, pane.remote_context()?))
+        let remote = pane.remote_context()?;
+        (remote.kind != crate::daemon::protocol::RemoteKind::Wsl)
+            .then_some((pane.pane_id, remote))
     }
 
     /// The focused pane when it is a *connected native* SSH session — the gate for

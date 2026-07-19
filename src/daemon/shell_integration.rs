@@ -30,13 +30,18 @@
 //!     plain non-login shell instead and have our rcfile manually replay the
 //!     login-shell startup-file chain (`/etc/profile`, `~/.bash_profile` &
 //!     co.) before layering hooks on top — see [`setup_bash`] and
-//!     [`Injection::force_non_login`]. Bash also has no native precmd/preexec,
+//!     [`Injection::replaces_argv`]. Bash also has no native precmd/preexec,
 //!     so the hook body vendors the relevant parts of
 //!     [bash-preexec](https://github.com/rcaloras/bash-preexec) (MIT), the
 //!     same shim VS Code relies on for this. This path covers Git Bash too —
 //!     the msys2 bash Git for Windows ships is spawned as `bash.exe` by
 //!     absolute path, and needs only its rcfile path spelled with forward
 //!     slashes (see [`bash_path`]).
+//!   - **WSL** is not a shell but a launcher: `wsl.exe` starts a shell *inside*
+//!     a distro, so the integration has to reach through it. We probe the
+//!     distro's login shell, write the matching rcfile on the Windows side, and
+//!     pass its path in via `WSLENV`, which translates it to the distro's view
+//!     of the filesystem. See [`setup_wsl`]. Only bash is wired up so far.
 //!   - **PowerShell** (the Windows default, and any `pwsh`) has no dotfile
 //!     redirect either, but `-EncodedCommand` runs a script *after* its own
 //!     profiles load — like fish's `-C`, no file on disk. It has no
@@ -45,19 +50,22 @@
 //!     `PSConsoleHostReadLine`, PSReadLine's line reader (the closest thing to
 //!     a preexec, for the C mark). See [`setup_powershell`].
 //!
-//! Across all four: **the user's own dotfiles are never modified** — the
+//! Across all of them: **the user's own dotfiles are never modified** — the
 //! mechanisms above only affect shells tty7 itself launches.
 //!
-//! The two remaining Windows dropdown entries stay unintegrated by design, not
-//! omission. **cmd** exposes exactly one hook, the `PROMPT` env var, which can
-//! emit the `A`/`B` marks but not `C` or `D`: it has no preexec/postexec, and
-//! `PROMPT` is expanded when it is *set*, so even `%ERRORLEVEL%` is out of
-//! reach. Since only `C` clears `at_prompt` (see `pane::handle_osc133`), an
-//! A/B-only shell would leave the line editor owning the keyboard for the
-//! whole of every command — worse than no integration. **WSL** is spawned as
-//! `wsl.exe`, the Windows-side launcher; reaching the distro's own shell would
-//! mean detecting which shell that is per distro and routing the injection
-//! through `WSLENV` path translation, which is its own piece of work.
+//! **cmd** stays unintegrated by design, not omission. It exposes exactly one
+//! hook, the `PROMPT` env var, which can emit the `A`/`B` marks but not `C` or
+//! `D`: it has no preexec/postexec, and `PROMPT` is expanded when it is *set*,
+//! so even `%ERRORLEVEL%` is out of reach. Since only `C` clears `at_prompt`
+//! (see `pane::handle_osc133`), an A/B-only shell would leave the line editor
+//! owning the keyboard for the whole of every command — worse than no
+//! integration at all.
+//!
+//! The install-guard sentinel (`TTY7_SHELL_INTEGRATION`, see [`setup`]) does
+//! not cross into WSL, and deliberately isn't listed in `WSLENV`: only vars
+//! named there cross, so a distro shell always starts with it unset — which is
+//! correct, since it *is* a fresh top-level interactive shell. Its own
+//! descendants inside the distro then see the `1` it exports, as on any Linux.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -709,13 +717,20 @@ pub struct Injection {
     pub env: HashMap<String, String>,
     /// Extra argv entries to append after the program (e.g. bash's
     /// `--rcfile <path>`, fish's `-C <script>`). Empty for zsh, which needs no
-    /// spawn-time changes at all.
+    /// spawn-time changes at all. When [`replaces_argv`](Self::replaces_argv)
+    /// is set these are the *whole* argv, not an addition to it.
     pub args: Vec<String>,
-    /// If set, the caller must spawn the shell as a plain (non-login) process
-    /// rather than however it normally would — only bash needs this (see the
-    /// module docs), and only when the caller can freely choose the spawn
-    /// invocation (i.e. no user-configured custom shell args to preserve).
-    pub force_non_login: bool,
+    /// If set, [`args`](Self::args) replace the argv the caller would otherwise
+    /// have used, rather than extending it. Only offered when the caller can
+    /// freely choose the spawn invocation (i.e. no user-configured custom shell
+    /// args to preserve). Two integrations need it, for different reasons:
+    ///
+    ///   - **bash**, because `--rcfile` is ignored for a *login* shell, so the
+    ///     caller's login invocation has to become a plain one (the rcfile
+    ///     replays the login chain itself — see the module docs).
+    ///   - **WSL**, because the launch flags and the command must be reordered
+    ///     around a `--` separator, which appending cannot express.
+    pub replaces_argv: bool,
     /// The throwaway dir we created, if any; the terminal owns it and removes
     /// it on drop so it doesn't accumulate across sessions. `None` for fish,
     /// which needs no files on disk at all.
@@ -763,6 +778,10 @@ enum ShellKind {
     Bash,
     Fish,
     PowerShell,
+    /// `wsl.exe`, the Windows-side launcher. Not a shell itself — the
+    /// integration has to reach *through* it to the distro's own shell. See
+    /// [`setup_wsl`].
+    Wsl,
 }
 
 fn shell_kind(program: Option<&str>) -> Option<ShellKind> {
@@ -786,8 +805,71 @@ fn shell_kind(program: Option<&str>) -> Option<ShellKind> {
         "bash" => Some(ShellKind::Bash),
         "fish" => Some(ShellKind::Fish),
         "powershell" | "pwsh" => Some(ShellKind::PowerShell),
+        "wsl" => Some(ShellKind::Wsl),
         _ => None,
     }
+}
+
+/// The shell kind named by a path *inside a distro*, where the Windows-specific
+/// disambiguation in [`shell_kind`] must not apply: `/bin/bash` there is
+/// genuinely bash, not the WSL launcher, even though the daemon asking the
+/// question is a Windows process.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn inner_shell_kind(path: &str) -> Option<ShellKind> {
+    match Path::new(path).file_name()?.to_str()? {
+        "zsh" => Some(ShellKind::Zsh),
+        "bash" => Some(ShellKind::Bash),
+        "fish" => Some(ShellKind::Fish),
+        _ => None,
+    }
+}
+
+/// The distro named by a `wsl.exe` argv, if any. tty7's own launch args spell it
+/// `--distribution <name>` (`core::shells::detect_shells`); `-d` is the short
+/// form a user-configured shell may use. Absent means "the default distro",
+/// which is also what `wsl.exe` does with no flag — so `None` is a valid answer,
+/// not a failure.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wsl_distro(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--distribution" || a == "-d" {
+            return it.next().cloned();
+        }
+        if let Some(v) = a.strip_prefix("--distribution=") {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Add our entries to a `WSLENV` value, preserving whatever was already there.
+///
+/// `WSLENV` is a colon-separated list of variable names, each optionally
+/// suffixed with flags — `/p` meaning "translate this value as a path when it
+/// crosses the boundary", which is how the rcfile's Windows path becomes a
+/// `/mnt/c/...` one the distro can read. Overwriting it wholesale would silently
+/// drop the user's own entries, so append and de-duplicate by name.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wslenv_with(existing: Option<&str>, additions: &[&str]) -> String {
+    let mut out: Vec<String> = existing
+        .unwrap_or("")
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    for add in additions {
+        let name = add.split('/').next().unwrap_or(add);
+        // A name already present wins whatever flags the user gave it; ours is
+        // additive, not a correction of their configuration.
+        if !out
+            .iter()
+            .any(|e| e.split('/').next().unwrap_or(e) == name)
+        {
+            out.push((*add).to_string());
+        }
+    }
+    out.join(":")
 }
 
 /// Whether a Windows `bash` program path is the msys bash that Git for Windows
@@ -860,7 +942,7 @@ fn setup_zsh() -> Option<Injection> {
     Some(Injection {
         env,
         args: Vec::new(),
-        force_non_login: false,
+        replaces_argv: false,
         dir: Some(dir),
     })
 }
@@ -872,7 +954,7 @@ fn setup_fish() -> Option<Injection> {
     Some(Injection {
         env: HashMap::new(),
         args: vec!["-C".to_string(), FISH_INTEGRATION.to_string()],
-        force_non_login: false,
+        replaces_argv: false,
         dir: None,
     })
 }
@@ -894,7 +976,7 @@ fn setup_powershell() -> Option<Injection> {
             "-EncodedCommand".to_string(),
             powershell_encoded_command(POWERSHELL_INTEGRATION),
         ],
-        force_non_login: false,
+        replaces_argv: false,
         dir: None,
     })
 }
@@ -988,9 +1070,141 @@ fn setup_bash() -> Option<Injection> {
         // macOS's shipped `/bin/bash` — refuses to parse a long option once a
         // short one has been seen.
         args: vec!["--rcfile".to_string(), bash_path(&rcfile), "-i".to_string()],
-        force_non_login: true,
+        replaces_argv: true,
         dir: Some(dir),
     })
+}
+
+/// The login shell of record inside `distro`, probed once and cached — the
+/// daemon would otherwise pay a `wsl.exe` startup on every WSL pane spawn.
+///
+/// `getent passwd` rather than `$SHELL`: the latter is whatever the launching
+/// environment exported, which for a shell `wsl.exe` starts for a probe is not
+/// necessarily the user's configured login shell. `$(id -u)` rather than
+/// `$(id -un)` keeps the command free of nested quotes.
+#[cfg(windows)]
+fn wsl_login_shell(distro: Option<&str>) -> Option<String> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = distro.unwrap_or_default().to_string();
+    if let Some(hit) = cache.lock().ok()?.get(&key) {
+        return hit.clone();
+    }
+
+    let mut cmd = std::process::Command::new("wsl.exe");
+    if let Some(d) = distro {
+        cmd.args(["--distribution", d]);
+    }
+    cmd.args(["-e", "sh", "-c", "getent passwd $(id -u) | cut -d: -f7"]);
+    // `hide_console` keeps the probe from flashing a console window — tty7 is a
+    // GUI process (see `core::proc`).
+    let probed = crate::core::proc::hide_console(&mut cmd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            (!s.is_empty()).then_some(s)
+        });
+    cache.lock().ok()?.insert(key, probed.clone());
+    probed
+}
+
+/// Env var carrying the rcfile path across the Windows/WSL boundary. Listed in
+/// `WSLENV` with the `/p` flag so WSL rewrites it to the distro's view of the
+/// path (`C:\Users\…` -> `/mnt/c/Users/…`), which is why we don't hardcode the
+/// `/mnt` automount root ourselves — it is configurable in `/etc/wsl.conf`.
+const WSL_RCFILE_ENV: &str = "TTY7_RC";
+
+/// Reach through `wsl.exe` to the distro's own shell.
+///
+/// `wsl.exe` is a launcher, not a shell: injecting into it directly would never
+/// reach the thing that draws the prompt. So we probe the distro's login shell,
+/// write the matching integration rcfile on the Windows side, and hand `wsl.exe`
+/// an explicit command that starts that shell with our rcfile — the distro's
+/// own startup chain replayed inside it exactly as on any other bash.
+///
+/// The argv shape is `[<launch flags>] -- sh -c 'exec <shell> --rcfile "$RC" -i'`
+/// rather than `-- <shell> --rcfile <path>` because the path only exists as an
+/// env var *inside* the distro after `WSLENV` translation, and `wsl.exe` execs
+/// its command directly without a shell to expand it. The one-shot `sh` costs a
+/// process and `exec`s away immediately.
+///
+/// Only bash is wired up. zsh and fish inside a distro are reachable the same
+/// way (`ZDOTDIR` would need translating too; fish's `-C` needs no file at all),
+/// but each needs its own verification pass, and declining simply leaves those
+/// panes launching bare — the behavior every WSL pane had before this.
+#[cfg(windows)]
+fn setup_wsl(args: &[String]) -> Option<Injection> {
+    let distro = wsl_distro(args);
+    let login_shell = wsl_login_shell(distro.as_deref())?;
+    if !matches!(inner_shell_kind(&login_shell), Some(ShellKind::Bash)) {
+        return None;
+    }
+
+    let dir = throwaway_dir("tty7-wslrc-")?;
+    let rcfile = dir.join("bashrc");
+    std::fs::write(&rcfile, bash_rcfile()).ok()?;
+
+    // Rebuild the launch flags rather than appending to them: `--` must come
+    // last, and everything after it is the command. Preserve the distro and
+    // `--cd` the caller asked for.
+    let mut argv: Vec<String> = Vec::new();
+    if let Some(d) = &distro {
+        argv.push("--distribution".to_string());
+        argv.push(d.clone());
+    }
+    if let Some(cd) = wsl_cd(args) {
+        argv.push("--cd".to_string());
+        argv.push(cd);
+    }
+    argv.push("--".to_string());
+    argv.push("sh".to_string());
+    argv.push("-c".to_string());
+    // `$RC` is quoted: the rcfile sits under the Windows temp dir, whose path
+    // contains the account name and so may contain spaces.
+    argv.push(format!(
+        "exec {login_shell} --rcfile \"${WSL_RCFILE_ENV}\" -i"
+    ));
+
+    let mut env = HashMap::new();
+    env.insert(
+        WSL_RCFILE_ENV.to_string(),
+        rcfile.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "WSLENV".to_string(),
+        wslenv_with(
+            std::env::var("WSLENV").ok().as_deref(),
+            &[&format!("{WSL_RCFILE_ENV}/p")],
+        ),
+    );
+
+    Some(Injection {
+        env,
+        args: argv,
+        replaces_argv: true,
+        dir: Some(dir),
+    })
+}
+
+/// The `--cd` value from a `wsl.exe` argv. tty7's own launch args pass `--cd ~`
+/// so the shell lands in the distro's home rather than a translated Windows path
+/// (`core::shells::detect_shells`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wsl_cd(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--cd" {
+            return it.next().cloned();
+        }
+        if let Some(v) = a.strip_prefix("--cd=") {
+            return Some(v.to_string());
+        }
+    }
+    None
 }
 
 /// Set up shell integration for a shell tty7 is about to spawn. `program` is
@@ -1001,10 +1215,14 @@ fn setup_bash() -> Option<Injection> {
 /// `true` when the caller is about to pass user-configured shell args it can't
 /// safely override (only affects bash — see [`setup_bash`]).
 ///
+/// `args` are the launch args the caller would otherwise use; only the WSL path
+/// reads them (for the distro), and only on Windows.
+///
 /// Returns the env/arg overrides and the temp dir to clean up, or `None` when
 /// the shell isn't supported or anything goes wrong — in which case the
 /// terminal launches bare, exactly as before (integration is best-effort).
-pub fn setup(program: Option<&str>, has_custom_args: bool) -> Option<Injection> {
+#[cfg_attr(not(windows), allow(unused_variables))]
+pub fn setup(program: Option<&str>, args: &[String], has_custom_args: bool) -> Option<Injection> {
     let mut injection = match shell_kind(program)? {
         ShellKind::Zsh => setup_zsh(),
         ShellKind::Fish => setup_fish(),
@@ -1015,6 +1233,11 @@ pub fn setup(program: Option<&str>, has_custom_args: bool) -> Option<Injection> 
         // a custom-arg invocation; launch it bare.
         ShellKind::PowerShell if !has_custom_args => setup_powershell(),
         ShellKind::PowerShell => None,
+        // WSL rebuilds the argv around a `--` separator, so — like bash — it
+        // can't be reconciled with args the user wrote.
+        #[cfg(windows)]
+        ShellKind::Wsl if !has_custom_args => setup_wsl(args),
+        ShellKind::Wsl => None,
     }?;
 
     // Reset the install-guard sentinel for the shell we're about to spawn. Each
@@ -1073,27 +1296,22 @@ mod tests {
         assert!(!is_our_zdotdir("/tmp/not-tty7-zdotdir-1"));
     }
 
-    /// End-to-end on a real PTY: spawn the actual Git Bash through the actual
-    /// `setup` output and assert the full A/B/C/D cycle comes back. Guards the
-    /// parts no pure test can see — that msys2 bash accepts the rcfile path we
-    /// hand it, that our hooks survive Git Bash's own `/etc/profile` (which
-    /// installs a `PROMPT_COMMAND` of its own), and that bash-preexec's DEBUG
-    /// trap actually fires under a Windows pty. Skips when Git for Windows
-    /// isn't installed, so it's a no-op on a machine without it.
+    /// Drive a real shell over a real PTY through `injection`, submit one
+    /// failing command, and return everything it wrote up to the `D` mark.
+    ///
+    /// Shared by the Git Bash and WSL end-to-end tests. Two ConPTY behaviors
+    /// are baked in and must not be "simplified" away:
+    ///
+    ///   - the writer is held for the whole call, because closing a ConPTY's
+    ///     input side raises a console control event that kills the shell with
+    ///     `STATUS_CONTROL_C_EXIT` before it ever reaches a prompt; and
+    ///   - draining happens on a worker thread against a deadline, because a
+    ///     ConPTY master does not reliably EOF when its child exits, so an
+    ///     inline read would block forever rather than fail.
     #[cfg(windows)]
-    #[test]
-    fn git_bash_reports_the_full_prompt_cycle_over_a_real_pty() {
+    fn prompt_cycle_over_pty(program: &str, injection: &Injection) -> String {
         use portable_pty::{CommandBuilder, PtySize, native_pty_system};
         use std::io::{Read, Write};
-
-        let Some(bash) = crate::core::shells::git_bash_path() else {
-            eprintln!("skipping: Git for Windows not installed");
-            return;
-        };
-        let bash = bash.to_string_lossy().into_owned();
-        // `has_custom_args: false` — the dropdown's `-i -l` are tty7's own, so
-        // the real spawn path reaches setup_bash with them overridable.
-        let injection = setup(Some(&bash), false).expect("bash integration");
 
         let pty = native_pty_system()
             .openpty(PtySize {
@@ -1103,28 +1321,20 @@ mod tests {
                 pixel_height: 0,
             })
             .expect("openpty");
-        let mut cmd = CommandBuilder::new(&bash);
+        let mut cmd = CommandBuilder::new(program);
         cmd.args(&injection.args);
         for (k, v) in &injection.env {
             cmd.env(k, v);
         }
-        let mut child = pty.slave.spawn_command(cmd).expect("spawn git bash");
+        let mut child = pty.slave.spawn_command(cmd).expect("spawn shell");
 
         let mut writer = pty.master.take_writer().expect("writer");
         let mut reader = pty.master.try_clone_reader().expect("reader");
         // `false` gives D a non-zero exit code to carry, so a hardcoded 0 in
-        // the report path can't pass this. `writer` is deliberately held for
-        // the rest of the test: closing a ConPTY's input side raises a console
-        // control event, which kills the shell with STATUS_CONTROL_C_EXIT
-        // before it ever reaches a prompt.
+        // the report path can't pass these tests.
         writer.write_all(b"false\n").expect("write");
         writer.flush().expect("flush");
 
-        // Drain on a worker: a Windows ConPTY master does not reliably EOF when
-        // its child exits, so reading inline would block past the shell's own
-        // exit. The worker feeds chunks over a channel and the test stops at the
-        // D mark that ends the cycle — or at a deadline, so a shell that never
-        // reports fails the assert instead of hanging.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -1150,7 +1360,41 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         drop(pty.master);
-        let text = String::from_utf8_lossy(&out);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// The OSC 7 cwd a captured PTY transcript reported, decoded by the
+    /// daemon's own parser so emitter and consumer are proven to agree.
+    #[cfg(windows)]
+    fn reported_cwd(text: &str) -> PathBuf {
+        let payload = text
+            .split("\u{1b}]")
+            .find(|s| s.starts_with("7;file://"))
+            .and_then(|s| s.split(['\u{7}', '\u{1b}']).next())
+            .unwrap_or_else(|| panic!("expected OSC 7; got:\n{text}"));
+        crate::daemon::pane::parse_osc7(payload.as_bytes())
+            .unwrap_or_else(|| panic!("daemon could not parse OSC 7 payload {payload:?}"))
+    }
+
+    /// End-to-end on a real PTY: spawn the actual Git Bash through the actual
+    /// `setup` output and assert the full A/B/C/D cycle comes back. Guards the
+    /// parts no pure test can see — that msys2 bash accepts the rcfile path we
+    /// hand it, that our hooks survive Git Bash's own `/etc/profile` (which
+    /// installs a `PROMPT_COMMAND` of its own), and that bash-preexec's DEBUG
+    /// trap actually fires under a Windows pty. Skips when Git for Windows
+    /// isn't installed, so it's a no-op on a machine without it.
+    #[cfg(windows)]
+    #[test]
+    fn git_bash_reports_the_full_prompt_cycle_over_a_real_pty() {
+        let Some(bash) = crate::core::shells::git_bash_path() else {
+            eprintln!("skipping: Git for Windows not installed");
+            return;
+        };
+        let bash = bash.to_string_lossy().into_owned();
+        // `has_custom_args: false` — the dropdown's `-i -l` are tty7's own, so
+        // the real spawn path reaches setup_bash with them overridable.
+        let injection = setup(Some(&bash), &[], false).expect("bash integration");
+        let text = prompt_cycle_over_pty(&bash, &injection);
 
         for mark in ["133;A", "133;B", "133;C", "133;D;1"] {
             assert!(
@@ -1162,20 +1406,58 @@ mod tests {
         // path, not just the marker's presence: Git Bash's `$PWD` is an msys
         // path (`/c/Users/x`) that Windows resolves drive-relative to a
         // non-existent `C:\c\Users\x`, which silently disables the git-status
-        // probe and breaks split/new-tab. Round-tripping through the daemon's
-        // own parser is what proves the two halves agree.
-        let payload = text
-            .split("\u{1b}]")
-            .find(|s| s.starts_with("7;file://"))
-            .and_then(|s| s.split(['\u{7}', '\u{1b}']).next())
-            .unwrap_or_else(|| panic!("expected OSC 7; got:\n{text}"));
-        let cwd = crate::daemon::pane::parse_osc7(payload.as_bytes())
-            .unwrap_or_else(|| panic!("daemon could not parse OSC 7 payload {payload:?}"));
+        // probe and breaks split/new-tab.
+        let cwd = reported_cwd(&text);
         assert!(
             cwd.exists(),
             "Git Bash reported a cwd the Windows side cannot resolve: {cwd:?} \
-             (from {payload:?}) — a drive-relative msys path, so `pwd -W` \
-             translation regressed"
+             — a drive-relative msys path, so `pwd -W` translation regressed"
+        );
+    }
+
+    /// End-to-end on a real PTY, through `wsl.exe` into an actual distro.
+    /// This is the only thing that can show the injection survives the whole
+    /// chain: `WSLENV` translating the rcfile path to the distro's view of the
+    /// filesystem, `wsl.exe` passing our `sh -c` through without a shell to
+    /// mangle its quoting, and the distro's own `/etc/profile` + `~/.bashrc`
+    /// running before our hooks layer on top.
+    ///
+    /// Skips when WSL isn't installed or the distro's login shell isn't one we
+    /// wire up, so it's a no-op on a machine without them.
+    #[cfg(windows)]
+    #[test]
+    fn wsl_reports_the_full_prompt_cycle_over_a_real_pty() {
+        let Some(distro) = crate::core::shells::wsl_distros().into_iter().next() else {
+            eprintln!("skipping: no WSL distributions installed");
+            return;
+        };
+        // Exactly the args the new-tab dropdown produces for this distro.
+        let args: Vec<String> = vec![
+            "--distribution".into(),
+            distro.clone(),
+            "--cd".into(),
+            "~".into(),
+        ];
+        let Some(injection) = setup(Some("wsl.exe"), &args, false) else {
+            eprintln!("skipping: {distro}'s login shell has no integration");
+            return;
+        };
+        let text = prompt_cycle_over_pty("wsl.exe", &injection);
+
+        for mark in ["133;A", "133;B", "133;C", "133;D;1"] {
+            assert!(
+                text.contains(mark),
+                "WSL ({distro}) must report {mark}; got:\n{text}"
+            );
+        }
+        // The distro's cwd is a *Linux* path, and must stay one — translating it
+        // to something Windows-resolvable would be wrong, not helpful. What
+        // matters is that the pane is tagged so nothing local consumes it; that
+        // tagging is asserted in `pane`'s `wsl_remote_context` tests.
+        let cwd = reported_cwd(&text);
+        assert!(
+            cwd.to_string_lossy().starts_with('/'),
+            "expected the distro's own absolute path, got {cwd:?}"
         );
     }
 
@@ -1210,11 +1492,83 @@ mod tests {
         }
         // Unknown shells (and absolute paths to them) resolve to None.
         assert!(shell_kind(Some("/bin/sh")).is_none());
+        // cmd has no preexec hook of any kind, so it stays unsupported on
+        // purpose (see the module docs).
         assert!(shell_kind(Some("cmd.exe")).is_none());
-        // cmd has no preexec hook of any kind, and `wsl.exe` is only the
-        // Windows-side launcher — injecting into it would never reach the
-        // distro's own shell. Both stay unsupported on purpose.
-        assert!(shell_kind(Some("wsl.exe")).is_none());
+        // `wsl.exe` is the launcher, not a shell — it maps to its own kind so
+        // `setup` can reach through it into the distro.
+        assert!(matches!(
+            shell_kind(Some("wsl.exe")),
+            Some(ShellKind::Wsl)
+        ));
+        assert!(matches!(shell_kind(Some("wsl")), Some(ShellKind::Wsl)));
+    }
+
+    #[test]
+    fn inner_shell_kind_reads_distro_paths_without_the_windows_bash_guard() {
+        // `shell_kind` declines a Windows `bash` it can't prove is msys, since
+        // `C:\Windows\System32\bash.exe` is the WSL launcher. That guard must
+        // not apply to a path reported from *inside* a distro, where
+        // `/bin/bash` is unambiguously bash.
+        assert!(matches!(
+            inner_shell_kind("/bin/bash"),
+            Some(ShellKind::Bash)
+        ));
+        assert!(matches!(
+            inner_shell_kind("/usr/bin/zsh"),
+            Some(ShellKind::Zsh)
+        ));
+        assert!(matches!(
+            inner_shell_kind("/usr/bin/fish"),
+            Some(ShellKind::Fish)
+        ));
+        // A login shell we have no integration for declines rather than
+        // guessing; the pane then launches bare.
+        assert!(inner_shell_kind("/usr/sbin/nologin").is_none());
+        assert!(inner_shell_kind("/bin/sh").is_none());
+    }
+
+    #[test]
+    fn wsl_distro_and_cd_are_read_from_either_flag_spelling() {
+        let long: Vec<String> = ["--distribution", "Ubuntu-24.04", "--cd", "~"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(wsl_distro(&long).as_deref(), Some("Ubuntu-24.04"));
+        assert_eq!(wsl_cd(&long).as_deref(), Some("~"));
+
+        let short: Vec<String> = ["-d", "Debian"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(wsl_distro(&short).as_deref(), Some("Debian"));
+        assert_eq!(wsl_cd(&short), None);
+
+        let eq: Vec<String> = ["--distribution=Arch", "--cd=/tmp"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(wsl_distro(&eq).as_deref(), Some("Arch"));
+        assert_eq!(wsl_cd(&eq).as_deref(), Some("/tmp"));
+
+        // No distro flag is a valid answer — `wsl.exe` then picks the default.
+        assert_eq!(wsl_distro(&[]), None);
+        // A trailing flag with no value must not panic.
+        assert_eq!(wsl_distro(&["--distribution".to_string()]), None);
+    }
+
+    #[test]
+    fn wslenv_preserves_the_users_own_entries() {
+        // Regression guard: overwriting `WSLENV` silently drops whatever the
+        // user configured, breaking *their* Windows->WSL variable passing.
+        assert_eq!(
+            wslenv_with(Some("MYVAR/p:OTHER"), &["TTY7_RC/p"]),
+            "MYVAR/p:OTHER:TTY7_RC/p"
+        );
+        assert_eq!(wslenv_with(None, &["TTY7_RC/p"]), "TTY7_RC/p");
+        assert_eq!(wslenv_with(Some(""), &["TTY7_RC/p"]), "TTY7_RC/p");
+        // Already present: left exactly as the user spelled it, not duplicated.
+        assert_eq!(
+            wslenv_with(Some("TTY7_RC/l"), &["TTY7_RC/p"]),
+            "TTY7_RC/l"
+        );
     }
 
     /// Git Bash is spawned by its absolute `bash.exe` path, so `.exe` must be
@@ -1575,7 +1929,7 @@ mod tests {
         assert!(inj.args[1].contains("__tty7"));
         assert!(inj.args[1].contains("133;"));
         assert!(inj.env.is_empty());
-        assert!(!inj.force_non_login);
+        assert!(!inj.replaces_argv);
         // fish needs no throwaway dir on disk.
         assert!(inj.dir.is_none());
     }
@@ -1589,7 +1943,7 @@ mod tests {
             inj.env.get("ZDOTDIR").map(String::as_str),
             Some(dir.to_string_lossy().as_ref())
         );
-        assert!(!inj.force_non_login);
+        assert!(!inj.replaces_argv);
         assert!(inj.args.is_empty());
         // All four redirector files landed on disk with the expected content.
         for (name, body) in zsh_redirectors() {
@@ -1608,7 +1962,7 @@ mod tests {
         // argv is `--rcfile <path> -i`, in that order.
         assert_eq!(inj.args[0], "--rcfile");
         assert_eq!(inj.args[2], "-i");
-        assert!(inj.force_non_login);
+        assert!(inj.replaces_argv);
         // The rc file on disk matches the generated template.
         let rc = std::fs::read_to_string(&inj.args[1]).expect("rcfile written");
         assert_eq!(rc, bash_rcfile());
@@ -1618,7 +1972,7 @@ mod tests {
     #[test]
     fn setup_dispatches_by_shell_and_sets_sentinel() {
         // zsh → an injection carrying the "already active" sentinel (empty value).
-        let inj = setup(Some("zsh"), false).expect("zsh setup");
+        let inj = setup(Some("zsh"), &[], false).expect("zsh setup");
         assert_eq!(
             inj.env.get("TTY7_SHELL_INTEGRATION").map(String::as_str),
             Some("")
@@ -1628,7 +1982,7 @@ mod tests {
         }
 
         // fish → same sentinel, no files.
-        let inj = setup(Some("fish"), false).expect("fish setup");
+        let inj = setup(Some("fish"), &[], false).expect("fish setup");
         assert!(inj.env.contains_key("TTY7_SHELL_INTEGRATION"));
 
         // bash without custom args → full injection with non-login override.
@@ -1639,28 +1993,28 @@ mod tests {
         } else {
             "bash"
         };
-        let inj = setup(Some(bash), false).expect("bash setup");
-        assert!(inj.force_non_login);
+        let inj = setup(Some(bash), &[], false).expect("bash setup");
+        assert!(inj.replaces_argv);
         assert!(inj.env.contains_key("TTY7_SHELL_INTEGRATION"));
         if let Some(d) = inj.dir {
             let _ = std::fs::remove_dir_all(d);
         }
 
         // bash WITH custom args → we must not second-guess the user: no injection.
-        assert!(setup(Some(bash), true).is_none());
+        assert!(setup(Some(bash), &[], true).is_none());
 
         // PowerShell without custom args → encoded-command injection, no files.
-        let inj = setup(Some("powershell.exe"), false).expect("powershell setup");
+        let inj = setup(Some("powershell.exe"), &[], false).expect("powershell setup");
         assert!(inj.env.contains_key("TTY7_SHELL_INTEGRATION"));
         assert!(inj.dir.is_none());
-        assert!(!inj.force_non_login);
+        assert!(!inj.replaces_argv);
 
         // PowerShell WITH custom args → `-EncodedCommand` would collide with the
         // user's own `-Command`/`-File`, so we launch bare.
-        assert!(setup(Some("pwsh"), true).is_none());
+        assert!(setup(Some("pwsh"), &[], true).is_none());
 
         // Unknown shell → no integration at all.
-        assert!(setup(Some("/bin/sh"), false).is_none());
+        assert!(setup(Some("/bin/sh"), &[], false).is_none());
     }
 
     #[test]
@@ -1684,7 +2038,7 @@ mod tests {
         // No throwaway dir, no forced spawn mode, no env of its own.
         assert!(inj.env.is_empty());
         assert!(inj.dir.is_none());
-        assert!(!inj.force_non_login);
+        assert!(!inj.replaces_argv);
     }
 
     #[test]
