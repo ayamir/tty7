@@ -251,18 +251,19 @@ fn diff_numstat(cwd: &Path) -> Option<(u32, u32)> {
 /// Run `git -C <cwd> <args>` and return stdout on success, `None` on a
 /// non-zero exit or a missing `git`. `GIT_OPTIONAL_LOCKS=0` makes the read
 /// truly read-only; stdin is nulled so a misconfigured git can't block on a
-/// prompt. Shared with [`git_diff`](crate::terminal::git_diff) so every git
-/// read in the app goes through the same lock-free, prompt-proof invocation.
+/// prompt; `hide_console` keeps this GUI process from flashing a console window
+/// on Windows for every probe. Shared with [`git_diff`](crate::terminal::git_diff)
+/// so every git read in the app goes through the same lock-free, prompt-proof
+/// invocation.
 pub(crate) fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(cwd)
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let out = crate::core::proc::hide_console(&mut cmd).output().ok()?;
     if !out.status.success() {
         return None;
     }

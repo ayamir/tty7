@@ -762,10 +762,9 @@ fn enable_codex_hooks_feature() -> Result<(), String> {
     .chain(home_dir().map(|h| h.join(".local/bin/codex")))
     .find(|p| p.exists());
     let program = candidates.unwrap_or_else(|| PathBuf::from("codex"));
-    match std::process::Command::new(&program)
-        .args(["features", "enable", "hooks"])
-        .output()
-    {
+    let mut cmd = std::process::Command::new(&program);
+    cmd.args(["features", "enable", "hooks"]);
+    match crate::core::proc::hide_console(&mut cmd).output() {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => Err(format!(
             "codex exited with {}: {}",

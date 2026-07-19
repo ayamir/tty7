@@ -278,7 +278,11 @@ fn detect_windows() -> Vec<DetectedShell> {
         out.push(DetectedShell {
             label: "Git Bash".into(),
             program: bash.to_string_lossy().into_owned(),
-            // Interactive login shell — matches Git Bash's own launcher.
+            // Interactive login shell — matches Git Bash's own launcher. These
+            // are tty7's args, not the user's, so shell integration may replace
+            // them with its own spelling of the same thing (see
+            // `protocol::ShellSpec::args_are_tty7_defaults`); they stand as the
+            // fallback for when integration doesn't apply or fails to set up.
             args: vec!["-i".into(), "-l".into()],
         });
     }
@@ -294,6 +298,14 @@ fn detect_windows() -> Vec<DetectedShell> {
     }
 
     out
+}
+
+/// Git Bash's `bash.exe`, if Git for Windows is installed. Exposed only to
+/// tests, so `daemon::shell_integration`'s live-PTY check can spawn the same
+/// binary the dropdown does (and skip itself when there is none).
+#[cfg(all(windows, test))]
+pub fn git_bash_path() -> Option<PathBuf> {
+    find_git_bash()
 }
 
 /// Git Bash from the usual Git-for-Windows install roots (machine-wide x64,
@@ -319,17 +331,13 @@ fn find_git_bash() -> Option<PathBuf> {
 }
 
 /// Installed WSL distribution names via `wsl.exe -l -q`, or empty when WSL is
-/// absent. `CREATE_NO_WINDOW` keeps the probe from flashing a console window
-/// (we're a GUI process).
+/// absent. [`hide_console`](crate::core::proc::hide_console) keeps the probe
+/// from flashing a console window (we're a GUI process).
 #[cfg(windows)]
 fn list_wsl_distros() -> Vec<String> {
-    use std::os::windows::process::CommandExt as _;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let Ok(output) = std::process::Command::new("wsl.exe")
-        .args(["-l", "-q"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-    else {
+    let mut cmd = std::process::Command::new("wsl.exe");
+    cmd.args(["-l", "-q"]);
+    let Ok(output) = crate::core::proc::hide_console(&mut cmd).output() else {
         return Vec::new();
     };
     if !output.status.success() {

@@ -1992,6 +1992,10 @@ impl Tty7App {
         self.update_config(cx, |cfg| cfg.copy_on_select = on);
     }
 
+    pub(crate) fn set_smart_select(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.smart_select = on);
+    }
+
     pub(crate) fn set_startup_mode(
         &mut self,
         mode: crate::core::config::StartupMode,
@@ -3071,9 +3075,9 @@ impl Tty7App {
         // which is what a review pass wants. Both invocations are quick; the
         // prompt builder caps runaway diffs.
         let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&cwd)
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(args).current_dir(&cwd);
+            crate::core::proc::hide_console(&mut cmd)
                 .output()
                 .ok()
                 .filter(|o| o.status.success())

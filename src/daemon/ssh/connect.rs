@@ -173,6 +173,10 @@ fn spawn_proxy_command(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .kill_on_drop(true);
+    // The daemon is detached and has no console to lend this child, so without
+    // the flag a `ProxyCommand` (`ssh -W`, `connect.exe`, `cloudflared`) gets a
+    // console of its own that stays up for the whole session.
+    crate::core::proc::hide_console_tokio(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("spawn ProxyCommand failed: {e}"))?;

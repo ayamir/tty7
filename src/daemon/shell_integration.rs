@@ -33,7 +33,10 @@
 //!     [`Injection::force_non_login`]. Bash also has no native precmd/preexec,
 //!     so the hook body vendors the relevant parts of
 //!     [bash-preexec](https://github.com/rcaloras/bash-preexec) (MIT), the
-//!     same shim VS Code relies on for this.
+//!     same shim VS Code relies on for this. This path covers Git Bash too —
+//!     the msys2 bash Git for Windows ships is spawned as `bash.exe` by
+//!     absolute path, and needs only its rcfile path spelled with forward
+//!     slashes (see [`bash_path`]).
 //!   - **PowerShell** (the Windows default, and any `pwsh`) has no dotfile
 //!     redirect either, but `-EncodedCommand` runs a script *after* its own
 //!     profiles load — like fish's `-C`, no file on disk. It has no
@@ -44,6 +47,17 @@
 //!
 //! Across all four: **the user's own dotfiles are never modified** — the
 //! mechanisms above only affect shells tty7 itself launches.
+//!
+//! The two remaining Windows dropdown entries stay unintegrated by design, not
+//! omission. **cmd** exposes exactly one hook, the `PROMPT` env var, which can
+//! emit the `A`/`B` marks but not `C` or `D`: it has no preexec/postexec, and
+//! `PROMPT` is expanded when it is *set*, so even `%ERRORLEVEL%` is out of
+//! reach. Since only `C` clears `at_prompt` (see `pane::handle_osc133`), an
+//! A/B-only shell would leave the line editor owning the keyboard for the
+//! whole of every command — worse than no integration. **WSL** is spawned as
+//! `wsl.exe`, the Windows-side launcher; reaching the distro's own shell would
+//! mean detecting which shell that is per distro and routing the injection
+//! through `WSLENV` path translation, which is its own piece of work.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -260,7 +274,36 @@ if [[ $- == *i* ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
     fi
   }
   # Escape literal `%` as %25 — the daemon percent-decodes the OSC 7 payload.
-  __tty7_report_cwd() { builtin printf '\e]7;file://%s%s\a' "${HOSTNAME:-localhost}" "${PWD//\%/%25}"; }
+  #
+  # Under Git Bash (msys) `$PWD` is an msys path — `/c/Users/x`, and `/tmp` for
+  # mounts with no drive at all. The daemon runs Windows-side, where `/c/Users/x`
+  # is not absolute but *drive-relative*, so it resolves to a bogus `C:\c\Users\x`
+  # (see `pane::strip_uri_drive_slash`, which only un-prefixes `/C:/…`). `pwd -W`
+  # is msys's own translation to the real Windows path, and it resolves mounts
+  # that have a real backing directory (`/tmp` -> `C:/Users/x/AppData/Local/Temp`).
+  # It has no leading slash, so add one to make it the absolute-path shape a
+  # file: URI expects.
+  #
+  # For msys-only virtual mounts (`/proc`, `/dev`) there *is* no Windows path
+  # and `pwd -W` is the identity, so require a drive letter and stay silent
+  # otherwise — a `/proc` payload would land as drive-relative `C:\proc` and
+  # fail the next spawn, whereas reporting nothing leaves the daemon holding
+  # the last usable cwd. Testing the shape beats testing for a leading slash,
+  # which cannot tell a translated path from an untranslated one.
+  #
+  # The branch is resolved once at install time; the `$(…)` inside still forks
+  # per prompt (~6.8 ms under msys, vs ~0.3 ms for the plain `$PWD` path), which
+  # is the price of a correct path and only paid by Git Bash panes.
+  if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; then
+    __tty7_report_cwd() {
+      local d
+      d="$(builtin pwd -W 2>/dev/null)" || return 0
+      [[ "$d" == ?:* ]] || return 0
+      builtin printf '\e]7;file://%s/%s\a' "${HOSTNAME:-localhost}" "${d//\%/%25}"
+    }
+  else
+    __tty7_report_cwd() { builtin printf '\e]7;file://%s%s\a' "${HOSTNAME:-localhost}" "${PWD//\%/%25}"; }
+  fi
 
   # Own hook for D, prepended to precmd_functions (same rationale as the zsh
   # path): the app flips back to prompt-editing on D, so it must fire the
@@ -727,21 +770,56 @@ fn shell_kind(program: Option<&str>) -> Option<ShellKind> {
         Some(p) => p.to_string(),
         None => std::env::var("SHELL").ok()?,
     };
-    // Lowercase the basename: Windows program names are case-insensitive and
-    // carry an `.exe` suffix, so `PowerShell.exe`, `powershell.exe` and `pwsh`
-    // must all match. The Unix shells are conventionally lowercase already, so
-    // this only ever normalizes the Windows spellings.
+    // Lowercase the basename and drop any `.exe`: Windows program names are
+    // case-insensitive and carry the suffix, so `PowerShell.exe` and `pwsh`
+    // must both match — as must Git Bash, which tty7 launches by its absolute
+    // `...\Git\bin\bash.exe` path (`core::shells::find_git_bash`). The Unix
+    // shells are conventionally lowercase and suffix-free already, so this only
+    // ever normalizes the Windows spellings.
     let base = Path::new(&owned)
         .file_name()?
         .to_str()?
         .to_ascii_lowercase();
-    match base.as_str() {
+    match base.strip_suffix(".exe").unwrap_or(&base) {
         "zsh" => Some(ShellKind::Zsh),
+        "bash" if cfg!(windows) && !is_msys_bash(&owned) => None,
         "bash" => Some(ShellKind::Bash),
         "fish" => Some(ShellKind::Fish),
-        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => Some(ShellKind::PowerShell),
+        "powershell" | "pwsh" => Some(ShellKind::PowerShell),
         _ => None,
     }
+}
+
+/// Whether a Windows `bash` program path is the msys bash that Git for Windows
+/// (or msys2) ships, as opposed to `C:\Windows\System32\bash.exe` — the WSL
+/// launcher, which exists on any machine with WSL and normally sits ahead of
+/// `Git\bin` on PATH.
+///
+/// The asymmetry is why this fails closed: getting it wrong in the WSL
+/// direction is destructive, because `--rcfile` *replaces* `~/.bashrc` rather
+/// than supplementing it and the path we pass does not exist inside the distro
+/// — the user silently loses aliases, prompt, and PATH. Getting it wrong in the
+/// Git Bash direction merely costs them shell integration, which they did not
+/// have before it was implemented. So anything not positively identifiable as
+/// msys is declined, including a bare `bash` / `bash.exe` whose PATH lookup we
+/// cannot predict.
+///
+/// Always `true` off Windows: `cfg!(windows)` gates the only call site, and
+/// keeping the body platform-neutral lets the tests run everywhere.
+fn is_msys_bash(program: &str) -> bool {
+    if !cfg!(windows) {
+        return true;
+    }
+    let normalized = program.replace('/', "\\").to_ascii_lowercase();
+    let Some((dir, _)) = normalized.rsplit_once('\\') else {
+        return false; // bare name — resolved through PATH at spawn time
+    };
+    let system_root = std::env::var("SystemRoot")
+        .unwrap_or_else(|_| r"C:\Windows".to_string())
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    let system_root = system_root.trim_end_matches('\\');
+    !(dir == system_root || dir.starts_with(&format!("{system_root}\\")))
 }
 
 /// A unique throwaway dir under the OS temp dir, prefixed for later
@@ -876,6 +954,23 @@ if [[ -f ~/.bashrc ]]; then source ~/.bashrc; fi
     )
 }
 
+/// Render a path for bash's own consumption. The only bash reachable on
+/// Windows is the msys2 one Git for Windows ships: its runtime does accept a
+/// native `C:\...` path, but the backslashes then survive into any bash string
+/// context that path is later interpolated into (`$BASH_SOURCE`, an error
+/// message re-evaluated by a user's `PROMPT_COMMAND`) where they *are* escape
+/// characters. Forward slashes are accepted just as readily by the msys
+/// runtime and carry no such second meaning, so normalize to them. No-op on
+/// Unix, where the separator is already `/`.
+fn bash_path(path: &Path) -> String {
+    let s = path.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        s.replace('\\', "/")
+    } else {
+        s
+    }
+}
+
 /// Force a non-login bash with our rcfile, replaying the login-file chain
 /// ourselves inside it (see [`bash_rcfile`]) since `--rcfile` only takes effect
 /// on non-login shells in the first place. Only offered when the caller has no
@@ -892,11 +987,7 @@ fn setup_bash() -> Option<Injection> {
         // `--rcfile` (a GNU long option) must precede `-i`: bash 3.2 — still
         // macOS's shipped `/bin/bash` — refuses to parse a long option once a
         // short one has been seen.
-        args: vec![
-            "--rcfile".to_string(),
-            rcfile.to_string_lossy().into_owned(),
-            "-i".to_string(),
-        ],
+        args: vec!["--rcfile".to_string(), bash_path(&rcfile), "-i".to_string()],
         force_non_login: true,
         dir: Some(dir),
     })
@@ -982,6 +1073,112 @@ mod tests {
         assert!(!is_our_zdotdir("/tmp/not-tty7-zdotdir-1"));
     }
 
+    /// End-to-end on a real PTY: spawn the actual Git Bash through the actual
+    /// `setup` output and assert the full A/B/C/D cycle comes back. Guards the
+    /// parts no pure test can see — that msys2 bash accepts the rcfile path we
+    /// hand it, that our hooks survive Git Bash's own `/etc/profile` (which
+    /// installs a `PROMPT_COMMAND` of its own), and that bash-preexec's DEBUG
+    /// trap actually fires under a Windows pty. Skips when Git for Windows
+    /// isn't installed, so it's a no-op on a machine without it.
+    #[cfg(windows)]
+    #[test]
+    fn git_bash_reports_the_full_prompt_cycle_over_a_real_pty() {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        use std::io::{Read, Write};
+
+        let Some(bash) = crate::core::shells::git_bash_path() else {
+            eprintln!("skipping: Git for Windows not installed");
+            return;
+        };
+        let bash = bash.to_string_lossy().into_owned();
+        // `has_custom_args: false` — the dropdown's `-i -l` are tty7's own, so
+        // the real spawn path reaches setup_bash with them overridable.
+        let injection = setup(Some(&bash), false).expect("bash integration");
+
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new(&bash);
+        cmd.args(&injection.args);
+        for (k, v) in &injection.env {
+            cmd.env(k, v);
+        }
+        let mut child = pty.slave.spawn_command(cmd).expect("spawn git bash");
+
+        let mut writer = pty.master.take_writer().expect("writer");
+        let mut reader = pty.master.try_clone_reader().expect("reader");
+        // `false` gives D a non-zero exit code to carry, so a hardcoded 0 in
+        // the report path can't pass this. `writer` is deliberately held for
+        // the rest of the test: closing a ConPTY's input side raises a console
+        // control event, which kills the shell with STATUS_CONTROL_C_EXIT
+        // before it ever reaches a prompt.
+        writer.write_all(b"false\n").expect("write");
+        writer.flush().expect("flush");
+
+        // Drain on a worker: a Windows ConPTY master does not reliably EOF when
+        // its child exits, so reading inline would block past the shell's own
+        // exit. The worker feeds chunks over a channel and the test stops at the
+        // D mark that ends the cycle — or at a deadline, so a shell that never
+        // reports fails the assert instead of hanging.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut out = Vec::new();
+        while std::time::Instant::now() < deadline {
+            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(chunk) => out.extend_from_slice(&chunk),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if String::from_utf8_lossy(&out).contains("133;D") {
+                break;
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(pty.master);
+        let text = String::from_utf8_lossy(&out);
+
+        for mark in ["133;A", "133;B", "133;C", "133;D;1"] {
+            assert!(
+                text.contains(mark),
+                "Git Bash must report {mark}; got:\n{text}"
+            );
+        }
+        // cwd reporting rides along on the same hooks. Assert the *decoded*
+        // path, not just the marker's presence: Git Bash's `$PWD` is an msys
+        // path (`/c/Users/x`) that Windows resolves drive-relative to a
+        // non-existent `C:\c\Users\x`, which silently disables the git-status
+        // probe and breaks split/new-tab. Round-tripping through the daemon's
+        // own parser is what proves the two halves agree.
+        let payload = text
+            .split("\u{1b}]")
+            .find(|s| s.starts_with("7;file://"))
+            .and_then(|s| s.split(['\u{7}', '\u{1b}']).next())
+            .unwrap_or_else(|| panic!("expected OSC 7; got:\n{text}"));
+        let cwd = crate::daemon::pane::parse_osc7(payload.as_bytes())
+            .unwrap_or_else(|| panic!("daemon could not parse OSC 7 payload {payload:?}"));
+        assert!(
+            cwd.exists(),
+            "Git Bash reported a cwd the Windows side cannot resolve: {cwd:?} \
+             (from {payload:?}) — a drive-relative msys path, so `pwd -W` \
+             translation regressed"
+        );
+    }
+
     #[test]
     fn shell_kind_maps_known_basenames() {
         assert!(matches!(shell_kind(Some("/bin/zsh")), Some(ShellKind::Zsh)));
@@ -1014,6 +1211,83 @@ mod tests {
         // Unknown shells (and absolute paths to them) resolve to None.
         assert!(shell_kind(Some("/bin/sh")).is_none());
         assert!(shell_kind(Some("cmd.exe")).is_none());
+        // cmd has no preexec hook of any kind, and `wsl.exe` is only the
+        // Windows-side launcher — injecting into it would never reach the
+        // distro's own shell. Both stay unsupported on purpose.
+        assert!(shell_kind(Some("wsl.exe")).is_none());
+    }
+
+    /// Git Bash is spawned by its absolute `bash.exe` path, so `.exe` must be
+    /// stripped for *every* shell and not just PowerShell — otherwise the one
+    /// bash reachable on Windows silently gets no integration.
+    #[test]
+    fn shell_kind_strips_exe_for_non_powershell_shells() {
+        for prog in [
+            "C:/Program Files/Git/bin/bash.exe",
+            "C:/msys64/usr/bin/bash.exe",
+        ] {
+            assert!(
+                matches!(shell_kind(Some(prog)), Some(ShellKind::Bash)),
+                "{prog} should map to Bash"
+            );
+        }
+        // Off Windows the guard is inert, so the bare spellings still resolve.
+        if !cfg!(windows) {
+            for prog in ["bash.exe", "BASH.EXE", "bash"] {
+                assert!(matches!(shell_kind(Some(prog)), Some(ShellKind::Bash)));
+            }
+        }
+    }
+
+    /// `C:\Windows\System32\bash.exe` is the WSL launcher, not a shell we can
+    /// inject into: `--rcfile` replaces `~/.bashrc` rather than adding to it,
+    /// and the Windows path we pass does not exist inside the distro, so the
+    /// user would silently lose their whole bash config. It also normally sits
+    /// ahead of `Git\bin` on PATH, which is why a bare name is declined too.
+    #[test]
+    #[cfg(windows)]
+    fn shell_kind_declines_the_wsl_bash_launcher() {
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        for prog in [
+            format!(r"{system_root}\System32\bash.exe"),
+            format!(r"{system_root}/System32/bash.exe"),
+            format!(r"{system_root}\SysWOW64\bash.exe"),
+            format!(r"{system_root}\system32\BASH.EXE"),
+        ] {
+            assert!(
+                shell_kind(Some(&prog)).is_none(),
+                "{prog} is the WSL launcher and must not be treated as Bash"
+            );
+        }
+        // A bare name resolves through PATH at spawn time, where System32
+        // usually wins — unpredictable, so fail closed.
+        for prog in ["bash", "bash.exe", "BASH.EXE"] {
+            assert!(
+                shell_kind(Some(prog)).is_none(),
+                "{prog} cannot be identified as msys bash and must be declined"
+            );
+        }
+    }
+
+    /// The rcfile path is handed to msys2 bash, which reads `\` as an escape in
+    /// the string contexts the path can later reach — see [`bash_path`].
+    #[test]
+    fn bash_rcfile_path_uses_forward_slashes_on_windows() {
+        let rendered = bash_path(Path::new(
+            r"C:\Users\a\AppData\Local\Temp\tty7-bashrc-1-0\bashrc",
+        ));
+        if cfg!(windows) {
+            assert_eq!(
+                rendered,
+                "C:/Users/a/AppData/Local/Temp/tty7-bashrc-1-0/bashrc"
+            );
+        }
+        // Unix paths are already separator-correct and must pass through
+        // untouched on every host.
+        assert_eq!(
+            bash_path(Path::new("/tmp/tty7-bashrc-1-0/bashrc")),
+            "/tmp/tty7-bashrc-1-0/bashrc"
+        );
     }
 
     #[test]
@@ -1208,6 +1482,90 @@ mod tests {
                 "{shell} must not emit the raw $PWD in its OSC 7 report"
             );
         }
+        // bash's msys branch reports `pwd -W` output rather than $PWD, so it
+        // needs the same escaping on its own variable.
+        assert!(
+            BASH_INTEGRATION.contains(r"${d//\%/%25}"),
+            "bash's msys OSC 7 reporter must %-escape the literal percent too"
+        );
+    }
+
+    /// Under Git Bash `$PWD` is an msys path (`/c/Users/x`). Windows reads that
+    /// as drive-relative, so it would land on `C:\c\Users\x` — a directory that
+    /// does not exist, silently killing the git-status probe and path completion,
+    /// and actively breaking split/new-tab (the client cwd wins over every
+    /// fallback in `pane::initial_working_directory`, so the next shell is
+    /// spawned with a bogus working directory). `pwd -W` is msys's translation
+    /// to the real Windows path.
+    #[test]
+    fn bash_reports_a_windows_path_under_msys() {
+        let s = BASH_INTEGRATION;
+        assert!(
+            s.contains(r#"if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]"#),
+            "bash must detect msys/cygwin to pick its cwd reporter"
+        );
+        assert!(
+            s.contains("builtin pwd -W"),
+            "bash's msys branch must translate the cwd with `pwd -W`"
+        );
+        // `pwd -W` yields `C:/Users/x` with no leading slash; a file: URI needs
+        // one so the daemon's `strip_uri_drive_slash` recognises the drive.
+        assert!(
+            s.contains(r#"file://%s/%s"#),
+            "bash's msys branch must make the translated path URI-absolute"
+        );
+        // `pwd -W` is the identity for msys-only virtual mounts (`/proc`,
+        // `/dev`), which have no Windows path at all. Requiring a drive letter
+        // is what separates a translated path from an untranslated one — a
+        // leading-slash test cannot. Falling back to `$PWD` would defeat the
+        // whole point, so silence is the only safe answer here.
+        assert!(
+            s.contains(r#"[[ "$d" == ?:* ]] || return 0"#),
+            "bash's msys branch must report nothing when `pwd -W` yields no drive"
+        );
+        assert!(
+            !s.contains(r#"d="$PWD""#),
+            "bash's msys branch must never fall back to the untranslated $PWD"
+        );
+    }
+
+    /// The payload the msys branch builds must survive the daemon's own parser
+    /// and come out as a path Windows can actually use — the shape assertions
+    /// above cannot see that. Mirrors what `__tty7_report_cwd` emits.
+    #[test]
+    fn msys_payload_round_trips_through_parse_osc7() {
+        let parse = |payload: &str| {
+            crate::daemon::pane::parse_osc7(payload.as_bytes())
+                .unwrap_or_else(|| panic!("{payload} should parse"))
+        };
+        for (translated, want) in [
+            ("C:/Users/thoma/repo", "C:/Users/thoma/repo"),
+            ("C:/", "C:/"),
+            ("D:/work/a b", "D:/work/a b"),
+            // The `%` the reporter escapes must survive the round trip.
+            ("C:/tmp/a%25c", "C:/tmp/a%c"),
+        ] {
+            let got = parse(&format!("7;file://localhost/{translated}"));
+            let want = if cfg!(windows) {
+                PathBuf::from(want)
+            } else {
+                PathBuf::from(format!("/{want}"))
+            };
+            assert_eq!(got, want, "payload for {translated}");
+        }
+
+        // And the shape the guard exists to suppress: an untranslated msys path
+        // parses fine but yields a drive-relative path Windows resolves against
+        // the current drive, which is how `/c/Users/x` became `C:\c\Users\x`.
+        if cfg!(windows) {
+            let got = parse("7;file://localhost/c/Users/thoma");
+            assert_ne!(got, PathBuf::from("C:/Users/thoma"));
+            assert!(
+                !got.is_absolute(),
+                "{got:?} is drive-relative — Windows resolves it against the \
+                 current drive, which is why it must never be emitted"
+            );
+        }
     }
 
     #[test]
@@ -1274,7 +1632,14 @@ mod tests {
         assert!(inj.env.contains_key("TTY7_SHELL_INTEGRATION"));
 
         // bash without custom args → full injection with non-login override.
-        let inj = setup(Some("bash"), false).expect("bash setup");
+        // On Windows only a path identifiable as msys counts as Bash, since a
+        // bare name could resolve to the WSL launcher — see `is_msys_bash`.
+        let bash = if cfg!(windows) {
+            "C:/Program Files/Git/bin/bash.exe"
+        } else {
+            "bash"
+        };
+        let inj = setup(Some(bash), false).expect("bash setup");
         assert!(inj.force_non_login);
         assert!(inj.env.contains_key("TTY7_SHELL_INTEGRATION"));
         if let Some(d) = inj.dir {
@@ -1282,7 +1647,7 @@ mod tests {
         }
 
         // bash WITH custom args → we must not second-guess the user: no injection.
-        assert!(setup(Some("bash"), true).is_none());
+        assert!(setup(Some(bash), true).is_none());
 
         // PowerShell without custom args → encoded-command injection, no files.
         let inj = setup(Some("powershell.exe"), false).expect("powershell setup");
