@@ -76,6 +76,18 @@ pub struct ShellSpec {
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// True when `args` were authored by tty7's own shell discovery
+    /// (`core::shells`) rather than by the user, and so may be replaced by
+    /// shell integration — Git Bash's `-i -l` is tty7's way of saying "an
+    /// interactive login shell", which `setup_bash`'s `--rcfile … -i` plus its
+    /// replayed login-file chain expresses differently but equivalently.
+    /// User-configured args get no such liberty; see
+    /// `daemon::shell_integration::setup`'s `has_custom_args`.
+    ///
+    /// Defaults to `false` on the wire so an older client's frame — which can
+    /// only carry user-configured args — keeps them untouched.
+    #[serde(default)]
+    pub args_are_tty7_defaults: bool,
 }
 
 /// Whether a short `ssh` option flag consumes the following argument as its
@@ -1396,6 +1408,7 @@ mod tests {
                 shell: Some(ShellSpec {
                     program: "wsl.exe".into(),
                     args: vec!["--distribution".into(), "Ubuntu".into()],
+                    args_are_tty7_defaults: true,
                 }),
             },
             ClientMsg::Attach {
@@ -1691,6 +1704,8 @@ mod tests {
         let shell = ShellSpec {
             program: "fish".to_string(),
             args: vec!["-l".to_string()],
+            // Set so the round-trip covers the flag, not just program + args.
+            args_are_tty7_defaults: true,
         };
         let msg = ClientMsg::Spawn {
             cwd: Some(PathBuf::from("/work")),

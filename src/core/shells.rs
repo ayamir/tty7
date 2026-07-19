@@ -278,7 +278,11 @@ fn detect_windows() -> Vec<DetectedShell> {
         out.push(DetectedShell {
             label: "Git Bash".into(),
             program: bash.to_string_lossy().into_owned(),
-            // Interactive login shell — matches Git Bash's own launcher.
+            // Interactive login shell — matches Git Bash's own launcher. These
+            // are tty7's args, not the user's, so shell integration may replace
+            // them with its own spelling of the same thing (see
+            // `protocol::ShellSpec::args_are_tty7_defaults`); they stand as the
+            // fallback for when integration doesn't apply or fails to set up.
             args: vec!["-i".into(), "-l".into()],
         });
     }
@@ -294,6 +298,14 @@ fn detect_windows() -> Vec<DetectedShell> {
     }
 
     out
+}
+
+/// Git Bash's `bash.exe`, if Git for Windows is installed. Exposed only to
+/// tests, so `daemon::shell_integration`'s live-PTY check can spawn the same
+/// binary the dropdown does (and skip itself when there is none).
+#[cfg(all(windows, test))]
+pub fn git_bash_path() -> Option<PathBuf> {
+    find_git_bash()
 }
 
 /// Git Bash from the usual Git-for-Windows install roots (machine-wide x64,
