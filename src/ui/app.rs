@@ -3114,6 +3114,7 @@ impl Tty7App {
             self.build_font_selects(&mut subs, window, cx);
         let (shell_program_input, shell_args_input, wd_path_input) =
             self.build_shell_inputs(&mut subs, window, cx);
+        let link_file_command_input = self.build_link_file_command_input(&mut subs, window, cx);
         let scroll_slider = self.build_scroll_slider(&mut subs, window, cx);
         let window_opacity_slider = self.build_window_opacity_slider(&mut subs, window, cx);
         // Live filter for the theme picker panel; each keystroke re-renders the
@@ -3149,6 +3150,7 @@ impl Tty7App {
             shell_program_input,
             shell_args_input,
             wd_path_input,
+            link_file_command_input,
             scroll_slider,
             window_opacity_slider,
             theme_editor: None,
@@ -3333,6 +3335,59 @@ impl Tty7App {
             }),
         );
         (shell_program_input, shell_args_input, wd_path_input)
+    }
+
+    /// File-open command template input (Links section), committing on Enter/blur.
+    fn build_link_file_command_input(
+        &mut self,
+        subs: &mut Vec<Subscription>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        let value = cx
+            .global::<Config>()
+            .link_file_command
+            .clone()
+            .unwrap_or_default();
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("open in default app")
+                .default_value(value)
+        });
+        subs.push(
+            cx.subscribe_in(&input, window, move |this, _i, ev, _w, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    this.commit_link_file_command(cx);
+                }
+            }),
+        );
+        input
+    }
+
+    /// Persist the file-open command template from the Links settings input. An
+    /// empty value clears the override (falls back to the built-in open).
+    fn commit_link_file_command(&mut self, cx: &mut Context<Self>) {
+        let Some(command) = self.active_settings().map(|s| {
+            s.link_file_command_input
+                .read(cx)
+                .value()
+                .trim()
+                .to_string()
+        }) else {
+            return;
+        };
+        let command = if command.is_empty() {
+            None
+        } else {
+            Some(command)
+        };
+        let cfg = cx.global_mut::<Config>();
+        if cfg.link_file_command == command {
+            return; // no change — avoid a redundant disk write on every Blur
+        }
+        cfg.link_file_command = command;
+        cfg.save();
+        cx.notify();
     }
 
     /// Window-opacity slider for the Appearance page (20%–100%). Emits `Change`

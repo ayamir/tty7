@@ -3975,7 +3975,14 @@ impl TerminalView {
         if let Some(link) = super::search::link_at(&text, col, cwd.as_deref(), true) {
             match link.target {
                 LinkTarget::Url(url) => self.open_url(&url, cx),
-                LinkTarget::File { path, .. } => open_file_path(&path),
+                LinkTarget::File { path, line, column } => {
+                    // A configured template (e.g. opening the file in an editor)
+                    // takes precedence; otherwise fall back to the OS opener.
+                    match cx.global::<Config>().link_file_command.as_deref() {
+                        Some(template) => run_file_command(template, &path, line, column),
+                        None => open_file_path(&path),
+                    }
+                }
             }
             true
         } else if self.can_forward_loopback(cx)
@@ -5112,6 +5119,81 @@ fn open_file_path(path: &std::path::Path) {
     }
 }
 
+/// Run a user-configured file-open command for a clicked file link. The template
+/// is expanded by [`expand_file_command_template`] and the first token is the
+/// program; the rest are its arguments. Spawned detached — tty7 doesn't wait for
+/// or read from the editor it launches.
+fn run_file_command(
+    template: &str,
+    path: &std::path::Path,
+    line: Option<u32>,
+    column: Option<u32>,
+) {
+    let argv = expand_file_command_template(template, path, line, column);
+    let Some((program, args)) = argv.split_first() else {
+        log::warn!("link_file_command is empty; ignoring file link");
+        return;
+    };
+    if let Err(e) = std::process::Command::new(program).args(args).spawn() {
+        log::warn!("failed to run link_file_command {template:?}: {e}");
+    }
+}
+
+/// Expand a file-open command template into an argv vector.
+///
+/// The template is split on whitespace into tokens. Within a token the
+/// placeholders `{path}`, `{line}`, and `{column}` are replaced with their
+/// values. If a token references a placeholder whose value is absent (e.g.
+/// `{line}` for a link with no line number), the whole token is dropped — this
+/// lets a combined token like `--line={line}` disappear cleanly rather than
+/// leaving a dangling flag. `{path}` is always present, so a token that only
+/// references `{path}` is never dropped.
+fn expand_file_command_template(
+    template: &str,
+    path: &std::path::Path,
+    line: Option<u32>,
+    column: Option<u32>,
+) -> Vec<String> {
+    let path = path.to_string_lossy();
+    template
+        .split_whitespace()
+        .filter_map(|token| expand_file_command_token(token, &path, line, column))
+        .collect()
+}
+
+/// Substitute placeholders in a single template token, or return `None` if the
+/// token references a placeholder with no value (so the caller drops it).
+fn expand_file_command_token(
+    token: &str,
+    path: &str,
+    line: Option<u32>,
+    column: Option<u32>,
+) -> Option<String> {
+    let mut out = String::with_capacity(token.len());
+    let mut rest = token;
+    while let Some(open) = rest.find('{') {
+        let Some(close_rel) = rest[open..].find('}') else {
+            // No closing brace: the remainder is literal text.
+            break;
+        };
+        let close = open + close_rel;
+        out.push_str(&rest[..open]);
+        let value = match &rest[open + 1..close] {
+            "path" => Some(path.to_string()),
+            "line" => line.map(|l| l.to_string()),
+            "column" => column.map(|c| c.to_string()),
+            // An unknown placeholder is left verbatim rather than dropping the
+            // token, so a stray brace doesn't silently swallow an argument.
+            other => Some(format!("{{{other}}}")),
+        };
+        // A recognized-but-absent placeholder drops the entire token.
+        out.push_str(&value?);
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 /// One mouse report, encoded for the protocol the app negotiated. SGR (1006)
 /// prints decimal 1-based coordinates and keeps the button in the final
 /// letter (`M` press / `m` release); X10 packs everything into three bytes,
@@ -5466,15 +5548,65 @@ fn drag_scroll_step(overshoot: f32) -> i32 {
 mod tests {
     use super::{
         SelectEndCopy, WheelRoute, clipboard_paste_text, display_width, drag_scroll_step,
-        encode_mouse, fallback_chain, fig_icon_emoji, fig_icon_glyph, focus_report_bytes,
-        input_overflow_shift, input_overlay_rows, menu_layout, paste_bytes, select_end_copy,
-        shell_escape_path, smooth_scroll_step, trim_trailing_spaces, wheel_route,
+        encode_mouse, expand_file_command_template, fallback_chain, fig_icon_emoji, fig_icon_glyph,
+        focus_report_bytes, input_overflow_shift, input_overlay_rows, menu_layout, paste_bytes,
+        select_end_copy, shell_escape_path, smooth_scroll_step, trim_trailing_spaces, wheel_route,
         wrapped_click_index,
     };
     use alacritty_terminal::term::TermMode;
     use gpui::{ClipboardEntry, ClipboardItem, ExternalPaths, Modifiers};
     use gpui_component::IconName;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn file_command_template_substitutes_path_line_and_column() {
+        let argv = expand_file_command_template(
+            "herdr edit {path} --line={line} --column={column}",
+            Path::new("/tmp/foo.rs"),
+            Some(42),
+            Some(7),
+        );
+        assert_eq!(
+            argv,
+            vec!["herdr", "edit", "/tmp/foo.rs", "--line=42", "--column=7",]
+        );
+    }
+
+    #[test]
+    fn file_command_template_drops_tokens_for_absent_values() {
+        // No line/column: the combined flag tokens vanish entirely, leaving no
+        // dangling `--line` for the downstream parser.
+        let argv = expand_file_command_template(
+            "herdr edit {path} --line={line} --column={column}",
+            Path::new("/tmp/foo.rs"),
+            None,
+            None,
+        );
+        assert_eq!(argv, vec!["herdr", "edit", "/tmp/foo.rs"]);
+
+        // Column absent but line present: only the column flag drops.
+        let argv = expand_file_command_template(
+            "herdr edit {path} --line={line} --column={column}",
+            Path::new("/tmp/foo.rs"),
+            Some(42),
+            None,
+        );
+        assert_eq!(argv, vec!["herdr", "edit", "/tmp/foo.rs", "--line=42"]);
+    }
+
+    #[test]
+    fn file_command_template_keeps_path_only_token_and_unknown_placeholder() {
+        // A path-only program still runs; an unknown placeholder is left verbatim
+        // rather than dropping its token.
+        let argv = expand_file_command_template(
+            "code --goto {path}:{line} {other}",
+            Path::new("/tmp/foo.rs"),
+            None,
+            None,
+        );
+        // `{path}:{line}` drops (line absent); `{other}` stays literal.
+        assert_eq!(argv, vec!["code", "--goto", "{other}"]);
+    }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
