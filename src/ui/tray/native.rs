@@ -75,10 +75,7 @@ impl Backend {
                         // scales proportionally from its 96×96 viewBox.
                         let target_h: f64 = 22.0;
                         let aspect = nsimage.size().width / nsimage.size().height;
-                        nsimage.setSize(objc2_foundation::NSSize::new(
-                            target_h * aspect,
-                            target_h,
-                        ));
+                        nsimage.setSize(objc2_foundation::NSSize::new(target_h * aspect, target_h));
                     }
                 }
             }
