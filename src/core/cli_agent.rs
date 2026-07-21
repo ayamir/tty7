@@ -161,7 +161,18 @@ impl CLIAgent {
     /// native session id, or `None` for agents without a known resume flag.
     /// The id is what the agent reported in its `session-start` event (see
     /// [`AgentEvent`]); commands mirror cmux's per-agent resume table.
-    pub fn resume_command(self, session_id: &str) -> Option<String> {
+    ///
+    /// `launch_argv` is the argv the agent was originally launched with, when
+    /// the daemon observed one. Its flags (`--dangerously-skip-permissions`,
+    /// `--model …`) are carried onto the resume command so the restored
+    /// session runs in the same mode the user picked — verbatim only when the
+    /// whole tail passes the conservative shell-safety gate; otherwise the
+    /// bare table command still resumes, just without the flags.
+    pub fn resume_command(
+        self,
+        session_id: &str,
+        launch_argv: Option<&[String]>,
+    ) -> Option<String> {
         // Ids come from the agent's own events, but they still land on a shell
         // command line — refuse anything that isn't a plain token so a
         // malicious/corrupt id can't smuggle shell syntax.
@@ -172,15 +183,133 @@ impl CLIAgent {
         {
             return None;
         }
+        // The user's launch flags, pre-joined with a leading space so they
+        // splice into the format strings below; empty when none survive.
+        let flags = launch_argv
+            .and_then(|argv| self.replay_flags(argv))
+            .map(|flags| {
+                flags.iter().fold(String::new(), |mut s, f| {
+                    s.push(' ');
+                    s.push_str(f);
+                    s
+                })
+            })
+            .unwrap_or_default();
         match self {
-            CLIAgent::Claude => Some(format!("claude --resume {session_id}")),
-            CLIAgent::Codex => Some(format!("codex resume {session_id}")),
-            CLIAgent::Gemini => Some(format!("gemini --resume {session_id}")),
-            CLIAgent::OpenCode => Some(format!("opencode --session {session_id}")),
-            CLIAgent::Amp => Some(format!("amp threads continue {session_id}")),
-            CLIAgent::Cursor => Some(format!("cursor-agent --resume {session_id}")),
+            CLIAgent::Claude => Some(format!("claude{flags} --resume {session_id}")),
+            // Codex resumes via a subcommand that accepts the interactive
+            // options after the positional id (`codex resume [OPTIONS]
+            // [SESSION_ID]`).
+            CLIAgent::Codex => Some(format!("codex resume {session_id}{flags}")),
+            CLIAgent::Gemini => Some(format!("gemini{flags} --resume {session_id}")),
+            CLIAgent::OpenCode => Some(format!("opencode{flags} --session {session_id}")),
+            // Amp's global options (`--dangerously-allow-all`, …) are accepted
+            // by the `threads continue` subcommand (verified: unknown options
+            // are a parse error, globals pass).
+            CLIAgent::Amp => Some(format!("amp threads continue {session_id}{flags}")),
+            CLIAgent::Cursor => Some(format!("cursor-agent{flags} --resume {session_id}")),
+            // Copilot CLI: `copilot --resume <sessionId>` (`-r` shorthand) —
+            // the one hooks-covered agent that was missing from this table.
+            CLIAgent::Copilot => Some(format!("copilot{flags} --resume {session_id}")),
             _ => None,
         }
+    }
+
+    /// The launch-flag tail of `argv` worth replaying on a resume command, or
+    /// `None` to resume bare. Deliberately conservative: anything ambiguous
+    /// falls back to no flags rather than a corrupted command line.
+    ///
+    /// - The tail is everything after the token that names this agent (the
+    ///   launcher itself, or the script path in an interpreter-wrapped argv);
+    ///   leading `VAR=value` env assignments are skipped first so they can't
+    ///   mis-anchor (`CLAUDE_CONFIG_DIR=/opt/claude claude …`). No naming
+    ///   token at all (custom wrapper rules) → no flags.
+    /// - Stale session-targeting flags (`--resume old-id`, `--continue`, a
+    ///   re-launched `codex resume <id>`) are stripped — the new id must win.
+    /// - Every surviving token must be a plain shell-safe word, the first must
+    ///   be a `-` flag, and no two bare words may run consecutively — a bare
+    ///   word is only acceptable as the value directly behind a flag; anything
+    ///   else is a positional prompt that must not re-submit itself into the
+    ///   resumed session. Any violation drops the whole tail.
+    fn replay_flags(self, argv: &[String]) -> Option<Vec<String>> {
+        let names_self = |token: &str| {
+            token.split(['/', '\\']).any(|seg| {
+                CLIAgent::match_token(&base_stem(seg).to_ascii_lowercase()) == Some(self)
+            })
+        };
+        let argv = &argv[argv.iter().take_while(|t| is_env_assignment(t)).count()..];
+        let named = argv.iter().position(|t| names_self(t))?;
+        let mut tail: Vec<&str> = argv[named + 1..].iter().map(String::as_str).collect();
+
+        // A relaunched `codex resume <old-id>`: drop the subcommand and its id
+        // so they don't replay as a positional prompt.
+        if self == CLIAgent::Codex && tail.first() == Some(&"resume") {
+            tail.remove(0);
+            if tail.first().is_some_and(|t| !t.starts_with('-')) {
+                tail.remove(0);
+            }
+        }
+
+        // Session-targeting flags whose old value must not survive; each is
+        // stripped together with one following non-flag value token (harmless
+        // for the value-less ones — anything trailing them is positional).
+        let stale: &[&str] = match self {
+            CLIAgent::Claude => &[
+                "--resume",
+                "-r",
+                "--continue",
+                "-c",
+                "--session-id",
+                "--from-pr",
+            ],
+            CLIAgent::Gemini | CLIAgent::Cursor => &["--resume", "-r"],
+            CLIAgent::Copilot => &["--resume", "-r", "--continue", "-c"],
+            CLIAgent::OpenCode => &["--session", "-s", "--continue", "-c"],
+            // `--last` targets "the most recent session" and would contradict
+            // the explicit id we inject.
+            CLIAgent::Codex => &["--last"],
+            _ => &[],
+        };
+        let mut i = 0;
+        while i < tail.len() {
+            let t = tail[i];
+            if stale.contains(&t)
+                || stale
+                    .iter()
+                    .any(|f| f.len() > 2 && t.starts_with(&format!("{f}=")))
+            {
+                tail.remove(i);
+                if i < tail.len() && !tail[i].starts_with('-') {
+                    tail.remove(i);
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        // The safety gate: plain tokens only, and a flag-shaped tail — every
+        // bare word must sit directly behind a `-` flag (its value slot); the
+        // first token being bare, or two bare words in a row, is a positional
+        // prompt and drops the whole tail. (A single bare word behind a
+        // boolean flag is indistinguishable from a flag value and slips
+        // through — the residual ambiguity of not knowing each flag's arity.)
+        let safe = |t: &str| {
+            !t.is_empty()
+                && t.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_=./,:@+~".contains(&b))
+        };
+        if !tail.iter().all(|t| safe(t)) {
+            return None;
+        }
+        let mut prev_was_flag = false;
+        for t in &tail {
+            let is_flag = t.starts_with('-');
+            if !is_flag && !prev_was_flag {
+                return None;
+            }
+            prev_was_flag = is_flag;
+        }
+        Some(tail.into_iter().map(String::from).collect())
     }
 
     /// Brand accent (0xRRGGBB) for the tab chip's agent dot. Chosen for legibility
@@ -479,6 +608,16 @@ pub struct AgentSessionState {
     /// key its own `--resume` flag takes — persisted for restore.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// The argv the agent was launched with, as the daemon observed it (the
+    /// foreground process-table poll on Unix, the shell integration's typed
+    /// `133;C` capture on Windows). Persisted alongside the session id so
+    /// restore can carry the user's launch flags
+    /// (`--dangerously-skip-permissions`, `--model …`) onto the resume
+    /// command — see [`CLIAgent::resume_command`]. Not touched by
+    /// [`apply_event`](Self::apply_event); the daemon stamps it from the
+    /// identity-detection side.
+    #[serde(default)]
+    pub launch_argv: Option<Vec<String>>,
     /// Whether this state came from the rich sentinel channel (hooks
     /// installed) rather than the opaque OSC 9/777 fallback. Rich state drives
     /// turn-level notifications; fallback state only paints the dot (the
@@ -1008,19 +1147,173 @@ mod tests {
     #[test]
     fn resume_commands_are_shell_safe() {
         assert_eq!(
-            CLIAgent::Claude.resume_command("abc-123").as_deref(),
+            CLIAgent::Claude.resume_command("abc-123", None).as_deref(),
             Some("claude --resume abc-123")
         );
         assert_eq!(
-            CLIAgent::Codex.resume_command("th_read.9").as_deref(),
+            CLIAgent::Codex.resume_command("th_read.9", None).as_deref(),
             Some("codex resume th_read.9")
         );
         // No resume flag known → None.
-        assert_eq!(CLIAgent::Aider.resume_command("abc"), None);
+        assert_eq!(CLIAgent::Aider.resume_command("abc", None), None);
         // An id carrying shell syntax is refused outright.
-        assert_eq!(CLIAgent::Claude.resume_command("abc; rm -rf /"), None);
-        assert_eq!(CLIAgent::Claude.resume_command("$(boom)"), None);
-        assert_eq!(CLIAgent::Claude.resume_command(""), None);
+        assert_eq!(CLIAgent::Claude.resume_command("abc; rm -rf /", None), None);
+        assert_eq!(CLIAgent::Claude.resume_command("$(boom)", None), None);
+        assert_eq!(CLIAgent::Claude.resume_command("", None), None);
+    }
+
+    #[test]
+    fn resume_carries_launch_flags() {
+        let argv = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // The headline case: the user's mode flags survive the restart.
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command(
+                    "abc-123",
+                    Some(&argv(&["claude", "--dangerously-skip-permissions"]))
+                )
+                .as_deref(),
+            Some("claude --dangerously-skip-permissions --resume abc-123")
+        );
+        // Value-taking flags ride along whole.
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command("abc", Some(&argv(&["claude", "--model", "opus"])))
+                .as_deref(),
+            Some("claude --model opus --resume abc")
+        );
+        // Interpreter-wrapped launch: flags start after the token naming the
+        // agent, and the table's launcher name is what replays.
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command(
+                    "abc",
+                    Some(&argv(&[
+                        "node",
+                        "/x/node_modules/@anthropic-ai/claude-code/cli.js",
+                        "--dangerously-skip-permissions",
+                    ]))
+                )
+                .as_deref(),
+            Some("claude --dangerously-skip-permissions --resume abc")
+        );
+        // A stale session-targeting flag is stripped — the new id must win.
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command(
+                    "new-id",
+                    Some(&argv(&["claude", "--resume", "old-id", "--model", "opus"]))
+                )
+                .as_deref(),
+            Some("claude --model opus --resume new-id")
+        );
+        // Codex resumes via its subcommand, flags after the positional id; a
+        // relaunched `codex resume <old>` sheds the old subcommand + id.
+        assert_eq!(
+            CLIAgent::Codex
+                .resume_command("id-1", Some(&argv(&["codex", "--yolo"])))
+                .as_deref(),
+            Some("codex resume id-1 --yolo")
+        );
+        assert_eq!(
+            CLIAgent::Codex
+                .resume_command("id-2", Some(&argv(&["codex", "resume", "id-1", "--yolo"])))
+                .as_deref(),
+            Some("codex resume id-2 --yolo")
+        );
+        // Anything shell-unsafe or positional-shaped drops the WHOLE tail —
+        // resume still works, just bare.
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command(
+                    "abc",
+                    Some(&argv(&["claude", "--allowedTools", "Bash(git:*)"]))
+                )
+                .as_deref(),
+            Some("claude --resume abc")
+        );
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command("abc", Some(&argv(&["claude", "fix-the-bug"])))
+                .as_deref(),
+            Some("claude --resume abc")
+        );
+        // A leading env assignment doesn't mis-anchor the flag tail.
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command(
+                    "abc",
+                    Some(&argv(&[
+                        "CLAUDE_CONFIG_DIR=/opt/claude",
+                        "claude",
+                        "--dangerously-skip-permissions",
+                    ]))
+                )
+                .as_deref(),
+            Some("claude --dangerously-skip-permissions --resume abc")
+        );
+        // Two consecutive bare words = a positional prompt, not a flag value —
+        // it must not re-submit itself into the resumed session.
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command(
+                    "abc",
+                    Some(&argv(&["claude", "--model", "opus", "review", "this"]))
+                )
+                .as_deref(),
+            Some("claude --resume abc")
+        );
+        // Codex `--last` targets "most recent" and would contradict the
+        // explicit id → stripped.
+        assert_eq!(
+            CLIAgent::Codex
+                .resume_command(
+                    "id-3",
+                    Some(&argv(&["codex", "resume", "--last", "--yolo"]))
+                )
+                .as_deref(),
+            Some("codex resume id-3 --yolo")
+        );
+        // No token names the agent (custom wrapper rule) → bare.
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command(
+                    "abc",
+                    Some(&argv(&["cc", "--dangerously-skip-permissions"]))
+                )
+                .as_deref(),
+            Some("claude --resume abc")
+        );
+        // Amp: global mode flags ride after the `threads continue` positional.
+        assert_eq!(
+            CLIAgent::Amp
+                .resume_command("t-1", Some(&argv(&["amp", "--dangerously-allow-all"])))
+                .as_deref(),
+            Some("amp threads continue t-1 --dangerously-allow-all")
+        );
+        // A relaunch via `amp threads continue …` is subcommand-shaped, not
+        // flag-shaped → bare (the gate rejects the leading bare word).
+        assert_eq!(
+            CLIAgent::Amp
+                .resume_command("t-2", Some(&argv(&["amp", "threads", "continue", "t-1"])))
+                .as_deref(),
+            Some("amp threads continue t-2")
+        );
+        // Copilot resumes by flag, stale session targeting stripped.
+        assert_eq!(
+            CLIAgent::Copilot
+                .resume_command(
+                    "s-9",
+                    Some(&argv(&["copilot", "--resume", "s-1", "--allow-all-tools"]))
+                )
+                .as_deref(),
+            Some("copilot --allow-all-tools --resume s-9")
+        );
+        assert_eq!(
+            CLIAgent::Copilot.resume_command("s-9", None).as_deref(),
+            Some("copilot --resume s-9")
+        );
     }
 
     #[test]

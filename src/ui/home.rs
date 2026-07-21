@@ -187,6 +187,7 @@ mod tests {
             ssh_spec: None,
             agent: None,
             agent_session_id: None,
+            agent_launch_argv: None,
         }
     }
 

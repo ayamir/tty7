@@ -54,6 +54,12 @@ pub enum SessionPane {
         agent: Option<crate::core::cli_agent::CLIAgent>,
         #[serde(default)]
         agent_session_id: Option<String>,
+        /// The argv the agent was launched with, as the daemon observed it —
+        /// lets the resume command carry the user's launch flags
+        /// (`--dangerously-skip-permissions`, …) instead of resuming bare.
+        /// `None` for old sessions or when nothing was captured.
+        #[serde(default)]
+        agent_launch_argv: Option<Vec<String>>,
     },
     /// A split of two subtrees along `axis`, with `a` taking `ratio` of space.
     Split {
@@ -192,6 +198,7 @@ mod tests {
                         ssh_spec: None,
                         agent: None,
                         agent_session_id: None,
+                        agent_launch_argv: None,
                     },
                 },
                 SessionTab {
@@ -206,6 +213,7 @@ mod tests {
                             ssh_spec: None,
                             agent: None,
                             agent_session_id: None,
+                            agent_launch_argv: None,
                         }),
                         b: Box::new(SessionPane::Leaf {
                             cwd: Some(PathBuf::from("/tmp")),
@@ -213,6 +221,7 @@ mod tests {
                             ssh_spec: None,
                             agent: None,
                             agent_session_id: None,
+                            agent_launch_argv: None,
                         }),
                     },
                 },
@@ -244,6 +253,10 @@ mod tests {
             ssh_spec: None,
             agent: Some(crate::core::cli_agent::CLIAgent::Claude),
             agent_session_id: Some("abc-123".into()),
+            agent_launch_argv: Some(vec![
+                "claude".into(),
+                "--dangerously-skip-permissions".into(),
+            ]),
         };
         let back: SessionPane =
             serde_json::from_str(&serde_json::to_string(&leaf).unwrap()).unwrap();
@@ -251,10 +264,20 @@ mod tests {
             SessionPane::Leaf {
                 agent,
                 agent_session_id,
+                agent_launch_argv,
                 ..
             } => {
                 assert_eq!(agent, Some(crate::core::cli_agent::CLIAgent::Claude));
                 assert_eq!(agent_session_id.as_deref(), Some("abc-123"));
+                assert_eq!(
+                    agent_launch_argv.as_deref(),
+                    Some(
+                        &[
+                            "claude".to_string(),
+                            "--dangerously-skip-permissions".to_string()
+                        ][..]
+                    )
+                );
             }
             _ => panic!("expected leaf"),
         }
@@ -266,6 +289,7 @@ mod tests {
             SessionPane::Leaf {
                 agent: None,
                 agent_session_id: None,
+                agent_launch_argv: None,
                 ..
             }
         ));
@@ -305,6 +329,7 @@ mod tests {
                     ssh_spec: None,
                     agent: None,
                     agent_session_id: None,
+                    agent_launch_argv: None,
                 },
             }],
         };
