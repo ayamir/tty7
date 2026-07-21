@@ -87,6 +87,14 @@ pub struct Config {
     /// Detect URLs (OSC 8 hyperlinks + bare URLs in the text), underline them on
     /// hover, and open them on ⌘/Ctrl-click. On by default.
     pub link_url: bool,
+    /// Optional command template run when ⌘/Ctrl-clicking a detected file-path
+    /// link, instead of tty7's built-in "open in the default app" behavior. The
+    /// template is tokenized on whitespace and the placeholders `{path}`,
+    /// `{line}`, and `{column}` are substituted per argument; an argument that
+    /// contains a placeholder with no value (e.g. `{line}` on a link that has no
+    /// line number) is dropped. `None` (the default) keeps the built-in open.
+    /// Example: `"herdr edit {path} --line {line}"`.
+    pub link_file_command: Option<String>,
     /// When a pane is in a detected SSH session, Command-clicking loopback URLs
     /// opens them through a temporary local SSH port-forward. Off by default
     /// because it starts background `ssh` processes.
@@ -475,6 +483,7 @@ impl Default for Config {
             // out: URL detection on, cursor blinking, 10k scrollback, new tabs
             // after the active one, notify only while unfocused.
             link_url: true,
+            link_file_command: None,
             ssh_loopback_forward: false,
             cursor_blink: true,
             scrollback_limit: 10_000,
@@ -589,6 +598,14 @@ impl Config {
             self.sidebar_width = default_sidebar_width();
         }
         self.sidebar_width = self.sidebar_width.clamp(100.0, 2000.0);
+        // An empty or whitespace-only file-open command means "no override"; the
+        // settings text field yields `""` when cleared, so fold it back to `None`
+        // rather than trying to run an empty command.
+        if let Some(command) = &self.link_file_command
+            && command.trim().is_empty()
+        {
+            self.link_file_command = None;
+        }
     }
 
     /// Write the current config back to disk, creating the parent directory if

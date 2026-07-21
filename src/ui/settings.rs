@@ -360,6 +360,9 @@ pub(crate) struct SettingsState {
     pub(crate) shell_args_input: Entity<InputState>,
     /// Custom working-directory path (used when the strategy is `Custom`).
     pub(crate) wd_path_input: Entity<InputState>,
+    /// Command template run when ⌘-clicking a file link (Links section). Empty
+    /// clears the override, restoring the built-in "open in default app".
+    pub(crate) link_file_command_input: Entity<InputState>,
     /// Mouse-scroll multiplier slider (Terminal section).
     pub(crate) scroll_slider: Entity<SliderState>,
     /// Global window-opacity slider (Appearance's Window section). Shows the
@@ -2794,6 +2797,10 @@ impl Tty7App {
             Some(s) => s.scroll_slider.clone(),
             None => return div().into_any_element(),
         };
+        let link_file_command_input = match self.active_settings() {
+            Some(s) => s.link_file_command_input.clone(),
+            None => return div().into_any_element(),
+        };
 
         let link_switch = Switch::new("term-link-url")
             .checked(link_url)
@@ -2802,6 +2809,10 @@ impl Tty7App {
         let ssh_loopback_switch = Switch::new("term-ssh-loopback-forward")
             .checked(ssh_loopback_forward)
             .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_ssh_loopback_forward(*on, cx)))
+            .into_any_element();
+        let link_file_command_control = div()
+            .w(px(300.))
+            .child(Input::new(&link_file_command_input).small())
             .into_any_element();
         let scrollback_radio = self.segmented(
             "term-scrollback",
@@ -2981,6 +2992,14 @@ impl Tty7App {
                 "Forward SSH loopback links",
                 "When a pane is in SSH, open localhost links through a temporary port forward.",
                 ssh_loopback_switch,
+                cx,
+            ))
+            .child(self.settings_row(
+                "Open files with",
+                "Command run when ⌘-clicking a file link, instead of the default app. \
+                 Use {path}, {line}, {column}; a flag whose value is absent is dropped \
+                 (e.g. herdr edit {path} --line={line}). Empty uses the default app.",
+                link_file_command_control,
                 cx,
             ))
             .child(self.section_rule(cx))
