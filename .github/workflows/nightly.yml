@@ -150,7 +150,7 @@ jobs:
       # Same glob list as release.yml's Release step: the bundle scripts leave
       # intermediates in dist/ (tty7.app, entitlements.plist, the Windows
       # staging dir) that must not reach the release assets.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: nightly-${{ matrix.os }}-${{ matrix.arch }}
           path: |
