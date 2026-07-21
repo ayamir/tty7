@@ -328,6 +328,18 @@ pub struct TerminalView {
     /// its result is dropped unless it still matches — so output from a session
     /// the user has since closed (or replaced) can never leak into a later menu.
     completion_generation: u64,
+    /// While equal to the terminal's current `prompt_cycle`, the local line
+    /// editor has handed this prompt's line over to the shell (Tab fell
+    /// through to shell-native completion — see
+    /// [`Self::handoff_tab_to_shell`]): the shell's own editor now holds the
+    /// text, so keys go raw to the PTY exactly as on a shell-vi-mode prompt.
+    /// Keyed to the entered-prompt *cycle*, not the raw report seq — a
+    /// same-prompt redraw (completion list, `reset-prompt`) re-emits the
+    /// PS1-embedded `133;B` and would bump the seq while zle still holds the
+    /// handed-off text; re-engaging there would fork the two line buffers.
+    /// Only a command actually running starts a new cycle and re-engages the
+    /// editor.
+    editor_handoff: Option<u64>,
     /// Active Ctrl+R history search, if any. While set, the editor shows a
     /// `(reverse-i-search)` prompt instead of the line and a menu of the ranked
     /// matches floats beside it: typing edits the query (fuzzy, blended with
@@ -1025,6 +1037,7 @@ impl TerminalView {
             pending_history: None,
             completion: None,
             completion_generation: 0,
+            editor_handoff: None,
             reverse_search: None,
             integration_notice: None,
             integration_notice_shown: false,
@@ -1431,7 +1444,7 @@ impl TerminalView {
         let kitty = self.kitty_flags();
         if let Some(bytes) = super::input::keystroke_to_bytes(ks, kitty) {
             let plain = !m.control && !m.alt && !m.platform;
-            let shell_vi_prompt = self.shell_vi_prompt();
+            let shell_owns_prompt = self.shell_owns_prompt();
             // A plain Backspace is reconstructable gap input: offer it to the
             // hold, so a fast command's typeahead never touches the PTY (see
             // `hold`). Anything else releases the hold first — FIFO order on
@@ -1439,7 +1452,7 @@ impl TerminalView {
             // for the deferred wipe.
             let held = plain
                 && ks.key == "backspace"
-                && !shell_vi_prompt
+                && !shell_owns_prompt
                 && self.gap_holdable()
                 && match self.hold.hold_backspace(&bytes) {
                     Verdict::Held(arm) => {
@@ -1453,7 +1466,7 @@ impl TerminalView {
             if !held {
                 self.release_hold();
                 self.terminal.write(bytes);
-                if !shell_vi_prompt {
+                if !shell_owns_prompt {
                     self.typeahead.observe(
                         RawInput::Key {
                             key: ks.key.as_str(),
@@ -2965,11 +2978,36 @@ impl TerminalView {
         if self.shell_vi_prompt() {
             return false;
         }
+        // A Tab handoff gave this prompt's line to the shell; until a command
+        // runs and a fresh prompt cycle starts, the shell's editor owns it,
+        // and re-engaging ours would fork the two line buffers.
+        if self.editor_handoff == Some(self.terminal.prompt_cycle()) {
+            return false;
+        }
         self.at_shell_prompt()
     }
 
     fn shell_vi_prompt(&self) -> bool {
         self.terminal.shell_vi_mode() && self.terminal.at_prompt() && !self.on_alt_screen()
+    }
+
+    /// True while a Tab handoff has given the current prompt's line to the
+    /// shell (see [`Self::handoff_tab_to_shell`]) and the shell is still in
+    /// that prompt cycle. Over once a command runs and the next prompt
+    /// arrives (a false→true `at_prompt` edge bumps the cycle).
+    fn handoff_active(&self) -> bool {
+        self.editor_handoff == Some(self.terminal.prompt_cycle())
+            && self.terminal.at_prompt()
+            && !self.on_alt_screen()
+    }
+
+    /// True while the shell's own line editor owns the prompt line — a
+    /// vi-mode prompt, or one whose line a Tab handoff shipped over. Raw
+    /// input then goes to the PTY with no hold and no typeahead record:
+    /// those bytes land on zle's line and are the shell's to keep, so a
+    /// deferred `^U` wipe would erase text the user can see.
+    fn shell_owns_prompt(&self) -> bool {
+        self.shell_vi_prompt() || self.handoff_active()
     }
 
     /// True while the emulator is on the alternate screen — a full-screen TUI
@@ -3021,7 +3059,7 @@ impl TerminalView {
     /// pane. Only consulted on the raw path, so "the editor is disengaged" is
     /// already implied.
     fn gap_holdable(&self) -> bool {
-        self.terminal.shell_active() && !self.on_alt_screen() && !self.shell_vi_prompt()
+        self.terminal.shell_active() && !self.on_alt_screen() && !self.shell_owns_prompt()
     }
 
     /// Write printable gap text (IME commit, paste) toward the shell: offered
@@ -3029,7 +3067,7 @@ impl TerminalView {
     /// written raw and recorded for the deferred wipe. `bytes` is the exact
     /// PTY encoding (paste may be bracketed-wrapped).
     fn write_gap_text(&mut self, text: &str, bytes: Vec<u8>, cx: &mut Context<Self>) {
-        if self.shell_vi_prompt() {
+        if self.shell_owns_prompt() {
             self.release_hold();
             self.terminal.write(bytes);
             return;
@@ -3364,6 +3402,47 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Hand the prompt line over to the shell so its native completion
+    /// (compsys, fzf-tab, …) answers the Tab tty7 has nothing for: ship the
+    /// locally edited text to the PTY (no newline), clear the editor, send
+    /// the Tab / Shift-Tab bytes, and suspend the local editor until the
+    /// shell's next report. From here the shell's own editor holds the text —
+    /// re-engaging ours mid-line would fork the two buffers (its Enter would
+    /// submit an empty local line on top of zle's populated one).
+    fn handoff_tab_to_shell(&mut self, shift: bool, cx: &mut Context<Self>) {
+        // Fold in any gap input still held, so the shipped line is what the
+        // user actually typed.
+        if let Some(net) = self.hold.engage() {
+            self.cmd.prepend_str(&net);
+        }
+        let line = self.cmd.text();
+        // An embedded newline would submit on the shell side (zle runs the
+        // line on `\r`), so a multi-line draft can't be handed over losslessly
+        // — keep it local and swallow the Tab as before.
+        if line.contains('\n') {
+            cx.notify();
+            return;
+        }
+        self.close_completion();
+        // A pending typeahead wipe's deferred `^U` would erase the very text
+        // we're about to ship; flush it first (FIFO keeps it ahead).
+        self.wipe_pending_typeahead();
+        // Chars right of the caret: after the shipped text lands, walk zle's
+        // cursor back over them so the shell completes the word the caret was
+        // on, not the line's tail.
+        let tail = line.chars().count().saturating_sub(self.cmd.cursor());
+        if !line.is_empty() {
+            self.terminal.write(line.into_bytes());
+            if tail > 0 {
+                self.terminal.write(b"\x1b[D".repeat(tail));
+            }
+        }
+        self.cmd.clear();
+        self.editor_handoff = Some(self.terminal.prompt_cycle());
+        let bytes = self.tab_bytes(shift);
+        self.send_to_pty(&bytes, cx);
+    }
+
     /// Tab completion over our own engine (command names in command
     /// position, filesystem paths elsewhere — history is deliberately absent:
     /// whole-line recall is ghost text's and Ctrl+R's job). A fresh Tab applies a
@@ -3373,6 +3452,17 @@ impl TerminalView {
     /// With the menu open, Tab fills any further common prefix, else moves the
     /// highlight (`forward` reverses for Shift-Tab).
     fn complete_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
+        // Ctrl+R search owns the keyboard: `self.cmd` still holds the stale
+        // pre-search line, so neither completing it nor shipping it to the
+        // shell makes sense here.
+        if self.reverse_search.is_some() {
+            return;
+        }
+        // tty7 completion switched off: every Tab goes to the shell.
+        if !cx.global::<Config>().tab_completion {
+            self.handoff_tab_to_shell(!forward, cx);
+            return;
+        }
         if self.completion.is_some() {
             self.completion_tab_step(forward, cx);
             return;
@@ -3390,6 +3480,9 @@ impl TerminalView {
         let line = self.cmd.text();
         let cursor = self.cmd.cursor();
         let Some(comp) = super::completion::complete(&line, cursor, cwd.as_deref()) else {
+            // Nothing to offer. Don't swallow the keypress (#136) — hand the
+            // line to the shell and let its completion have the Tab.
+            self.handoff_tab_to_shell(!forward, cx);
             return;
         };
 
@@ -4788,14 +4881,14 @@ impl Render for TerminalView {
         // that arms the flag arrives as pane output, so a render always
         // follows it (Output → Wakeup → notify). Both prepend: they were
         // typed before any post-engage keys already sitting in the editor.
-        if self.shell_vi_prompt() {
-            // A vi prompt never engages the editor: release held gap input to
-            // the shell's own line editor (raw, no typeahead record — there is
-            // no local adoption to reconcile against) and drop any pending
-            // record without its `^U`. Those bytes land on zle's line and are
-            // the shell's to keep; a record surviving the vi prompt would
-            // flush at the next emacs-mode prompt and resurrect long-consumed
-            // text into the editor.
+        if self.shell_owns_prompt() {
+            // A vi-mode (or handed-off) prompt never engages the editor:
+            // release held gap input to the shell's own line editor (raw, no
+            // typeahead record — there is no local adoption to reconcile
+            // against) and drop any pending record without its `^U`. Those
+            // bytes land on zle's line and are the shell's to keep; a record
+            // surviving this prompt would flush at the next editor-engaged
+            // prompt and resurrect long-consumed text into the editor.
             if let Some((_net, bytes)) = self.hold.release() {
                 self.terminal.write(bytes);
             }
@@ -6429,6 +6522,146 @@ mod gpui_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("an emacs-mode prompt should re-enable tty7's local editor");
+    }
+
+    /// Wait until the daemon-fed prompt state makes the local editor live.
+    fn wait_for_input_active(window: &gpui::WindowHandle<TerminalView>, cx: &mut TestAppContext) {
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let active = window.update(cx, |view, _, _| view.input_active()).unwrap();
+            if active {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the local editor never engaged at the prompt");
+    }
+
+    /// Tab the engine has nothing for must not be swallowed (#136): the
+    /// locally edited line is shipped to the shell followed by the Tab
+    /// itself, and the local editor stays out of the way until the shell
+    /// reports its next prompt — from there the shell's own completion owns
+    /// the line.
+    #[gpui::test]
+    fn tab_with_no_candidates_hands_the_line_to_the_shell(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: None,
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        wait_for_input_active(&window, cx);
+
+        window
+            .update(cx, |view, window, cx| {
+                // A command-position word matching no builtin or $PATH entry,
+                // so the completion engine returns `None`.
+                for ch in ["z", "z", "q", "q", "x"] {
+                    type_char(view, ch, window, cx);
+                }
+                assert_eq!(view.cmd.text(), "zzqqx");
+                view.complete_tab(true, cx);
+                assert_eq!(view.cmd.text(), "", "the line moved to the shell");
+                assert!(
+                    !view.input_active(),
+                    "the shell owns the prompt after the handoff"
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            next_input_until_timeout(&mut daemon),
+            Some(b"zzqqx".to_vec()),
+            "the edited line ships ahead of the Tab"
+        );
+        assert_eq!(
+            next_input_until_timeout(&mut daemon),
+            Some(b"\t".to_vec()),
+            "the Tab reaches the PTY instead of being swallowed"
+        );
+
+        // A same-prompt redraw (a prompt framework re-emitting the
+        // PS1-embedded `133;B` on reset-prompt / a completion list reprint)
+        // must NOT re-engage the editor — zle still holds the handed-off
+        // text, and an engaged-empty editor would fork the two buffers.
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: None,
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let applied = window
+                .update(cx, |view, _, _| view.terminal.prompt_seq() >= 2)
+                .unwrap();
+            if applied {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        window
+            .update(cx, |view, _, _| {
+                assert!(
+                    !view.input_active(),
+                    "a same-prompt redraw must not re-engage the editor"
+                );
+            })
+            .unwrap();
+
+        // A real command cycle — the shell leaves the prompt and comes back —
+        // re-engages the local editor.
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: false,
+            last_exit: None,
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: Some(0),
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        wait_for_input_active(&window, cx);
+    }
+
+    /// With `tab_completion` off, Tab never opens tty7's menu — even when the
+    /// engine would have candidates, the line and the Tab go to the shell.
+    #[gpui::test]
+    fn tab_completion_off_sends_every_tab_to_the_shell(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        cx.update(|cx| {
+            let mut cfg = cx.global::<Config>().clone();
+            cfg.tab_completion = false;
+            cx.set_global(cfg);
+        });
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: None,
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        wait_for_input_active(&window, cx);
+
+        window
+            .update(cx, |view, window, cx| {
+                // "cd " would offer path candidates were the engine consulted.
+                for ch in ["c", "d", " "] {
+                    type_char(view, ch, window, cx);
+                }
+                view.complete_tab(true, cx);
+                assert!(view.completion.is_none(), "no tty7 menu while opted out");
+                assert_eq!(view.cmd.text(), "");
+            })
+            .unwrap();
+        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"cd ".to_vec()));
+        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"\t".to_vec()));
     }
 
     #[gpui::test]

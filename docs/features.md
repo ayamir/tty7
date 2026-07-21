@@ -5,7 +5,7 @@
 ## Input
 
 - **Ghost suggestions** — your history completes the whole line as you type; <kbd>→</kbd> to accept
-- **Explained tab completion** — every flag and subcommand with its description, for ~100 common commands
+- **Explained tab completion** — every flag and subcommand with its description, for ~100 common commands; when tty7 has nothing to offer the Tab falls through to your shell's own completion, and the whole feature can be turned off (Settings → Terminal → Keyboard, or `tab_completion` in `config.json`)
 - **Syntax highlighting** — as you type, nothing to install
 - **Fuzzy history search** — <kbd>⌃ R</kbd> shows what you ran, where, and whether it failed
 - **History from day one** — your existing shell history works as-is and carries across sessions

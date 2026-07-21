@@ -153,6 +153,13 @@ pub struct Config {
     /// visual flash (the current behavior).
     #[serde(default, deserialize_with = "de_lenient")]
     pub bell: BellMode,
+    /// Tab at the prompt opens tty7's own completion menu (commands, paths,
+    /// per-command signatures). On by default. When off — or whenever the
+    /// engine has nothing to offer — the prompt line is handed to the shell
+    /// and Tab goes to the PTY, so the shell's native completion (compsys,
+    /// fzf-tab, …) answers instead.
+    #[serde(default = "default_true")]
+    pub tab_completion: bool,
 
     // ── Appearance ──────────────────────────────────────────────────────────
     /// The shape drawn for the terminal cursor.
@@ -503,6 +510,7 @@ impl Default for Config {
             // Visual flash preserves the pre-config behavior (the bell always
             // flashed); opting into None/Audible is a deliberate change.
             bell: BellMode::Visual,
+            tab_completion: true,
             cursor_style: CursorStyle::Block,
             // Input/mouse defaults preserve today's behavior: Option composes
             // characters as macOS ships it (opt into Option-as-Meta); GPUI
@@ -1109,6 +1117,7 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.restore_session);
         assert!(cfg.mouse_reporting);
+        assert!(cfg.tab_completion);
         assert_eq!(cfg.notify_threshold_secs, 10);
         assert_eq!(cfg.bell, BellMode::Visual);
 
@@ -1117,8 +1126,13 @@ mod tests {
         let cfg: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
         assert!(cfg.restore_session);
         assert!(cfg.mouse_reporting);
+        assert!(cfg.tab_completion);
         assert_eq!(cfg.notify_threshold_secs, 10);
         assert_eq!(cfg.bell, BellMode::Visual);
+
+        // The opt-out round-trips.
+        let cfg: Config = serde_json::from_str(r#"{"tab_completion": false}"#).unwrap();
+        assert!(!cfg.tab_completion);
 
         // Valid values round-trip; a bad bell string falls back without failing
         // the whole parse.

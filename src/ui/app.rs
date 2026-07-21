@@ -1996,6 +1996,10 @@ impl Tty7App {
         self.update_config(cx, |cfg| cfg.smart_select = on);
     }
 
+    pub(crate) fn set_tab_completion(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.tab_completion = on);
+    }
+
     pub(crate) fn set_startup_mode(
         &mut self,
         mode: crate::core::config::StartupMode,

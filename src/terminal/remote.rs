@@ -98,6 +98,14 @@ struct ShellState {
     /// back) from the stale pre-submit state — even when 1 Hz polling misses
     /// the intermediate not-at-prompt window of a fast command.
     seq: u64,
+    /// Monotonic count of *entered-prompt edges*: bumped only when a report
+    /// flips `at_prompt` false → true. Unlike `seq` it ignores same-prompt
+    /// redraws — prompt frameworks re-emit the PS1-embedded `133;B` on every
+    /// `reset-prompt` / completion-list reprint, and each re-emission is
+    /// another `Prompt` frame. The Tab handoff keys its release off this
+    /// (see `TerminalView::editor_handoff`): only a command actually running
+    /// (`133;C` → not-at-prompt) starts a new cycle.
+    cycle: u64,
 }
 
 /// The shared handles the reader thread writes into as daemon frames arrive;
@@ -636,6 +644,8 @@ impl RemoteTerminal {
                                         at_prompt,
                                         last_exit,
                                         seq: guard.seq + 1,
+                                        cycle: guard.cycle
+                                            + u64::from(at_prompt && !guard.at_prompt),
                                     };
                                 }
                                 // The shell just reported a fresh prompt, so at
@@ -908,6 +918,13 @@ impl RemoteTerminal {
     /// tells whether the shell has reported back since.
     pub fn prompt_seq(&self) -> u64 {
         self.shell_state.lock().map(|s| s.seq).unwrap_or(0)
+    }
+
+    /// Monotonic count of entered-prompt edges — see [`ShellState::cycle`].
+    /// Stable across same-prompt redraws (which bump `seq` but not this);
+    /// only leaving the prompt for a command and coming back advances it.
+    pub fn prompt_cycle(&self) -> u64 {
+        self.shell_state.lock().map(|s| s.cycle).unwrap_or(0)
     }
 
     /// Exit code of the most recently completed foreground command, as sniffed
