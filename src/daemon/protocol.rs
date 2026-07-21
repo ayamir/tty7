@@ -1575,6 +1575,10 @@ mod tests {
                 status: crate::core::cli_agent::AgentStatus::Waiting,
                 message: Some("Claude needs your permission to use Bash".into()),
                 session_id: Some("abc-123".into()),
+                launch_argv: Some(vec![
+                    "claude".into(),
+                    "--dangerously-skip-permissions".into(),
+                ]),
                 rich: true,
                 cwd: Some("/repo/.claude/worktrees/fix-x".into()),
             })),

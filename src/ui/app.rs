@@ -4572,9 +4572,12 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
                 ssh_spec: view.ssh_spec(),
                 // The running agent + its native session id (when its hooks
                 // reported one), so a pane the daemon loses can resume the
-                // agent conversation instead of just reopening a shell.
+                // agent conversation instead of just reopening a shell. The
+                // observed launch argv rides along so the resume command keeps
+                // the user's flags (`--dangerously-skip-permissions`, …).
                 agent: view.agent(),
                 agent_session_id: view.agent_session().and_then(|s| s.session_id),
+                agent_launch_argv: view.agent_session().and_then(|s| s.launch_argv),
             }
         }
         Pane::Split {
@@ -4596,6 +4599,7 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
             ssh_spec: None,
             agent: None,
             agent_session_id: None,
+            agent_launch_argv: None,
         },
     }
 }
@@ -4665,6 +4669,7 @@ fn session_to_pane(
             ssh_spec,
             agent,
             agent_session_id,
+            agent_launch_argv,
         } => {
             // Only restore the pane id when the daemon confirms it's still live;
             // a stale id (daemon restarted, pane killed) falls back to a spawn.
@@ -4696,7 +4701,7 @@ fn session_to_pane(
             if restore.is_none()
                 && cx.global::<Config>().restore_agent_sessions
                 && let (Some(agent), Some(id)) = (agent, agent_session_id)
-                && let Some(cmd) = agent.resume_command(id)
+                && let Some(cmd) = agent.resume_command(id, agent_launch_argv.as_deref())
             {
                 view.read(cx).run_command_line(&cmd);
             }

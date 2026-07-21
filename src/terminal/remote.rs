@@ -2340,6 +2340,7 @@ mod tests {
             status: AgentStatus::Waiting,
             message: Some("Claude needs your permission".into()),
             session_id: Some("sid-1".into()),
+            launch_argv: None,
             rich: true,
             cwd: None,
         }))

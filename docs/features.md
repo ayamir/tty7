@@ -34,7 +34,7 @@ it never wraps or replaces the agent.
 - **Status dot** — working (blue) / needs your input (amber) / done (green), driven by agent-reported events over an OSC channel; run *Agent: Install Claude Code Hooks* from the palette to wire Claude Code up
 - **Notifications** — "needs your permission…" the moment an agent blocks on you, and "finished after Ns" per turn, honoring your notification policy
 - **Branch at a glance** — each sidebar row shows its pane's git branch and working-tree diff (`+N −M`), refreshed on `cd` and when a command finishes
-- **Session resume** — panes lost to a reboot re-launch their agent conversation (`claude --resume …`) on restore (`restore_agent_sessions`, on by default)
+- **Session resume** — panes lost to a reboot re-launch their agent conversation on restore, carrying the original launch flags (`claude --dangerously-skip-permissions --resume …`) (`restore_agent_sessions`, on by default)
 - **Context feed** — palette commands send the current selection or the repo's `git diff` to the running agent as a ready-made prompt
 - **Tray icon** — a system tray / menu bar item that flips to an attention state the moment any agent needs your input; its menu lists every agent pane (brand avatar + status dot, click to reveal), switches the notification policy, and offers *Quit and Stop Daemon* alongside the plain session-keeping quit (`show_tray_icon`, on by default)
 

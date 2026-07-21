@@ -468,6 +468,11 @@ struct PaneState {
     /// the foreground `argv` (same process-table poll as `remote`). `None` when
     /// no known agent runs — see [`crate::core::cli_agent`].
     agent: Option<crate::core::cli_agent::CLIAgent>,
+    /// The argv the detected agent was launched with, held here until a rich
+    /// session exists to stamp it into (the sentinel events that create the
+    /// session can land before the first argv poll, and vice versa). Cleared
+    /// with the chip. See [`stamp_launch_argv`].
+    agent_argv: Option<Vec<String>>,
     /// The rich agent-session status (idle/working/waiting/done + native
     /// session id), folded from the sentinel OSC events the agent's hooks emit
     /// (with an opaque OSC 9/777 fallback). Cleared when the agent exits.
@@ -503,8 +508,9 @@ struct ForegroundProbes {
     /// process group) — "no opinion", never applied, so it can't wipe an agent
     /// identified another way (sentinel events, the Windows `133;C;<cmd>`
     /// mark). `Some(answer)` is a real poll result; its inner `None` ("polled,
-    /// no agent") clears the chip.
-    agent: Box<dyn Fn() -> Option<Option<crate::core::cli_agent::CLIAgent>> + Send>,
+    /// no agent") clears the chip. A detected agent travels with the `argv` it
+    /// was identified from, kept for flag carry-over on session resume.
+    agent: Box<dyn Fn() -> Option<Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>> + Send>,
 }
 
 /// The local-PTY backend: the same handles `DaemonPane` has always owned.
@@ -669,6 +675,7 @@ impl DaemonPane {
             remote: spawn.remote.clone(),
             agent: None,
             agent_session: None,
+            agent_argv: None,
             alive: true,
         }));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -777,6 +784,7 @@ impl DaemonPane {
             // agent detection never runs for it.
             agent: None,
             agent_session: None,
+            agent_argv: None,
             alive: true,
         }));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -1736,7 +1744,8 @@ fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
         if shell_mark_capture_changed(&st.shell, &shell) {
             apply_agent(
                 st,
-                agent_from_shell_mark(&shell, crate::core::config::agent_commands_cached()),
+                agent_from_shell_mark(&shell, crate::core::config::agent_commands_cached())
+                    .map(|agent| (agent, Vec::new())),
             );
         }
         st.shell = shell.clone();
@@ -1774,6 +1783,12 @@ fn agent_from_shell_mark(
     shell: &ShellState,
     custom: &std::collections::HashMap<String, String>,
 ) -> Option<crate::core::cli_agent::CLIAgent> {
+    // Identity only — deliberately NOT a launch-argv source for resume flag
+    // carry-over. The `133;C` capture is terminal *output* (any program can
+    // print the OSC and forge it), and forged flags would ride an
+    // auto-executed resume command on the next restore; the Unix argv comes
+    // from the process table and has no such problem. Windows sessions
+    // therefore resume bare.
     shell
         .command
         .as_deref()
@@ -1827,6 +1842,16 @@ fn apply_agent_signals(
         sess.message = Some(body);
     }
 
+    // A session the events just created starts without the launch argv the
+    // identity poll captured — seed it so resume gets the flags no matter
+    // which side observed the pane first. Updates keep flowing through
+    // [`stamp_launch_argv`].
+    if let (Some(sess), Some(argv)) = (&mut st.agent_session, &st.agent_argv)
+        && sess.launch_argv.is_none()
+    {
+        sess.launch_argv = Some(argv.clone());
+    }
+
     if st.agent_session != before
         && let Some(sub) = &st.subscriber
     {
@@ -1854,8 +1879,19 @@ fn apply_remote_context(st: &mut PaneState, remote: Option<RemoteContext>) {
     st.remote = remote;
 }
 
-fn apply_agent(st: &mut PaneState, agent: Option<crate::core::cli_agent::CLIAgent>) {
+fn apply_agent(
+    st: &mut PaneState,
+    detected: Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>,
+) {
+    let (agent, argv) = match detected {
+        Some((agent, argv)) => (Some(agent), Some(argv)),
+        None => (None, None),
+    };
     if st.agent == agent {
+        // Same chip, but the observed argv can still be news: the sentinel
+        // events may have branded the pane before the first argv poll, or the
+        // user relaunched the agent with different flags.
+        stamp_launch_argv(st, argv);
         return;
     }
     // The agent leaving the foreground ends its session: clear the rich state
@@ -1868,10 +1904,38 @@ fn apply_agent(st: &mut PaneState, agent: Option<crate::core::cli_agent::CLIAgen
             let _ = sub.send(DaemonMsg::AgentStatus(None));
         }
     }
+    if agent.is_none() {
+        st.agent_argv = None;
+    }
     if let Some(sub) = &st.subscriber {
         let _ = sub.send(DaemonMsg::Agent(agent));
     }
     st.agent = agent;
+    stamp_launch_argv(st, argv);
+}
+
+/// Record the detected agent's launch argv and mirror it into the rich session
+/// state (pushing the change to the client) when one exists — resume-after-
+/// restart reads it from there. `None` (a poll that saw no argv) and an empty
+/// argv (Windows mark detection, identity without a trustworthy argv) never
+/// wipe a captured value; the chip clearing in [`apply_agent`] does that.
+fn stamp_launch_argv(st: &mut PaneState, argv: Option<Vec<String>>) {
+    let Some(argv) = argv else { return };
+    if argv.is_empty() {
+        return;
+    }
+    if st.agent_argv.as_ref() == Some(&argv) {
+        return;
+    }
+    st.agent_argv = Some(argv.clone());
+    if let Some(sess) = &mut st.agent_session
+        && sess.launch_argv.as_ref() != Some(&argv)
+    {
+        sess.launch_argv = Some(argv);
+        if let Some(sub) = &st.subscriber {
+            let _ = sub.send(DaemonMsg::AgentStatus(st.agent_session.clone()));
+        }
+    }
 }
 
 /// Whether a foreground command — not the shell itself — currently owns the
@@ -1938,14 +2002,16 @@ fn foreground_remote_context(_master: &Mutex<Box<dyn MasterPty + Send>>) -> Opti
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn foreground_agent(
     master: &Mutex<Box<dyn MasterPty + Send>>,
-) -> Option<Option<crate::core::cli_agent::CLIAgent>> {
+) -> Option<Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>> {
     let detect = || {
         let pid = master.lock().ok().and_then(|m| m.process_group_leader())?;
         let argv = crate::daemon::remote::foreground_argv(pid)?;
-        crate::core::cli_agent::CLIAgent::detect_from_argv_with(
+        let agent = crate::core::cli_agent::CLIAgent::detect_from_argv_with(
             &argv,
             crate::core::config::agent_commands_cached(),
-        )
+        )?;
+        // The argv rides along: resume-after-restart replays its flags.
+        Some((agent, argv))
     };
     Some(detect())
 }
@@ -1957,7 +2023,7 @@ fn foreground_agent(
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn foreground_agent(
     _master: &Mutex<Box<dyn MasterPty + Send>>,
-) -> Option<Option<crate::core::cli_agent::CLIAgent>> {
+) -> Option<Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>> {
     None
 }
 
@@ -2305,10 +2371,16 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
 
+        let (agent, argv) = detected.expect("agent detected from live PTY child");
         assert_eq!(
-            detected,
-            Some(crate::core::cli_agent::CLIAgent::Codex),
+            agent,
+            crate::core::cli_agent::CLIAgent::Codex,
             "a live PTY child with argv[0]=codex must be detected as Codex"
+        );
+        assert_eq!(
+            argv.first().map(String::as_str),
+            Some("codex"),
+            "the observed argv rides along with the detection"
         );
     }
 
@@ -3150,6 +3222,7 @@ mod tests {
             remote: None,
             agent: None,
             agent_session: None,
+            agent_argv: None,
             alive,
         }
     }
@@ -3246,6 +3319,7 @@ mod tests {
             status: AgentStatus::Working,
             message: None,
             session_id: Some("sid".into()),
+            launch_argv: None,
             rich: true,
             cwd: None,
         });
