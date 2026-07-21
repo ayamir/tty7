@@ -27,9 +27,9 @@ const GLYPH_SVG: &[u8] = include_bytes!("../../../assets/tray.svg");
 #[cfg(not(target_os = "macos"))]
 const GLYPH_SVG: &[u8] = include_bytes!("../../../assets/app-icon.svg");
 
-/// Physical pixel size. macOS forces the NSImage to 18 pt in the status bar
-/// regardless of pixel size (see tray-icon's macOS backend), so 36 px renders
-/// crisp on retina. Windows tray slots are 16–32 px; 32 downsamples cleanly.
+/// Physical pixel size. On macOS the bitmap is 36 px (retina-crisp at 18 pt);
+/// native.rs then overrides the NSImage to 22 pt so the glyph fills the menu
+/// bar. Windows tray slots are 16–32 px; 32 downsamples cleanly.
 #[cfg(target_os = "macos")]
 const SIZE: u32 = 36;
 #[cfg(not(target_os = "macos"))]
