@@ -62,6 +62,24 @@ impl Backend {
                 return None;
             }
         };
+
+        // tray-icon hardcodes the NSImage height to 18 pt; override to a
+        // larger size so the glyph fills more of the menu bar. The bitmap
+        // itself is already rendered at `icon::SIZE` px (retina-ready).
+        #[cfg(target_os = "macos")]
+        if let Some(status_item) = tray.ns_status_item() {
+            if let Some(mtm) = objc2::MainThreadMarker::new() {
+                if let Some(button) = status_item.button(mtm) {
+                    if let Some(nsimage) = button.image() {
+                        // 22 pt matches the macOS menu bar height; the glyph
+                        // scales proportionally from its 96×96 viewBox.
+                        let target_h: f64 = 22.0;
+                        let aspect = nsimage.size().width / nsimage.size().height;
+                        nsimage.setSize(objc2_foundation::NSSize::new(target_h * aspect, target_h));
+                    }
+                }
+            }
+        }
         Some(Self {
             tray,
             #[cfg(not(target_os = "macos"))]

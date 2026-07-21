@@ -184,13 +184,13 @@ impl CLIAgent {
     }
 
     /// Brand accent (0xRRGGBB) for the tab chip's agent dot. Chosen for legibility
-    /// on both light and dark themes rather than exact brand black/white — a pure
-    /// black or white dot vanishes against one theme, so vendors whose mark is
-    /// monochrome (Codex/OpenAI, Cursor) get a recognizable mid-tone hue instead.
+    /// on both light and dark themes rather than exact brand black/white. A pure
+    /// black or white dot vanishes against one theme, so monochrome vendors get
+    /// a recognizable mid-tone hue instead; Codex keeps its black field.
     pub fn accent_rgb(self) -> u32 {
         match self {
             CLIAgent::Claude => 0xD97757,      // Claude terracotta
-            CLIAgent::Codex => 0x10A37F,       // OpenAI green (black mark reads as this)
+            CLIAgent::Codex => 0x000000,       // Codex black field
             CLIAgent::Gemini => 0x4285F4,      // Google blue
             CLIAgent::Aider => 0x14B8A6,       // teal
             CLIAgent::Amp => 0xF34E3F,         // Amp red
@@ -761,6 +761,11 @@ mod tests {
             assert!(a.accent_rgb() <= 0xFFFFFF);
             assert_eq!(CLIAgent::from_slug(a.slug()), Some(a));
         }
+    }
+
+    #[test]
+    fn codex_avatar_uses_its_black_brand_field() {
+        assert_eq!(CLIAgent::Codex.accent_rgb(), 0x000000);
     }
 
     #[test]
