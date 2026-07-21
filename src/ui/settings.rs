@@ -2772,6 +2772,7 @@ impl Tty7App {
         let copy_on_select = cfg.copy_on_select;
         let mouse_reporting = cfg.mouse_reporting;
         let smart_select = cfg.smart_select;
+        let tab_completion = cfg.tab_completion;
         let bell = cfg.bell;
         // Map the persisted threshold onto its preset radio index (nearest slot
         // for any off-preset value a hand-edit might leave).
@@ -2868,6 +2869,10 @@ impl Tty7App {
         let smart_select_switch = Switch::new("term-smart-select")
             .checked(smart_select)
             .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_smart_select(*on, cx)))
+            .into_any_element();
+        let tab_completion_switch = Switch::new("term-tab-completion")
+            .checked(tab_completion)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_tab_completion(*on, cx)))
             .into_any_element();
         let bell_idx = match bell {
             BellMode::None => 0,
@@ -2975,11 +2980,16 @@ impl Tty7App {
                 smart_select_switch,
                 cx,
             ))
-            .when_some(option_alt_row, |v, row| {
-                v.child(self.section_rule(cx))
-                    .child(self.section_header("Keyboard", cx))
-                    .child(row)
-            })
+            .child(self.section_rule(cx))
+            .child(self.section_header("Keyboard", cx))
+            .child(self.settings_row(
+                "Tab completion",
+                "Tab at the prompt opens tty7's completion menu. When off, Tab goes to the \
+                 shell's own completion instead.",
+                tab_completion_switch,
+                cx,
+            ))
+            .when_some(option_alt_row, |v, row| v.child(row))
             .child(self.section_rule(cx))
             .child(self.section_header("Links", cx))
             .child(self.settings_row(

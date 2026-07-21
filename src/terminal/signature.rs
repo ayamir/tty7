@@ -125,6 +125,13 @@ impl Arg {
             .iter()
             .any(|t| t == "filepaths" || t == "folders")
     }
+
+    /// Whether this arg's filesystem completion is directories only — a Fig
+    /// `folders` template with no `filepaths` alongside it.
+    pub fn wants_dirs_only(&self) -> bool {
+        self.template.iter().any(|t| t == "folders")
+            && !self.template.iter().any(|t| t == "filepaths")
+    }
 }
 
 /// A static value suggestion for an argument.

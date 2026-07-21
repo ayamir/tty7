@@ -118,6 +118,30 @@ const BUILTINS: &[&str] = &[
 /// (or `$PATH` entries) can't blow up the UI or the cycle.
 const MAX_CANDIDATES: usize = 400;
 
+/// Commands whose arguments are directories, never files. They have no Fig
+/// signature (shell builtins), so the generic path fallback handles them —
+/// which must not offer files (`cd tar` completing to `tar.exe` is never
+/// right).
+const DIR_ONLY_COMMANDS: &[&str] = &["cd", "pushd", "popd", "rmdir"];
+
+/// The command name the cursor's word is an argument of: the first token of
+/// the current simple command (after the last shell separator), reduced to its
+/// basename so `/bin/rmdir` matches like `rmdir`. `None` when there is no
+/// command token before the word.
+fn current_command(chars: &[char], word_start: usize) -> Option<String> {
+    let prefix: String = chars[..word_start].iter().collect();
+    let seg_start = prefix
+        .rfind(['|', '&', ';', '\n', '('])
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let cmd = prefix[seg_start..].split_whitespace().next()?;
+    let base = cmd
+        .rfind(std::path::is_separator)
+        .map(|i| &cmd[i + 1..])
+        .unwrap_or(cmd);
+    (!base.is_empty()).then(|| base.to_string())
+}
+
 /// Compute completions for `line` at char position `cursor`, resolving relative
 /// paths against `cwd`: command names in command position, filesystem paths
 /// elsewhere. Returns `None` when there's nothing to offer.
@@ -155,7 +179,13 @@ pub fn complete(line: &str, cursor: usize, cwd: Option<&Path>) -> Option<Complet
             None => (Vec::new(), Vec::new()),
             Some(cwd) => match complete_signature(&chars, word_start, &word, cwd) {
                 Some(sig) => (sig.cands, sig.pending),
-                None => (complete_path(&word, cwd), Vec::new()),
+                None => {
+                    // No signature: generic paths, narrowed to directories when
+                    // the command only takes those (`cd`, `pushd`, …).
+                    let dirs_only = current_command(&chars, word_start)
+                        .is_some_and(|c| DIR_ONLY_COMMANDS.contains(&c.as_str()));
+                    (complete_path(&word, cwd, dirs_only), Vec::new())
+                }
             },
         }
     };
@@ -246,7 +276,9 @@ fn sort_candidates_by_closeness(cands: &mut [Candidate]) {
 /// Filesystem path completion. Splits `word` into the directory part (kept
 /// verbatim in each candidate so the typed path prefix is preserved) and the
 /// final-segment prefix to match in that directory. Ordered by closeness.
-fn complete_path(word: &str, cwd: &Path) -> Vec<WordCand> {
+/// `dirs_only` drops file entries — for commands / argument slots that only
+/// accept directories.
+fn complete_path(word: &str, cwd: &Path, dirs_only: bool) -> Vec<WordCand> {
     // Split on the last path separator. `is_separator` is `/` on Unix and both
     // `/` and `\` on Windows, so a `C:\Users\me\f`-style word splits correctly
     // under the (future) Windows line editor; separators are ASCII so the byte
@@ -270,7 +302,15 @@ fn complete_path(word: &str, cwd: &Path) -> Vec<WordCand> {
         if !name.starts_with(prefix) {
             continue;
         }
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // Follow symlinks when classifying: a symlink to a directory must count
+        // as one (it both takes the trailing `/` and survives a dirs-only
+        // filter — `cd` into a linked dir is routine).
+        let is_dir = entry
+            .file_type()
+            .is_ok_and(|t| t.is_dir() || (t.is_symlink() && entry.path().is_dir()));
+        if dirs_only && !is_dir {
+            continue;
+        }
         let kind = if is_dir {
             CandidateKind::Dir
         } else {
@@ -359,7 +399,7 @@ fn complete_signature(
         let mut out = Vec::new();
         push_arg_suggestions(&mut out, arg, word);
         if arg.wants_paths() {
-            out.extend(complete_path(word, cwd));
+            out.extend(complete_path(word, cwd, arg.wants_dirs_only()));
         }
         let pending = collect_generators(arg);
         // A slot that declares suggestions or generators owns the position even
@@ -396,7 +436,7 @@ fn complete_signature(
     if let Some(arg) = node.args().first() {
         push_arg_suggestions(&mut out, arg, word);
         if arg.wants_paths() {
-            out.extend(complete_path(word, cwd));
+            out.extend(complete_path(word, cwd, arg.wants_dirs_only()));
         }
         pending = collect_generators(arg);
         // Suggestions/generators mean this positional owns the slot: don't cede
@@ -833,6 +873,29 @@ mod tests {
         s.merge(vec![cand("bugfix", CandidateKind::Value, 0, 1)], "b");
         // The highlighted candidate survives the merge/re-sort and keeps focus.
         assert_eq!(s.selected().unwrap().text, "branch-b");
+    }
+
+    #[test]
+    fn dir_only_commands_complete_only_directories() {
+        // `cd tar` must offer `target/`, never `tar.gz` (#136) — same for the
+        // other dir-only builtins, and for absolute spellings by basename.
+        let dir = temp_tree("dironly", &[("target", true), ("tar.gz", false)]);
+        let only_dirs = |line: &str| {
+            complete(line, line.chars().count(), Some(dir.as_path()))
+                .map(|c| c.candidates.into_iter().map(|c| c.text).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        assert_eq!(only_dirs("cd tar"), vec!["target"]);
+        assert_eq!(only_dirs("pushd tar"), vec!["target"]);
+        assert_eq!(only_dirs("/bin/rmdir tar"), vec!["target"]);
+        // Only the current simple command counts: `cd` after a pipe governs.
+        assert_eq!(only_dirs("foo | cd tar"), vec!["target"]);
+        // A bare argument slot narrows too.
+        assert_eq!(only_dirs("cd "), vec!["target"]);
+        // A generic command keeps offering files alongside directories.
+        let both = only_dirs("frobnicate tar");
+        assert!(both.contains(&"tar.gz".to_string()), "{both:?}");
+        assert!(both.contains(&"target".to_string()), "{both:?}");
     }
 
     #[test]
