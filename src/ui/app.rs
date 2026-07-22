@@ -698,11 +698,20 @@ impl Tty7App {
                 return true;
             }
             // From the home page (zero tabs) there are no running sessions to
-            // reassure about — prompting would be pure friction. Close directly.
+            // reassure about — prompting would be pure friction. Close directly,
+            // but still quit with the window: closing our only window without
+            // quitting leaves a windowless process sitting in the Dock that no
+            // longer responds to being clicked (#147). Deferred onto the next
+            // tick so the close itself completes first, same as the confirmed
+            // path below.
             if weak_app
                 .upgrade()
                 .is_some_and(|app| app.read(cx).tabs.is_empty())
             {
+                cx.spawn(async move |cx| {
+                    let _ = cx.update(|cx| cx.quit());
+                })
+                .detach();
                 return true;
             }
             let answer = window.prompt(
