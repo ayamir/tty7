@@ -20,6 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// A repo's git snapshot: the branch it's on and how much the working tree has
 /// changed against `HEAD`. `added`/`removed` sum the per-file line counts from
@@ -62,39 +63,46 @@ pub fn probe(cwd: &Path) -> Option<RepoSnapshot> {
     if !cwd.exists() {
         return None;
     }
-    // Doubles as the "is this a git repo" gate: fails outside a work tree.
-    let root = git(cwd, &["rev-parse", "--show-toplevel"])?;
-    let root = PathBuf::from(root.trim_end_matches(['\n', '\r']));
+    // One `rev-parse` answers every path question at once: the work-tree root
+    // (which doubles as the "is this a git repo" gate — it fails outside a
+    // work tree) plus the git-dir/common-dir pair that tells a linked worktree
+    // from a main checkout. Asking separately cost two process spawns per
+    // probe, which mattered once probes stopped being rare: they now also fire
+    // on window activation and on an agent's tool calls, across every pane.
+    let paths = git(
+        cwd,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    )?;
+    let mut lines = paths.lines().map(|l| l.trim_end_matches(['\n', '\r']));
+    let root = PathBuf::from(lines.next()?);
+    // A git old enough to reject `--path-format` fails the whole invocation
+    // above, so reaching here means the two dirs are present — but degrade to
+    // "main checkout" rather than trusting that, same as the old code did.
+    let home = repo_home(&root, lines.next(), lines.next());
     let branch = branch_name(cwd)?;
     Some(RepoSnapshot {
-        home: repo_home(cwd, &root),
+        home,
         root,
         branch,
         counts: diff_numstat(cwd),
     })
 }
 
-/// The repository "home" every checkout of one repo shares: for a linked
-/// worktree (its git dir differs from the common git dir) the main work
-/// tree's root — the parent of `<main>/.git`; for the main checkout itself,
-/// a submodule, or any failure to tell, the work-tree root unchanged. A bare
-/// common dir (no trailing `.git` component, the bare-repo-plus-worktrees
-/// layout) anchors on the bare directory itself — still one shared key.
-fn repo_home(cwd: &Path, root: &Path) -> PathBuf {
-    let both = git(
-        cwd,
-        &[
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-dir",
-            "--git-common-dir",
-        ],
-    );
-    let Some(both) = both else {
-        return root.to_path_buf();
-    };
-    let mut lines = both.lines();
-    let (Some(git_dir), Some(common)) = (lines.next(), lines.next()) else {
+/// The repository "home" every checkout of one repo shares, from the work-tree
+/// `root` and the `--git-dir` / `--git-common-dir` pair: for a linked worktree
+/// (its git dir differs from the common git dir) the main work tree's root —
+/// the parent of `<main>/.git`; for the main checkout itself, a submodule, or
+/// any failure to tell, the work-tree root unchanged. A bare common dir (no
+/// trailing `.git` component, the bare-repo-plus-worktrees layout) anchors on
+/// the bare directory itself — still one shared key.
+fn repo_home(root: &Path, git_dir: Option<&str>, common_dir: Option<&str>) -> PathBuf {
+    let (Some(git_dir), Some(common)) = (git_dir, common_dir) else {
         return root.to_path_buf();
     };
     if git_dir == common {
@@ -133,6 +141,9 @@ pub struct GitStatusCache {
     /// In-flight cwds re-triggered meanwhile — reprobed once their flight
     /// lands, so the newest trigger's state is never skipped.
     dirty: HashSet<PathBuf>,
+    /// When each cwd's last probe *landed*, for the throttle that opportunistic
+    /// triggers go through ([`begin_probe_throttled`](Self::begin_probe_throttled)).
+    last_probe: HashMap<PathBuf, Instant>,
 }
 
 impl gpui::Global for GitStatusCache {}
@@ -177,12 +188,39 @@ impl GitStatusCache {
         }
     }
 
+    /// Claim an *opportunistic* probe for `cwd`: one triggered by a cheap,
+    /// frequent signal — the window regaining focus, an agent finishing a tool
+    /// call — rather than by a rare edge like a command ending.
+    ///
+    /// Unlike [`begin_probe`](Self::begin_probe) this declines instead of
+    /// queueing: a probe already in flight, or one that landed less than
+    /// `min_interval` ago, drops the trigger entirely (no dirty mark, no
+    /// rerun). That's the whole point of the two entry points — the rare edges
+    /// must never be missed, while these signals repeat on their own, so a
+    /// count that's a second stale beats a `git` storm across every pane of a
+    /// repo the moment the user alt-tabs back.
+    pub fn begin_probe_throttled(&mut self, cwd: &Path, min_interval: Duration) -> bool {
+        if self.in_flight.contains(cwd) {
+            return false;
+        }
+        if self
+            .last_probe
+            .get(cwd)
+            .is_some_and(|at| at.elapsed() < min_interval)
+        {
+            return false;
+        }
+        self.in_flight.insert(cwd.to_path_buf());
+        true
+    }
+
     /// Fold a landed probe for `cwd` into the cache. A failed diff inside a
     /// live repo keeps the root's previous counts (a transient `git` error is
     /// not "the tree went clean"). Returns whether the cwd was re-triggered
     /// while this probe flew — the caller should start one more probe.
     pub fn finish_probe(&mut self, cwd: &Path, snapshot: Option<RepoSnapshot>) -> bool {
         self.in_flight.remove(cwd);
+        self.last_probe.insert(cwd.to_path_buf(), Instant::now());
         match snapshot {
             Some(snap) => {
                 let (added, removed) = snap.counts.unwrap_or_else(|| {
@@ -421,5 +459,61 @@ mod tests {
         // …two independent branch lines.
         assert_eq!(cache.status_for(main).unwrap().branch, "main");
         assert_eq!(cache.status_for(wt).unwrap().branch, "feat/x");
+    }
+
+    /// The four shapes `repo_home` has to tell apart, straight from the
+    /// `--git-dir` / `--git-common-dir` pair the merged `rev-parse` returns.
+    #[test]
+    fn repo_home_resolves_worktree_layouts() {
+        let root = Path::new("/repo/.wt/feat");
+
+        // A main checkout: the two dirs agree, so the work tree is its own home.
+        assert_eq!(
+            repo_home(Path::new("/repo"), Some("/repo/.git"), Some("/repo/.git")),
+            PathBuf::from("/repo")
+        );
+        // A linked worktree: the common dir is the main checkout's `.git`, so
+        // the home is that `.git`'s parent — the main work tree.
+        assert_eq!(
+            repo_home(root, Some("/repo/.git/worktrees/feat"), Some("/repo/.git")),
+            PathBuf::from("/repo")
+        );
+        // A bare repo with worktrees hanging off it: no `.git` component to
+        // strip, so the bare dir itself is the shared key.
+        assert_eq!(
+            repo_home(root, Some("/bare.git/worktrees/feat"), Some("/bare.git")),
+            PathBuf::from("/bare.git")
+        );
+        // A git too old (or too odd) to answer both: degrade to the work tree
+        // rather than guessing a grouping key.
+        assert_eq!(
+            repo_home(root, Some("/repo/.git"), None),
+            root.to_path_buf()
+        );
+        assert_eq!(repo_home(root, None, None), root.to_path_buf());
+    }
+
+    /// The opportunistic path declines where the edge path queues: an in-flight
+    /// probe drops the trigger (and leaves nothing dirty, so no rerun), and a
+    /// probe that just landed rate-limits the next one.
+    #[test]
+    fn throttled_probes_decline_instead_of_queueing() {
+        let mut cache = GitStatusCache::default();
+        let cwd = Path::new("/repo");
+        let gap = Duration::from_secs(60);
+
+        assert!(cache.begin_probe_throttled(cwd, gap));
+        // In flight: declined, and unlike `begin_probe` it doesn't mark dirty —
+        // the landing reports "nothing pending" rather than asking for a rerun.
+        assert!(!cache.begin_probe_throttled(cwd, gap));
+        assert!(!cache.finish_probe(cwd, Some(snap("/repo", "main", Some((1, 0))))));
+
+        // Landed just now: still inside the gap, so the next trigger is dropped.
+        assert!(!cache.begin_probe_throttled(cwd, gap));
+        // …but a zero gap always lets one through, and edge triggers never
+        // consult the throttle at all.
+        assert!(cache.begin_probe_throttled(cwd, Duration::ZERO));
+        assert!(!cache.finish_probe(cwd, Some(snap("/repo", "main", Some((1, 0))))));
+        assert!(cache.begin_probe(cwd));
     }
 }

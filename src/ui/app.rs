@@ -530,13 +530,22 @@ impl Tty7App {
         // so treat it like a release. Dismissing on *both* flips also keeps a
         // reveal scheduled just before the switch from popping the badges up
         // in a window the user already left.
-        let activation_watch = cx.observe_window_activation(window, |this, _window, cx| {
+        let activation_watch = cx.observe_window_activation(window, |this, window, cx| {
             this.dismiss_mod_hint(cx);
             // The panes' link-modifier tracking loses the release the same
             // way, and a stale "⌘ held" is worse than missing badges: a
             // plain unmodified click would open links. Treat the flip as a
             // release; holding ⌘ again re-arms it via `on_modifiers_changed`.
             this.set_link_modifier(false, cx);
+            // Coming back is the only cue we get that the working tree may
+            // have moved while the user was elsewhere: an edit in another
+            // editor, a `git` command in another app, an agent in another
+            // window. None of those reach a pane's poll loop, so without this
+            // the sidebar's `+N −N` would keep showing pre-alt-tab numbers
+            // until the user happened to run a command in the pane.
+            if window.is_window_active() {
+                this.refresh_git_status_all(cx);
+            }
         });
         // Follow OS light/dark flips live: while "sync with system" is on, an
         // appearance change re-resolves the theme slot and repaints. While it's
@@ -2065,6 +2074,21 @@ impl Tty7App {
     fn focus_leaf(&self, leaf: &Entity<TerminalView>, window: &mut Window, cx: &mut App) {
         let handle = leaf.read(cx).focus_handle.clone();
         window.focus(&handle, cx);
+    }
+
+    /// Ask every pane in the window to re-probe its git status. Called when the
+    /// window regains focus: the sidebar shows a git line for *every* tab, not
+    /// just the active one, so refreshing only the focused pane would leave the
+    /// rest of the list stale — which is exactly the list the user is scanning
+    /// right after switching back.
+    ///
+    /// Panes sharing a cwd fold into one probe in the shared cache, and the
+    /// throttle there drops anything probed in the last moment, so the cost of
+    /// a window with many panes is bounded by the number of distinct repos.
+    fn refresh_git_status_all(&mut self, cx: &mut Context<Self>) {
+        for leaf in self.tabs.iter().flat_map(|tab| tab.pane.leaves()) {
+            leaf.update(cx, |view, cx| view.refresh_git_status_now(cx));
+        }
     }
 
     /// Where a freshly opened tab should be inserted, per `new_tab_position`:

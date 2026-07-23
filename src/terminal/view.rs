@@ -261,6 +261,11 @@ pub struct TerminalView {
     /// by work-tree root — panes in one repo share one entry instead of each
     /// computing (and staling) its own.
     git_status_cwd: Option<std::path::PathBuf>,
+    /// The agent session's tool-completion count as of the last poll, so a
+    /// change means "the agent ran a tool since we looked" — the cue to refresh
+    /// the git line mid-turn rather than at the end of one. Reset to 0 when no
+    /// session is present, so a new session's first tool call reads as activity.
+    last_agent_activity: u64,
     /// The inline command line editor. Live only while the shell sits idle
     /// at its prompt (`input_active`): there the terminal keeps keyboard focus and
     /// we run our own line editor (so we own Tab / ↑ / ↓ for completion and
@@ -459,6 +464,27 @@ const INTEGRATION_GRACE: std::time::Duration = std::time::Duration::from_secs(8)
 
 /// How long the integration notice stays up when no keystroke dismisses it.
 const INTEGRATION_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Floor on how often an *opportunistic* git probe may run for one cwd (see
+/// [`GitRefresh::Opportunistic`]). Short enough that the sidebar's counts feel
+/// live while an agent works, long enough that a burst of tool calls — or an
+/// alt-tab into a window holding a dozen panes — collapses into one `git`
+/// shell-out per repo instead of a dozen.
+const OPPORTUNISTIC_GIT_GAP: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Why a git-status probe is being asked for — the two classes get opposite
+/// treatment when one is already in flight.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GitRefresh {
+    /// A rare state change that must not be missed: the pane changed
+    /// directory, a command finished, an agent turn ended. Queues behind an
+    /// in-flight probe (which then reruns) rather than being dropped.
+    Edge,
+    /// A cheap signal that repeats on its own: the window regained focus, the
+    /// agent finished a tool call. Dropped outright when a probe is in flight
+    /// or one ran within [`OPPORTUNISTIC_GIT_GAP`] — the next one will come.
+    Opportunistic,
+}
 
 /// Fig-descended PTY shims known to exec over the shell we spawned and re-host
 /// it on a nested PTY without forwarding OSC 133 — which starves shell
@@ -1022,6 +1048,7 @@ impl TerminalView {
             agent_result_unread: false,
             keep_unread_on_focus: false,
             git_status_cwd: None,
+            last_agent_activity: 0,
             cmd: CmdEditor::new(),
             typeahead: Typeahead::new(),
             hold: GapHold::new(),
@@ -1155,6 +1182,24 @@ impl TerminalView {
     /// [`git_status`]: Self::git_status
     pub fn git_status_cwd(&self) -> Option<&std::path::Path> {
         self.git_status_cwd.as_deref()
+    }
+
+    /// Re-probe this pane's git status opportunistically — for callers holding
+    /// a reason to suspect the tree moved without the pane seeing it. The one
+    /// that matters is the window regaining focus: edits made in an editor, or
+    /// by a `git` command run in another app entirely, produce no event here at
+    /// all, so without this the counts would sit stale until the user happened
+    /// to run something in the pane.
+    ///
+    /// Throttled and in-flight-deduped (see [`GitRefresh::Opportunistic`]), so
+    /// calling it for every pane on every activation is cheap. A pane with no
+    /// resolved cwd yet is skipped rather than being pinned to `None` — its
+    /// first real probe is the poll loop's job.
+    pub fn refresh_git_status_now(&mut self, cx: &mut Context<Self>) {
+        let cwd = self.git_status_cwd.clone();
+        if cwd.is_some() {
+            self.refresh_git_status(cwd, GitRefresh::Opportunistic, cx);
+        }
     }
 
     /// The current grid selection as text, if any non-blank one exists — the
@@ -2627,6 +2672,13 @@ impl TerminalView {
         // otherwise stay invisible until it exits. All rare edges, so the
         // off-thread `git` shell-out runs seldom, not every 300ms tick.
         //
+        // Those edges alone left the counts badly stale during the case they
+        // matter most: a long agent turn writes file after file for minutes
+        // with nothing to show for it. A tool completion is the one signal that
+        // the tree may have just moved mid-turn, so it refreshes too — through
+        // the throttled path, since a busy agent emits them several a second
+        // and each one would otherwise cost a `git diff` across the repo.
+        //
         // An agent that reports its own cwd through the hook channel wins over
         // the proc probe: it tracks internal chdirs the PTY can't observe
         // (Claude Code's EnterWorktree) and works where the proc fallback
@@ -2639,18 +2691,31 @@ impl TerminalView {
         // a remote path — and being first in the chain it would win over
         // `local_cwd` unconditionally and hand that path straight to the local
         // `git`, which is the collision `local_cwd` exists to prevent.
+        let session = self.terminal.agent_session();
+        // A count that moved means at least one tool finished since the last
+        // tick. With no session the counter resets, so a fresh agent's very
+        // first tool call still reads as activity.
+        let tool_activity = match session.as_ref().map(|s| s.activity) {
+            Some(n) => std::mem::replace(&mut self.last_agent_activity, n) != n,
+            None => {
+                self.last_agent_activity = 0;
+                false
+            }
+        };
         let cwd_now = self
             .remote_context()
             .is_none()
             .then(|| {
-                self.terminal
-                    .agent_session()
-                    .and_then(|s| s.cwd)
+                session
+                    .as_ref()
+                    .and_then(|s| s.cwd.clone())
                     .or_else(|| self.cwd())
             })
             .flatten();
         if cwd_now.as_ref() != self.git_status_cwd.as_ref() || cmd_finished || turn_finished {
-            self.refresh_git_status(cwd_now, cx);
+            self.refresh_git_status(cwd_now, GitRefresh::Edge, cx);
+        } else if tool_activity {
+            self.refresh_git_status(cwd_now, GitRefresh::Opportunistic, cx);
         }
     }
 
@@ -2666,7 +2731,12 @@ impl TerminalView {
     /// cannot be what keeps the local probe away from a remote path.
     ///
     /// [`GitStatusCache`]: crate::terminal::git_status::GitStatusCache
-    fn refresh_git_status(&mut self, cwd: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
+    fn refresh_git_status(
+        &mut self,
+        cwd: Option<std::path::PathBuf>,
+        trigger: GitRefresh,
+        cx: &mut Context<Self>,
+    ) {
         use crate::terminal::git_status::GitStatusCache;
 
         let changed = self.git_status_cwd != cwd;
@@ -2678,7 +2748,11 @@ impl TerminalView {
             return;
         };
         cx.default_global::<GitStatusCache>(); // first probe of the process creates it
-        if !cx.update_global::<GitStatusCache, _>(|cache, _| cache.begin_probe(&cwd)) {
+        let claimed = cx.update_global::<GitStatusCache, _>(|cache, _| match trigger {
+            GitRefresh::Edge => cache.begin_probe(&cwd),
+            GitRefresh::Opportunistic => cache.begin_probe_throttled(&cwd, OPPORTUNISTIC_GIT_GAP),
+        });
+        if !claimed {
             return;
         }
         cx.spawn(async move |this, cx| {
@@ -2689,19 +2763,27 @@ impl TerminalView {
                     async move { crate::terminal::git_status::probe(&cwd) }
                 })
                 .await;
-            let _ = this.update(cx, |view, cx| {
-                // Landing through `update_global` wakes the sidebar's
-                // `observe_global`, so every pane in the repo repaints — not
-                // just this one.
-                let rerun = cx.update_global::<GitStatusCache, _>(|cache, _| {
-                    cache.finish_probe(&cwd, result)
+            // Land the result in the shared cache before touching the pane,
+            // and whether or not the pane still exists: the in-flight claim is
+            // keyed by *cwd*, so a pane closed mid-probe that never released
+            // its claim would wedge the git line of every other pane in that
+            // directory — permanently, since nothing else ever clears it.
+            //
+            // Landing through `update_global` wakes the sidebar's
+            // `observe_global`, so every pane in the repo repaints — not just
+            // this one.
+            let rerun =
+                cx.update_global::<GitStatusCache, _>(|cache, _| cache.finish_probe(&cwd, result));
+            // A trigger arrived while we flew; go once more so its state is
+            // observed — unless this pane has since left that cwd. Only edge
+            // triggers set that flag, so the rerun is an edge too.
+            if rerun {
+                let _ = this.update(cx, |view, cx| {
+                    if view.git_status_cwd.as_deref() == Some(&cwd) {
+                        view.refresh_git_status(Some(cwd), GitRefresh::Edge, cx);
+                    }
                 });
-                // A trigger arrived while we flew; go once more so its state
-                // is observed — unless this pane has since left that cwd.
-                if rerun && view.git_status_cwd.as_deref() == Some(&cwd) {
-                    view.refresh_git_status(Some(cwd), cx);
-                }
-            });
+            }
         })
         .detach();
     }
