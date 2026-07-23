@@ -12,7 +12,8 @@
 
 use gpui::{
     AnyElement, Bounds, Context, FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, SharedString, Window, canvas, div, prelude::*, px,
+    MouseUpEvent, Pixels, SharedString, Window, canvas, div, linear_color_stop, linear_gradient,
+    prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
@@ -313,47 +314,84 @@ impl Tty7App {
                     // Leading avatar: agent brand mark, SSH status, or shell glyph.
                     .child(self.tab_avatar(agent, agent_status, agent_unread, ssh_dot, 22., cx))
                     .child(label_region)
-                    // Trailing slot: while the shortcut hints are armed it shows the
-                    // row's ⌘N switch digit; otherwise the close affordance —
-                    // opacity-0-until-hover on every row, active or not, so a column
-                    // of tabs reads clean. Space is reserved either way. The digit
+                    // Trailing ⌘N badge: while the shortcut hints are armed the
+                    // row shows its switch digit in an in-flow 20px slot (an
+                    // all-rows-at-once modal reflow, same as the strip). The digit
                     // is the row's *display* position (`activate_visual` speaks the
                     // same order), so under grouping the rail still reads 1…9 top
                     // to bottom instead of scattering the tab-vector indices.
-                    .child(if show_badges && badge_pos < 9 {
+                    .when(show_badges && badge_pos < 9, |row| {
                         // Bare digit, no keycap box — matches the chip badge exactly.
-                        div()
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(20.))
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(if is_active {
-                                cx.theme().sidebar_accent_foreground
-                            } else {
-                                cx.theme().muted_foreground
-                            })
-                            .child(tab_badge_label(badge_pos))
-                            .into_any_element()
-                    } else {
-                        div()
-                            .flex_shrink_0()
-                            .opacity(0.)
-                            .group_hover(SharedString::from(format!("tab-row-{i}")), |s| {
-                                s.opacity(1.)
-                            })
-                            .child(
-                                Button::new(("sidebar-close", i))
-                                    .icon(IconName::Close)
-                                    .ghost()
-                                    .xsmall()
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.close_tab(i, window, cx);
-                                    })),
-                            )
-                            .into_any_element()
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(20.))
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(if is_active {
+                                    cx.theme().sidebar_accent_foreground
+                                } else {
+                                    cx.theme().muted_foreground
+                                })
+                                .child(tab_badge_label(badge_pos)),
+                        )
+                    })
+                    // Close affordance: out of flow, so the label runs the full
+                    // rail width instead of always reserving a slot for a button
+                    // that's invisible until hover (same Safari-style float as
+                    // the strip's chips). On hover the ✕ sits over the *title
+                    // line's* right end — pinned to the row top, not centered:
+                    // on a two-line row a centered ✕ would straddle both lines
+                    // and cover the branch line's `+n −n` counts, which are a
+                    // click target of their own (the diff-overlay toggle). A
+                    // solid backing in the row's hover fill plus a short
+                    // gradient run-in fades covered title text out instead of
+                    // hard-cutting mid-glyph. Nothing reflows on hover.
+                    .when(!(show_badges && badge_pos < 9), |row| {
+                        // The row fills are composited over the rail (the accent
+                        // carries alpha; the inactive hover is a half-strength
+                        // wash), so flatten them against `sidebar` to get the
+                        // opaque colour the float must match.
+                        let backing = if is_active {
+                            cx.theme().sidebar.blend(cx.theme().sidebar_accent)
+                        } else {
+                            cx.theme()
+                                .sidebar
+                                .blend(cx.theme().sidebar_accent.opacity(0.5))
+                        };
+                        let mut fade_from = backing;
+                        fade_from.a = 0.;
+                        row.child(
+                            h_flex()
+                                .absolute()
+                                // `py_1` row padding: the 20px button covers the
+                                // title line exactly.
+                                .top(px(4.))
+                                .right(px(6.))
+                                .opacity(0.)
+                                .group_hover(SharedString::from(format!("tab-row-{i}")), |s| {
+                                    s.opacity(1.)
+                                })
+                                .child(div().w(px(10.)).h(px(20.)).bg(linear_gradient(
+                                    90.,
+                                    linear_color_stop(fade_from, 0.),
+                                    linear_color_stop(backing, 1.),
+                                )))
+                                .child(
+                                    div().bg(backing).child(
+                                        Button::new(("sidebar-close", i))
+                                            .icon(IconName::Close)
+                                            .ghost()
+                                            .xsmall()
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.close_tab(i, window, cx);
+                                            })),
+                                    ),
+                                ),
+                        )
                     });
 
                 // Per-tab right-click menu, shared with the strip's chips;
