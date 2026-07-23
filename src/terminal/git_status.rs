@@ -193,25 +193,54 @@ impl GitStatusCache {
     /// call — rather than by a rare edge like a command ending.
     ///
     /// Unlike [`begin_probe`](Self::begin_probe) this declines instead of
-    /// queueing: a probe already in flight, or one that landed less than
-    /// `min_interval` ago, drops the trigger entirely (no dirty mark, no
+    /// queueing: a probe already in flight, or one against a repo probed less
+    /// than `min_interval` ago, drops the trigger entirely (no dirty mark, no
     /// rerun). That's the whole point of the two entry points — the rare edges
     /// must never be missed, while these signals repeat on their own, so a
     /// count that's a second stale beats a `git` storm across every pane of a
     /// repo the moment the user alt-tabs back.
+    ///
+    /// The throttle counts per *repo*, not per cwd (see
+    /// [`throttle_key`](Self::throttle_key)), and the claim stamps the clock
+    /// rather than waiting for the landing: without that, a dozen panes
+    /// scattered over one repo's subdirectories would all claim in the same
+    /// instant — each of them passing a throttle no probe had answered yet —
+    /// and produce a dozen identical full-repo diffs.
     pub fn begin_probe_throttled(&mut self, cwd: &Path, min_interval: Duration) -> bool {
         if self.in_flight.contains(cwd) {
             return false;
         }
+        let key = self.throttle_key(cwd).to_path_buf();
         if self
             .last_probe
-            .get(cwd)
+            .get(&key)
             .is_some_and(|at| at.elapsed() < min_interval)
         {
             return false;
         }
+        self.last_probe.insert(key, Instant::now());
         self.in_flight.insert(cwd.to_path_buf());
         true
+    }
+
+    /// What the opportunistic throttle counts against: the work-tree root once
+    /// some probe has answered for `cwd`, and `cwd` itself before that.
+    ///
+    /// The counts a probe produces are repo-wide — `git diff --numstat HEAD`
+    /// ignores which subdirectory it ran in — so panes at `repo/`, `repo/src`
+    /// and `repo/docs` are three ways of asking one question, and want one
+    /// shared clock rather than one each. In-flight dedup stays keyed by cwd:
+    /// it brackets a specific spawn, and [`finish_probe`](Self::finish_probe)
+    /// has to be able to release exactly what was claimed.
+    ///
+    /// Before any probe has landed the root is simply unknown, so the first
+    /// sweep over a repo still costs one probe per distinct cwd; every sweep
+    /// after that collapses to one.
+    fn throttle_key<'a>(&'a self, cwd: &'a Path) -> &'a Path {
+        match self.roots.get(cwd) {
+            Some(Some(root)) => root,
+            _ => cwd,
+        }
     }
 
     /// Fold a landed probe for `cwd` into the cache. A failed diff inside a
@@ -220,7 +249,14 @@ impl GitStatusCache {
     /// while this probe flew — the caller should start one more probe.
     pub fn finish_probe(&mut self, cwd: &Path, snapshot: Option<RepoSnapshot>) -> bool {
         self.in_flight.remove(cwd);
-        self.last_probe.insert(cwd.to_path_buf(), Instant::now());
+        // Re-stamp on landing so the gap is measured from fresh counts, and
+        // under the root this probe just resolved — which is how a cwd first
+        // learns to share its repo's clock (at claim time it had none).
+        let key = match &snapshot {
+            Some(snap) => snap.root.clone(),
+            None => self.throttle_key(cwd).to_path_buf(),
+        };
+        self.last_probe.insert(key, Instant::now());
         match snapshot {
             Some(snap) => {
                 let (added, removed) = snap.counts.unwrap_or_else(|| {
@@ -515,5 +551,42 @@ mod tests {
         assert!(cache.begin_probe_throttled(cwd, Duration::ZERO));
         assert!(!cache.finish_probe(cwd, Some(snap("/repo", "main", Some((1, 0))))));
         assert!(cache.begin_probe(cwd));
+    }
+
+    /// The throttle is per repo, not per cwd: panes sitting in different
+    /// subdirectories ask one question (the counts are repo-wide), so once the
+    /// cache knows where they live, a window activation costs one probe for
+    /// the repo rather than one per pane.
+    #[test]
+    fn throttle_collapses_subdirectories_of_one_repo() {
+        let mut cache = GitStatusCache::default();
+        let (top, src, docs) = (
+            Path::new("/repo"),
+            Path::new("/repo/src"),
+            Path::new("/repo/docs"),
+        );
+        let gap = Duration::from_secs(60);
+
+        // Nothing known yet, so each cwd is its own key and each gets a probe.
+        for cwd in [top, src, docs] {
+            assert!(cache.begin_probe_throttled(cwd, gap));
+            assert!(!cache.finish_probe(cwd, Some(snap("/repo", "main", Some((3, 1))))));
+        }
+
+        // Now all three resolve to `/repo`, so the next sweep collapses: the
+        // first pane to ask spends the probe and the rest ride on it.
+        assert!(!cache.begin_probe_throttled(top, gap));
+        assert!(!cache.begin_probe_throttled(src, gap));
+
+        // …and the claim itself is what stops the stampede — with the clock
+        // wound back far enough to let one through, the *others* still decline
+        // while it is in flight, even though nothing has landed yet.
+        assert!(cache.begin_probe_throttled(docs, Duration::ZERO));
+        assert!(!cache.begin_probe_throttled(top, gap));
+        assert!(!cache.begin_probe_throttled(src, gap));
+
+        // A pane elsewhere is untouched by any of it.
+        let other = Path::new("/other");
+        assert!(cache.begin_probe_throttled(other, gap));
     }
 }

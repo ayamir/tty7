@@ -2083,8 +2083,11 @@ impl Tty7App {
     /// right after switching back.
     ///
     /// Panes sharing a cwd fold into one probe in the shared cache, and the
-    /// throttle there drops anything probed in the last moment, so the cost of
-    /// a window with many panes is bounded by the number of distinct repos.
+    /// throttle there counts per repo rather than per cwd, so once the cache
+    /// knows where each pane lives the cost of a window with many panes is
+    /// bounded by the number of distinct repos — not by the number of
+    /// subdirectories they happen to sit in, which would be the same full-repo
+    /// `git diff` asked several times over.
     fn refresh_git_status_all(&mut self, cx: &mut Context<Self>) {
         for leaf in self.tabs.iter().flat_map(|tab| tab.pane.leaves()) {
             leaf.update(cx, |view, cx| view.refresh_git_status_now(cx));
