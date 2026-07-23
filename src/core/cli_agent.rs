@@ -631,6 +631,16 @@ pub struct AgentSessionState {
     /// a stale path; while absent, consumers fall back to the pane's proc cwd.
     #[serde(default)]
     pub cwd: Option<std::path::PathBuf>,
+    /// Tool completions seen in this session, counted only so consumers can
+    /// spot *that* the agent did something — a turn's edits land tool by tool,
+    /// and the status alone can't say so (`ToolComplete` is a no-op transition
+    /// during normal work, by design). The sidebar's git probe watches this to
+    /// refresh mid-turn instead of waiting for `stop`; see
+    /// [`TerminalView::refresh_git_status`](crate::terminal::view::TerminalView).
+    /// Monotonic within a session and never reset — consumers compare against
+    /// the value they last saw, so only the *change* means anything.
+    #[serde(default)]
+    pub activity: u64,
 }
 
 impl AgentStatus {
@@ -698,6 +708,10 @@ impl AgentSessionState {
             // stream of completions during normal work is a no-op and can
             // never overwrite Done between turns.
             AgentEventKind::ToolComplete => {
+                // The count moves even when the status doesn't: a tool call is
+                // the one signal that the working tree may have just changed
+                // under a turn that won't end for minutes.
+                self.activity = self.activity.wrapping_add(1);
                 if self.status == AgentStatus::Waiting {
                     self.status = AgentStatus::Working;
                     self.message = None;
@@ -1101,6 +1115,49 @@ mod tests {
         s.apply_event(&ev(AgentEventKind::SessionEnd, None, None));
         assert_eq!(s.status, AgentStatus::Idle);
         assert_eq!(s.session_id.as_deref(), Some("sid-1"));
+    }
+
+    /// Tool completions are deliberately a *status* no-op during normal work
+    /// (the assertions above), which leaves consumers watching the status with
+    /// no way to tell that an agent mid-turn just wrote a file. `activity` is
+    /// what makes them observable: it moves on every completion, in every
+    /// status, and never rewinds — the sidebar's git probe compares it against
+    /// the value it last saw.
+    #[test]
+    fn tool_completions_count_even_when_the_status_holds_still() {
+        let ev = |kind| AgentEvent {
+            agent: Some(CLIAgent::Claude),
+            kind,
+            session_id: None,
+            message: None,
+            cwd: None,
+        };
+
+        let mut s = AgentSessionState::default();
+        s.apply_event(&ev(AgentEventKind::PromptSubmit));
+        assert_eq!(s.activity, 0, "a turn starting is not tool activity");
+
+        for n in 1..=3 {
+            s.apply_event(&ev(AgentEventKind::ToolComplete));
+            assert_eq!(s.status, AgentStatus::Working, "the status holds still…");
+            assert_eq!(s.activity, n, "…while the counter is what moves");
+        }
+
+        // A straggler after the turn ended still counts: it may well have
+        // written a file, and it must not be mistaken for "nothing happened".
+        s.apply_event(&ev(AgentEventKind::Stop));
+        s.apply_event(&ev(AgentEventKind::ToolComplete));
+        assert_eq!(
+            s.status,
+            AgentStatus::Done,
+            "and still doesn't resurrect the turn"
+        );
+        assert_eq!(s.activity, 4);
+
+        // Session end resets plenty of state but not this — a rewind to 0 would
+        // read to a delta-comparing consumer as one more tool call.
+        s.apply_event(&ev(AgentEventKind::SessionEnd));
+        assert_eq!(s.activity, 4);
     }
 
     /// The agent's cwd claim: any event carrying one sets it, later events

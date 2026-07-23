@@ -2360,6 +2360,7 @@ mod tests {
             launch_argv: None,
             rich: true,
             cwd: None,
+            activity: 0,
         }))
         .encode(&mut daemon_side)
         .unwrap();

@@ -3322,6 +3322,7 @@ mod tests {
             launch_argv: None,
             rich: true,
             cwd: None,
+            activity: 0,
         });
         apply_signals(&mut st, sniffer.feed(b"\x1b]9;noise\x07"));
         assert_eq!(
