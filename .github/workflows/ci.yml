@@ -62,8 +62,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # `--locked` on the build so a Cargo.lock that disagrees with Cargo.toml
+      # fails here instead of being silently rewritten. Without it the drift is
+      # invisible to CI and lands on contributors instead: every local `cargo`
+      # run rewrites the lock, leaving a permanently dirty working tree that has
+      # to be re-discarded before every commit. Deliberately not applied to the
+      # release/nightly workflows — those stamp Cargo.toml's version and rely on
+      # cargo refreshing the lock's own root entry.
       - name: Build
-        run: cargo build --target ${{ matrix.target }}
+        run: cargo build --locked --target ${{ matrix.target }}
 
       - name: Test
-        run: cargo test --target ${{ matrix.target }}
+        run: cargo test --locked --target ${{ matrix.target }}
