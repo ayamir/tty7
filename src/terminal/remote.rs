@@ -33,6 +33,8 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, CursorShape, CursorStyle};
 
+use crate::terminal::marks::{MarkEvent, MarkScanner};
+
 use std::collections::VecDeque;
 
 use crate::core::cli_agent::{AgentSessionState, CLIAgent};
@@ -41,8 +43,8 @@ use crate::core::osc::OscTokenizer;
 use crate::daemon::protocol::{
     AuthPromptKind, AuthResponse, ClientMsg, DaemonMsg, KnownHostEntry, KnownHostId,
     LoopbackForward, LoopbackForwardId, LoopbackForwardInfo, LoopbackForwardRequest,
-    ManagedForward, NativeSshSpec, RemoteContext, SftpEntry, SftpJobProgress, SftpOp, SftpOpResult,
-    SftpTransferSpec, ShellSpec, SshForwardRule, SshPhase, WinSize,
+    ManagedForward, NativeSshSpec, PaneProcs, RemoteContext, SftpEntry, SftpJobProgress, SftpOp,
+    SftpOpResult, SftpTransferSpec, ShellSpec, SshForwardRule, SshPhase, WinSize,
 };
 use crate::daemon::transport::{self, Stream};
 
@@ -122,6 +124,8 @@ struct ReaderSignals {
     /// Latest native-SSH spawn phase from `DaemonMsg::SshStatus`, for the status
     /// line. `None` until the first status frame (a plain shell pane never sets it).
     phase: Arc<Mutex<Option<SshPhase>>>,
+    /// Command marks (OSC 133 prompt positions) for the details panel's Outline.
+    marks: crate::terminal::marks::Marks,
 }
 
 /// A terminal whose PTY lives in the daemon. Mirrors `backend::Terminal`'s public
@@ -200,6 +204,10 @@ pub struct RemoteTerminal {
     /// session id), last reported by the daemon via `AgentStatus`. Drives the
     /// status dot, "needs your input" notifications, and session resume.
     agent_session: Arc<Mutex<Option<AgentSessionState>>>,
+    /// Command marks recorded by the reader thread from OSC 133, for the details
+    /// panel's Outline. Positions are grid rows, so they can only be taken here
+    /// on the client — the daemon has no grid.
+    marks: crate::terminal::marks::Marks,
     reader_thread: Option<JoinHandle<()>>,
 }
 
@@ -325,6 +333,7 @@ impl RemoteTerminal {
         let auth_prompts: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>> =
             Arc::new(Mutex::new(VecDeque::new()));
         let ssh_phase: Arc<Mutex<Option<SshPhase>>> = Arc::new(Mutex::new(None));
+        let marks = crate::terminal::marks::Marks::new();
 
         let reader_thread = Self::spawn_reader(
             term.clone(),
@@ -342,6 +351,7 @@ impl RemoteTerminal {
                 shell_vi_mode: shell_vi_mode.clone(),
                 auth: auth_prompts.clone(),
                 phase: ssh_phase.clone(),
+                marks: marks.clone(),
             },
         );
 
@@ -366,6 +376,7 @@ impl RemoteTerminal {
             auto_supplied_password: false,
             agent,
             agent_session,
+            marks,
             reader_thread: Some(reader_thread),
         })
     }
@@ -408,6 +419,7 @@ impl RemoteTerminal {
                     shell_vi_mode,
                     auth,
                     phase,
+                    marks,
                 } = signals;
                 // The client end of the visible-output path: keep it off the
                 // efficiency cores (see `core::threads`).
@@ -433,6 +445,10 @@ impl RemoteTerminal {
                 // zle is reading (see the `zle_reading` field docs). Historical
                 // Snapshot replays deliberately do not feed this tokenizer.
                 let mut zle_tok = OscTokenizer::new(&[b"133"]);
+                // Positional OSC 133 marks for the details panel's Outline. Unlike
+                // the tokenizers above this one reports byte *offsets*, because a
+                // mark's value is the grid row it lands on — see `terminal::marks`.
+                let mut mark_scan = MarkScanner::new();
                 // Bytes read but not yet framed, plus the recorded geometry
                 // waiting for its paired Snapshot: the attach replay is a
                 // `Size` → `Snapshot` pair per ring segment, and each pair
@@ -490,11 +506,29 @@ impl RemoteTerminal {
                     macro_rules! flush_batch {
                         () => {
                             if !out_batch.is_empty() {
+                                // Where the batch's OSC 133 marks land, so the
+                                // advance can stop at each one and read the grid
+                                // row it fell on. Scanned before the lock (it's a
+                                // pure byte pass) and normally empty — a batch
+                                // with no marks takes the single-advance path
+                                // below, exactly as before.
+                                let mut cuts: Vec<(usize, MarkEvent)> = Vec::new();
+                                mark_scan.feed(&out_batch, |off, ev| cuts.push((off, ev)));
                                 {
                                     let t0 = trace.then(std::time::Instant::now);
                                     let mut term = term.lock();
                                     let t1 = trace.then(std::time::Instant::now);
-                                    processor.advance(&mut *term, &out_batch);
+                                    if cuts.is_empty() {
+                                        processor.advance(&mut *term, &out_batch);
+                                    } else {
+                                        let mut at = 0usize;
+                                        for (off, ev) in cuts {
+                                            processor.advance(&mut *term, &out_batch[at..off]);
+                                            at = off;
+                                            record_mark(&term, &marks, ev);
+                                        }
+                                        processor.advance(&mut *term, &out_batch[at..]);
+                                    }
                                     if let (Some(t0), Some(t1)) = (t0, t1) {
                                         tr_lock_t += t1 - t0;
                                         tr_adv_t += t1.elapsed();
@@ -920,6 +954,12 @@ impl RemoteTerminal {
     /// The third-party CLI coding agent (Claude Code, Codex, …) running in the
     /// pane's foreground, as last reported by the daemon, or `None`. Cheap cache
     /// read — detection runs daemon-side. See [`crate::core::cli_agent`].
+    /// Command marks recorded from OSC 133, oldest first — the Outline's source.
+    /// Cheap clone of a shared handle; the caller snapshots via `Marks::list`.
+    pub fn marks(&self) -> crate::terminal::marks::Marks {
+        self.marks.clone()
+    }
+
     pub fn foreground_agent(&self) -> Option<CLIAgent> {
         self.agent.lock().ok().and_then(|g| *g)
     }
@@ -1323,6 +1363,42 @@ impl RemoteTerminal {
             }
         }
         query(pane_id).unwrap_or_default()
+    }
+
+    /// A pane's process tree and listening ports, for the details panel. One-shot
+    /// over a short-lived control connection, like the forward queries — this is
+    /// polled only while the panel is open, so it never rides the pane's hot
+    /// output connection.
+    pub fn query_procs(pane_id: u64) -> PaneProcs {
+        fn query(pane_id: u64) -> anyhow::Result<PaneProcs> {
+            let mut stream = connect()?;
+            ClientMsg::QueryProcs { pane_id }.encode(&mut stream)?;
+            match DaemonMsg::read(&mut stream)? {
+                DaemonMsg::Procs(procs) => Ok(procs),
+                other => Err(anyhow::anyhow!("unexpected reply to QueryProcs: {other:?}")),
+            }
+        }
+        query(pane_id).unwrap_or_default()
+    }
+}
+
+/// Apply one OSC 133 mark at the emulator's current position.
+///
+/// Called with the terminal lock held and the parser advanced to exactly the
+/// mark's byte, so `cursor.point.line` is the row the mark fell on. That row is
+/// converted to an index from the top of the scrollback, which is stable as long
+/// as history hasn't saturated — see the `terminal::marks` module docs.
+fn record_mark(term: &Term<EventProxy>, marks: &crate::terminal::marks::Marks, event: MarkEvent) {
+    use alacritty_terminal::grid::Dimensions as _;
+    match event {
+        MarkEvent::Prompt => {
+            let grid = term.grid();
+            let row = grid.history_size() as i64 - grid.display_offset() as i64
+                + i64::from(grid.cursor.point.line.0);
+            marks.begin(row, String::new());
+        }
+        MarkEvent::Command(cmd) => marks.set_text(cmd),
+        MarkEvent::Done(exit) => marks.finish(exit),
     }
 }
 
@@ -2345,6 +2421,55 @@ mod tests {
             .unwrap();
         daemon_side.flush().unwrap();
         assert!(poll(&|s| s.is_none()), "a None report clears the session");
+    }
+
+    /// End-to-end check of the Outline's data path: OSC 133 marks arriving in the
+    /// output stream must land in `Marks` with the *grid row they fell on*, not
+    /// the row at the end of the batch. This is the whole reason the reader
+    /// splits its advance at mark offsets, so it's worth an integration test —
+    /// a regression here looks fine (marks appear) but scrolls to the wrong place.
+    #[test]
+    fn marks_record_the_row_each_one_landed_on() {
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let poll = |want: usize| {
+            for _ in 0..200 {
+                if term.marks().list().len() == want {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        };
+
+        // Two full prompt cycles in ONE batch, separated by output lines. If the
+        // reader advanced the batch in a single pass and read the cursor after,
+        // both marks would report the same (final) row.
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"\x1b]133;A\x07"); // prompt 1 at row 0
+        stream.extend_from_slice(b"\x1b]133;C;echo one\x07");
+        stream.extend_from_slice(b"one\r\n");
+        stream.extend_from_slice(b"\x1b]133;D;0\x07");
+        stream.extend_from_slice(b"\x1b]133;A\x07"); // prompt 2, two rows down
+        stream.extend_from_slice(b"\x1b]133;C;false\x07");
+        stream.extend_from_slice(b"\r\n");
+        stream.extend_from_slice(b"\x1b]133;D;1\x07");
+        DaemonMsg::Output(stream).encode(&mut daemon_side).unwrap();
+        daemon_side.flush().unwrap();
+
+        assert!(poll(2), "both commands recorded");
+        let marks = term.marks().list();
+        assert_eq!(marks[0].text, "echo one");
+        assert_eq!(marks[0].exit, Some(0));
+        assert_eq!(marks[1].text, "false");
+        assert_eq!(marks[1].exit, Some(1), "a failure keeps its exit code");
+        assert!(
+            marks[1].row > marks[0].row,
+            "the second prompt is further down the scrollback ({} vs {}) — equal rows \
+             would mean the advance wasn't split at the marks",
+            marks[0].row,
+            marks[1].row
+        );
     }
 
     /// The typeahead wipe (^U) may only be written once zle actually reads the

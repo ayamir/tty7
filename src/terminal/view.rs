@@ -2368,6 +2368,10 @@ impl TerminalView {
     pub fn clear_scrollback(&mut self, cx: &mut Context<Self>) {
         self.terminal.term.lock().grid_mut().clear_history();
         self.scroll_frac = 0.;
+        // Every mark's row indexed into the history that just went away, so the
+        // Outline's positions are now meaningless. Drop them rather than leave
+        // rows that scroll somewhere arbitrary.
+        self.terminal.marks().clear();
         self.terminal.write(vec![0x0c_u8]); // Ctrl+L
         cx.notify();
     }
@@ -3785,6 +3789,40 @@ impl TerminalView {
     /// pixel-smooth: whole lines go to the emulator's `display_offset`, the
     /// remainder stays in `scroll_frac` and shifts the paint. The position may
     /// come to rest between line boundaries, like a native scroll view.
+    /// The pane's OSC 133 command marks, newest last — the Outline's rows.
+    pub fn command_marks(&self) -> Vec<crate::terminal::marks::CommandMark> {
+        self.terminal.marks().list()
+    }
+
+    /// Scroll so the command recorded at `row` sits near the top of the viewport.
+    /// Returns `false` when the mark has aged out of the scrollback, so the
+    /// caller can say so rather than leaving the user staring at an unchanged
+    /// screen wondering whether the click registered.
+    ///
+    /// `row` is an index from the top of history, which drifts once the
+    /// scrollback saturates (see the `terminal::marks` docs). A drifted mark
+    /// still scrolls *somewhere* — it just may not be the exact prompt — so the
+    /// only failure reported here is a row that has fallen off entirely.
+    pub fn scroll_to_mark(&mut self, row: i64, cx: &mut Context<Self>) -> bool {
+        use alacritty_terminal::grid::Dimensions as _;
+        let mut term = self.terminal.term.lock();
+        let history = term.grid().history_size() as i64;
+        if row < 0 || row > history + term.grid().screen_lines() as i64 {
+            return false;
+        }
+        // `display_offset` counts *up* from the bottom of history, so the offset
+        // that puts `row` at the viewport's top line is its distance from there.
+        let target = (history - row).max(0);
+        let current = term.grid().display_offset() as i64;
+        term.scroll_display(Scroll::Delta((target - current) as i32));
+        drop(term);
+        // A jump lands wherever it lands; the fractional offset is a smooth-scroll
+        // artifact and would otherwise shift the paint off the line boundary.
+        self.scroll_frac = 0.;
+        cx.notify();
+        true
+    }
+
     fn smooth_scroll(&mut self, delta: f32, cx: &mut Context<Self>) {
         let mut term = self.terminal.term.lock();
         let offset = term.grid().display_offset();

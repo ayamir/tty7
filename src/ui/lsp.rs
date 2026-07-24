@@ -210,6 +210,11 @@ impl LspClient {
         })
     }
 
+    /// The server binary's name, for the status bar.
+    pub(crate) fn name(&self) -> &str {
+        &self.inner.name
+    }
+
     fn notify(&self, method: &str, params: Value) {
         let body = json!({ "jsonrpc": "2.0", "method": method, "params": params }).to_string();
         self.inner.send(body);

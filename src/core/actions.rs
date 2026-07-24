@@ -55,6 +55,22 @@ actions!(
         // Switch the tab bar between the horizontal title-bar strip and the
         // vertical left-side sidebar (persists `tab_bar_position`).
         ToggleTabSidebar,
+        // Collapse/expand the left tab sidebar in place (persists
+        // `sidebar_collapsed`). Unlike `ToggleTabSidebar` this does not switch
+        // the tab bar to the horizontal strip — the rail just goes away and
+        // comes back at the same width.
+        ToggleLeftPanel,
+        // Show/hide the right detail panel — session info, working-tree changes,
+        // and the file tree (persists `right_panel_visible`).
+        ToggleRightPanel,
+        // Jump straight to one of the right panel's tabs, opening the panel if
+        // it was closed. Unit actions rather than one parameterized action so
+        // config/Settings can bind them by name; unbound by default, since the
+        // panel's own tab row is the primary way in.
+        ShowRightPanelInfo,
+        ShowRightPanelOutline,
+        ShowRightPanelChanges,
+        ShowRightPanelFiles,
         OpenSettings,
         RestartDaemon,
         // Toggle the SFTP file panel for the focused native-SSH pane (WS5).

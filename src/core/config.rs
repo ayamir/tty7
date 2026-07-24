@@ -97,6 +97,25 @@ pub struct Config {
     /// the live layout re-clamps it to `[180, window_width/2]`.
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
+    /// Whether the vertical tab sidebar is collapsed out of the layout (only
+    /// meaningful when `tab_bar_position` is `left`). Distinct from
+    /// `tab_bar_position`: collapsing hides the rail *without* falling back to
+    /// the horizontal title-bar strip, so the terminal gets the full width and
+    /// re-expanding restores the same rail. Toggled by `ToggleLeftPanel`.
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
+    /// Whether the right detail panel (session info / changes / files) is
+    /// docked open. Toggled by `ToggleRightPanel`.
+    #[serde(default)]
+    pub right_panel_visible: bool,
+    /// Width (px) of the right detail panel. Re-clamped by the live layout the
+    /// same way `sidebar_width` is.
+    #[serde(default = "default_right_panel_width")]
+    pub right_panel_width: f32,
+    /// Which tab the right detail panel last had selected, so reopening it lands
+    /// where it was left.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub right_panel_tab: RightPanelTab,
     /// How the vertical tab sidebar arranges its rows (only meaningful when
     /// `tab_bar_position` is `left`): grouped under a header per git work tree
     /// (`repo`, the default), or one flat list (`none`).
@@ -453,6 +472,10 @@ impl Default for Config {
             // `left` opts into the vertical sidebar.
             tab_bar_position: TabBarPosition::Top,
             sidebar_width: default_sidebar_width(),
+            sidebar_collapsed: false,
+            right_panel_visible: false,
+            right_panel_width: default_right_panel_width(),
+            right_panel_tab: RightPanelTab::Info,
             sidebar_grouping: SidebarGrouping::Repo,
             notify_on_command_finish: NotifyMode::Unfocused,
             // Opt-out, not opt-in: a stale terminal that never tells you it's
@@ -557,6 +580,10 @@ impl Config {
             self.sidebar_width = default_sidebar_width();
         }
         self.sidebar_width = self.sidebar_width.clamp(100.0, 2000.0);
+        if !self.right_panel_width.is_finite() || self.right_panel_width <= 0.0 {
+            self.right_panel_width = default_right_panel_width();
+        }
+        self.right_panel_width = self.right_panel_width.clamp(100.0, 2000.0);
     }
 
     /// Write the current config back to disk, creating the parent directory if
@@ -754,6 +781,27 @@ fn default_notify_threshold_secs() -> u64 {
 /// Serde default for [`Config::prefix`]: tmux's classic `C-b`.
 fn default_prefix() -> String {
     "ctrl-b".to_string()
+}
+
+/// Which tab the right detail panel shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RightPanelTab {
+    /// Session facts: cwd, shell, branch, agent.
+    #[default]
+    Info,
+    /// The pane's command history as a navigable outline (OSC 133 marks).
+    Outline,
+    /// The pane's working-tree diff.
+    Changes,
+    /// The file tree rooted at the pane's repository.
+    Files,
+}
+
+/// Serde default for [`Config::right_panel_width`]: wide enough for a file path
+/// plus its `+N −M` counts without the tree turning into an ellipsis parade.
+fn default_right_panel_width() -> f32 {
+    260.
 }
 
 /// Serde default for [`Config::sidebar_width`]: a comfortable rail width that

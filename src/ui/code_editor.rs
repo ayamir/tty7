@@ -68,6 +68,9 @@ pub(crate) struct OpenFile {
     /// timer) on every keystroke.
     change_task: Option<gpui::Task<()>>,
     _sub: Subscription,
+    /// Repaints the app when the input notifies (cursor moves, scrolls…) so
+    /// the status bar's Ln/Col stays live.
+    _observe: Subscription,
 }
 
 impl OpenFile {
@@ -104,7 +107,13 @@ pub(crate) struct TabCode {
 impl TabCode {
     pub(crate) fn new() -> Self {
         Self {
-            visible: true,
+            // Born hidden. This state used to be created only by opening the
+            // overlay, so defaulting to visible was harmless; now the right
+            // panel's Files tab creates it just to hold the tree's roots and
+            // expansion, and a default of `true` popped an empty editor open
+            // ("No file open") the moment you looked at the tree. Every path
+            // that actually wants the overlay sets `visible` itself.
+            visible: false,
             files: Vec::new(),
             active: 0,
             references: None,
@@ -257,6 +266,16 @@ impl Tty7App {
         self.tabs.get_mut(self.active)?.code.as_deref_mut()
     }
 
+    /// Like [`tab_code_mut`], but creates the state instead of returning `None`.
+    /// The panel state used to be born with the code overlay, so anything that
+    /// needed it could assume the overlay had been opened at least once — no
+    /// longer true now that the right panel's Files tab renders the same tree
+    /// without ever opening the overlay.
+    pub(crate) fn tab_code_mut_or_init(&mut self) -> Option<&mut TabCode> {
+        let tab = self.tabs.get_mut(self.active)?;
+        Some(tab.code.get_or_insert_with(|| Box::new(TabCode::new())))
+    }
+
     /// Whether the active tab's code panel is currently shown.
     pub(crate) fn code_panel_visible(&self) -> bool {
         self.tab_code().is_some_and(|c| c.visible)
@@ -317,12 +336,21 @@ impl Tty7App {
         if self.tabs.get(self.active).is_none() {
             return;
         }
+        // Opening a file is an act on the editor, so it comes forward — the
+        // file tree lives in the right panel and stays clickable even while the
+        // diff overlay covers the column.
+        self.raise_code_overlay();
         let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if let Some(code) = self.tab_code_mut()
             && let Some(ix) = code.files.iter().position(|f| f.path == path)
         {
-            code.active = ix;
             code.visible = true;
+            // Activating always surfaces to the front of the strip: the strip
+            // is MRU-ordered and only its head fits on screen (see
+            // `render_editor_tabs`), so the active file must live there.
+            let f = code.files.remove(ix);
+            code.files.insert(0, f);
+            code.active = 0;
             self.focus_editor(window, cx);
             cx.notify();
             return;
@@ -442,19 +470,25 @@ impl Tty7App {
             .get_mut(self.active)
             .expect("checked at function entry");
         let code = tab.code.get_or_insert_with(|| Box::new(TabCode::new()));
-        code.files.push(OpenFile {
-            path,
-            input,
-            dirty: false,
-            disk_mtime: mtime,
-            conflict: false,
-            preview: false,
-            wrap: false,
-            lsp,
-            change_task: None,
-            _sub: sub,
-        });
-        code.active = code.files.len() - 1;
+        let observe = cx.observe(&input, |_, _, cx| cx.notify());
+        // New files join at the front of the MRU strip (always visible).
+        code.files.insert(
+            0,
+            OpenFile {
+                path,
+                input,
+                dirty: false,
+                disk_mtime: mtime,
+                conflict: false,
+                preview: false,
+                wrap: false,
+                lsp,
+                change_task: None,
+                _sub: sub,
+                _observe: observe,
+            },
+        );
+        code.active = 0;
         code.visible = true;
         self.editor_rebuild_watcher();
         self.focus_editor(window, cx);
@@ -467,6 +501,20 @@ impl Tty7App {
     /// drops it. Opening re-roots the file tree from the tab's panes and
     /// focuses the panel; closing hands focus back to the terminal.
     pub(crate) fn toggle_code_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        // Buried under the diff overlay, this shortcut means "come forward" —
+        // hiding a panel the user can't see would look like it did nothing.
+        let buried = tab.overlay_top == crate::ui::app::OverlayTop::Diff
+            && tab.diff_overlay.is_some()
+            && tab.code.as_ref().is_some_and(|c| c.visible);
+        tab.overlay_top = crate::ui::app::OverlayTop::Code;
+        if buried {
+            self.focus_editor(window, cx);
+            cx.notify();
+            return;
+        }
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -486,6 +534,14 @@ impl Tty7App {
             self.file_tree.focus_handle.focus(window, cx);
         }
         cx.notify();
+    }
+
+    /// Bring the code overlay in front of the diff overlay. See
+    /// [`Tab::overlay_top`](crate::ui::app::Tab).
+    fn raise_code_overlay(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.overlay_top = crate::ui::app::OverlayTop::Code;
+        }
     }
 
     /// Focus the active file's text input (e.g. right after opening a file).
@@ -890,7 +946,10 @@ impl Tty7App {
             }
             Some(f) => {
                 let input = f.input.clone();
+                // `appearance(false)`: no border/background of its own — the
+                // buffer sits flush in the panel instead of in a rounded box.
                 Input::new(&input)
+                    .appearance(false)
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_size(cx.theme().mono_font_size)
                     .size_full()
@@ -908,15 +967,19 @@ impl Tty7App {
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(self.render_editor_tabs(window, cx))
+            .child(self.render_editor_header(cx))
             .when_some(conflict_banner, |this, b| this.child(b))
             .child(div().flex_1().min_h_0().child(body))
             .when_some(references, |this, drawer| this.child(drawer));
 
         Some(
-            h_flex()
+            v_flex()
                 .id("code-panel")
                 .absolute()
+                // Fills its column, which is now everything *except* the detail
+                // panel — the panel is a sibling of that column, not a child of it,
+                // so the tree that opens files stays visible beside the editor
+                // without the overlay needing to know the panel's width.
                 .inset_0()
                 // The overlay must swallow input to the terminal behind it.
                 .occlude()
@@ -928,11 +991,183 @@ impl Tty7App {
                         this.toggle_code_panel(window, cx);
                     }
                 }))
-                .child(self.render_file_tree_column(window, cx))
-                .child(self.render_tree_divider(cx))
-                .child(editor_col)
+                // No top inset: the header row below *is* the title bar's row, and
+                // it clears the window controls itself (see `render_editor_header`).
+                // Padding the whole overlay down would cost a blank 40px band and
+                // still misalign the editor's top edge with the panel's tab row.
+                // No tree column here: the right panel owns the file tree now, and
+                // the overlay stops short of it (see the `right` inset above), so
+                // the tree stays visible beside the editor instead of being
+                // duplicated inside it.
+                .child(h_flex().flex_1().min_h_0().w_full().child(editor_col))
+                .child(self.render_code_status_bar(window, cx))
                 .into_any_element(),
         )
+    }
+
+    /// The editor's one header row: which file is open, and a way back to the
+    /// terminal. Not a tab strip — the file tree is the switcher now, so this only
+    /// has to answer "what am I looking at" without earning a row of chrome for
+    /// every buffer that was ever opened. Sits on the title bar's line and matches
+    /// its height, so the editor's top edge lines up with the panel's tab row and
+    /// the rail's controls across the window.
+    fn render_editor_header(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let active = self.tab_code().and_then(|c| c.active_file());
+        let name = active.map(|f| f.label());
+        let dirty = active.is_some_and(|f| f.dirty);
+        // The overlay fills the column left of the detail panel. With the rail out
+        // that column starts after it, and the traffic lights sit on the rail's
+        // surface — but with the rail collapsed (or in horizontal-tabs mode) the
+        // column starts at the window's left edge and the lights are right where
+        // the filename would go, so the header takes the window controls' reserve
+        // as its inset instead.
+        let lead = if self.left_panel_open(cx) {
+            crate::ui::app::CONTENT_INSET
+        } else {
+            crate::ui::app::TITLE_BAR_LEAD
+        };
+        h_flex()
+            .flex_none()
+            .h(px(crate::ui::app::TITLE_BAR_HEIGHT))
+            .items_center()
+            .gap_1p5()
+            .pl(px(lead))
+            .pr(px(crate::ui::app::CONTENT_INSET - crate::ui::app::TILE_PAD))
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_ellipsis()
+                    .text_sm()
+                    .when(name.is_none(), |d| {
+                        d.text_color(cx.theme().muted_foreground)
+                    })
+                    .child(name.unwrap_or_else(|| SharedString::from("No file open"))),
+            )
+            // Same amber dot the tree marks unsaved files with.
+            .when(dirty, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .size(px(6.))
+                        .rounded_full()
+                        .bg(cx.theme().warning),
+                )
+            })
+            .child(
+                crate::ui::tab_strip::chrome_tile(
+                    Button::new("editor-panel-close")
+                        .icon(Icon::new(IconName::Close).size(px(15.))),
+                    false,
+                    cx,
+                )
+                .xsmall()
+                .w(px(30.))
+                .h(px(30.))
+                .rounded_lg()
+                .tooltip("Back to Terminal (Esc)")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_code_panel(window, cx);
+                })),
+            )
+    }
+
+    /// The Zed-style status bar along the panel bottom: repo-relative path on
+    /// the left; preview/wrap toggles, cursor position, and the language
+    /// server's presence on the right.
+    fn render_code_status_bar(&self, _window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        let code = self.tab_code();
+        let muted = cx.theme().muted_foreground;
+        // `repo › relative/path` for the active file; just the repo otherwise.
+        let path_text: Option<SharedString> = code.map(|c| {
+            let repo = c
+                .roots
+                .first()
+                .and_then(|r| r.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            match c.active_file() {
+                Some(f) => {
+                    let rel = c
+                        .roots
+                        .iter()
+                        .find_map(|r| f.path.strip_prefix(r).ok())
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| f.label().to_string());
+                    format!("{repo} › {rel}").into()
+                }
+                None => repo.into(),
+            }
+        });
+        let active = code.and_then(|c| c.active_file());
+        let cursor: Option<SharedString> = active.map(|f| {
+            let pos = f.input.read(cx).cursor_position();
+            format!("Ln {}, Col {}", pos.line + 1, pos.character + 1).into()
+        });
+        let wrap: Option<bool> = active.map(|f| f.wrap);
+        let is_markdown = active.is_some_and(|f| language_for_path(&f.path) == "markdown");
+        let preview = active.is_some_and(|f| f.preview);
+        let lsp_name: Option<SharedString> = active
+            .and_then(|f| f.lsp.as_ref())
+            .map(|(client, _)| format!("{} ✓", client.name()).into());
+
+        h_flex()
+            .flex_none()
+            .w_full()
+            .h(px(26.))
+            .items_center()
+            .gap_3()
+            .px_3()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .text_xs()
+            .text_color(muted)
+            .when_some(path_text, |this, t| {
+                this.child(div().min_w_0().text_ellipsis().child(t))
+            })
+            .child(div().flex_1())
+            .when(is_markdown, |this| {
+                this.child(
+                    Button::new("status-md-preview")
+                        .label(if preview { "Edit" } else { "Preview" })
+                        .custom(crate::ui::tab_strip::chrome_tile_variant(cx))
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _w, cx| {
+                            if let Some(code) = this.tab_code_mut() {
+                                let ix = code.active;
+                                if let Some(f) = code.files.get_mut(ix) {
+                                    f.preview = !f.preview;
+                                    cx.notify();
+                                }
+                            }
+                        })),
+                )
+            })
+            .when_some(wrap, |this, wrap| {
+                this.child(
+                    Button::new("status-wrap")
+                        .label(if wrap { "Wrap: on" } else { "Wrap: off" })
+                        .custom(crate::ui::tab_strip::chrome_tile_variant(cx))
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let Some(code) = this.tab_code_mut() else {
+                                return;
+                            };
+                            let ix = code.active;
+                            if let Some(f) = code.files.get_mut(ix) {
+                                f.wrap = !f.wrap;
+                                let wrap = f.wrap;
+                                f.input.clone().update(cx, |st, cx| {
+                                    st.set_soft_wrap(wrap, window, cx);
+                                });
+                            }
+                        })),
+                )
+            })
+            .when_some(cursor, |this, t| this.child(div().child(t)))
+            .when_some(lsp_name, |this, t| this.child(div().child(t)))
     }
 
     /// Empty state: the panel is open with nothing loaded.
@@ -952,126 +1187,6 @@ impl Tty7App {
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child("Open a file from the file tree"),
-            )
-    }
-
-    /// The file tab strip along the panel top.
-    fn render_editor_tabs(&self, _window: &Window, cx: &mut Context<Self>) -> gpui::Div {
-        let active = self.tab_code().map(|c| c.active).unwrap_or(0);
-        let files: &[OpenFile] = self.tab_code().map(|c| c.files.as_slice()).unwrap_or(&[]);
-        let tabs = files.iter().enumerate().map(|(ix, f)| {
-            let is_active = ix == active;
-            let title = f.label();
-            h_flex()
-                .id(("editor-tab", ix))
-                .flex_none()
-                .items_center()
-                .gap_1()
-                .px_2()
-                .py_1()
-                .rounded(cx.theme().radius)
-                .text_sm()
-                .cursor_pointer()
-                .when(is_active, |d| d.bg(cx.theme().accent))
-                .when(!is_active, |d| {
-                    d.text_color(cx.theme().muted_foreground)
-                        .hover(|s| s.bg(cx.theme().accent.opacity(0.5)))
-                })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
-                        if let Some(code) = this.tab_code_mut() {
-                            code.active = ix;
-                        }
-                        this.focus_editor(window, cx);
-                        cx.notify();
-                    }),
-                )
-                .child(div().child(title))
-                .when(f.dirty, |d| {
-                    d.child(div().size(px(7.)).rounded_full().bg(cx.theme().warning))
-                })
-                .child(
-                    Button::new(("editor-tab-close", ix))
-                        .icon(IconName::Close)
-                        .ghost()
-                        .xsmall()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.editor_close_file(ix, window, cx);
-                        })),
-                )
-        });
-        h_flex()
-            .flex_none()
-            .w_full()
-            .items_center()
-            .gap_1()
-            .px_1()
-            .py_1()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .overflow_x_hidden()
-            .children(tabs)
-            .child(div().flex_1())
-            // Markdown files get a preview toggle.
-            .when_some(
-                self.tab_code()
-                    .and_then(|c| c.active_file())
-                    .filter(|f| language_for_path(&f.path) == "markdown"),
-                |this, f| {
-                    let preview = f.preview;
-                    this.child(
-                        Button::new("editor-md-preview-toggle")
-                            .label(if preview { "Edit" } else { "Preview" })
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener(|this, _, _w, cx| {
-                                if let Some(code) = this.tab_code_mut() {
-                                    let ix = code.active;
-                                    if let Some(f) = code.files.get_mut(ix) {
-                                        f.preview = !f.preview;
-                                        cx.notify();
-                                    }
-                                }
-                            })),
-                    )
-                },
-            )
-            // Soft-wrap toggle for the active buffer.
-            .when(
-                self.tab_code().is_some_and(|c| c.active_file().is_some()),
-                |this| {
-                    this.child(
-                        Button::new("editor-wrap-toggle")
-                            .label("Wrap")
-                            .ghost()
-                            .xsmall()
-                            .tooltip("Toggle soft wrap")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let Some(code) = this.tab_code_mut() else {
-                                    return;
-                                };
-                                let ix = code.active;
-                                if let Some(f) = code.files.get_mut(ix) {
-                                    f.wrap = !f.wrap;
-                                    let wrap = f.wrap;
-                                    f.input.clone().update(cx, |st, cx| {
-                                        st.set_soft_wrap(wrap, window, cx);
-                                    });
-                                }
-                            })),
-                    )
-                },
-            )
-            .child(
-                Button::new("editor-panel-close")
-                    .icon(IconName::Close)
-                    .ghost()
-                    .small()
-                    .tooltip("Back to Terminal (Esc)")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_code_panel(window, cx);
-                    })),
             )
     }
 
@@ -1134,16 +1249,20 @@ impl Tty7App {
                         .text_sm()
                         .child(div().flex_1().child(format!("{} references", refs.len())))
                         .child(
-                            Button::new("editor-refs-close")
-                                .icon(IconName::Close)
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener(|this, _, _w, cx| {
+                            crate::ui::tab_strip::chrome_tile(
+                                Button::new("editor-refs-close").icon(IconName::Close),
+                                false,
+                                cx,
+                            )
+                            .xsmall()
+                            .on_click(cx.listener(
+                                |this, _, _w, cx| {
                                     if let Some(code) = this.tab_code_mut() {
                                         code.references = None;
                                     }
                                     cx.notify();
-                                })),
+                                },
+                            )),
                         ),
                 )
                 .child(

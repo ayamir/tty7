@@ -23,6 +23,7 @@
 
 pub mod pane;
 pub mod pidfile;
+pub mod procinfo;
 pub mod protocol;
 pub(crate) mod remote;
 pub mod server;

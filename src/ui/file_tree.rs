@@ -14,7 +14,6 @@
 //! invalidated by `notify` events, so a huge repo only ever pays for the
 //! directories actually expanded.
 
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -22,20 +21,14 @@ use std::rc::Rc;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, Context, Entity, ExternalPaths, FocusHandle, KeyDownEvent, MouseButton,
-    MouseMoveEvent, MouseUpEvent, PromptLevel, SharedString, Subscription, Window, div, px,
+    PromptLevel, SharedString, Subscription, Window, div, px,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use ignore::gitignore::Gitignore;
 
 use crate::ui::app::Tty7App;
-
-/// Width band (px) for the tree column.
-const MIN_WIDTH: f32 = 160.0;
-const MAX_WIDTH: f32 = 480.0;
-const DEFAULT_WIDTH: f32 = 240.0;
 
 /// Per-level indent (px) for nested rows.
 const INDENT: f32 = 14.0;
@@ -108,8 +101,6 @@ pub(crate) struct FileTreeState {
     /// Invalidated when a `.gitignore` changes.
     gitignore: HashMap<PathBuf, Option<Rc<Gitignore>>>,
     pub(crate) show_hidden: bool,
-    pub(crate) width: Rc<Cell<f32>>,
-    dragging: Rc<Cell<bool>>,
     pub(crate) editing: Option<TreeEdit>,
     editing_subs: Vec<Subscription>,
     /// One recursive watcher over the union of every tab's roots; rebuilt
@@ -143,8 +134,6 @@ impl FileTreeState {
             children: HashMap::new(),
             gitignore: HashMap::new(),
             show_hidden: false,
-            width: Rc::new(Cell::new(DEFAULT_WIDTH)),
-            dragging: Rc::new(Cell::new(false)),
             editing: None,
             editing_subs: Vec::new(),
             watcher: None,
@@ -264,9 +253,71 @@ impl FileTreeState {
         state
     }
 
+    /// Flat, bounded search across the whole tree — not a filter over the rows
+    /// that happen to be expanded, which would answer "no matches" for anything
+    /// the user hasn't already drilled into. Walks breadth-first from the roots
+    /// so shallow hits (the ones you usually mean) come first, skips ignored
+    /// directories entirely — `.git`, `target`, `node_modules` are where the file
+    /// count explodes and never where you're searching — and stops at `LIMIT`
+    /// hits so a query like "e" can't walk a whole monorepo.
+    fn search_rows(&mut self, roots: &[PathBuf], query: &str) -> Vec<TreeRow> {
+        const LIMIT: usize = 200;
+        /// Directories visited even if nothing matches, so a typo can't turn into
+        /// a full-disk crawl.
+        const MAX_DIRS: usize = 2000;
+
+        let needle = query.to_lowercase();
+        let mut out: Vec<TreeRow> = Vec::new();
+        let mut visited = 0usize;
+        for root in roots {
+            let mut queue: Vec<PathBuf> = vec![root.clone()];
+            while let Some(dir) = queue.first().cloned() {
+                queue.remove(0);
+                if out.len() >= LIMIT || visited >= MAX_DIRS {
+                    break;
+                }
+                visited += 1;
+                if !self.children.contains_key(&dir) {
+                    let listed = self.list_dir(&dir, root);
+                    self.children.insert(dir.clone(), listed);
+                }
+                let entries = self.children.get(&dir).cloned().unwrap_or_default();
+                for e in entries {
+                    if e.ignored && !self.show_hidden {
+                        continue;
+                    }
+                    if !self.show_hidden && e.name.starts_with('.') {
+                        continue;
+                    }
+                    if e.is_dir {
+                        queue.push(e.path.clone());
+                    }
+                    if e.name.to_lowercase().contains(&needle) {
+                        out.push(TreeRow {
+                            entry: e,
+                            // Flat: a match's own indentation would be meaningless
+                            // without its ancestors on screen.
+                            depth: 0,
+                            is_root: false,
+                            expanded: false,
+                        });
+                        if out.len() >= LIMIT {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Flatten `roots` + `expanded` directories into display order (both come
     /// from the active tab's panel state).
-    pub(crate) fn visible_rows(&self, roots: &[PathBuf], expanded: &HashSet<PathBuf>) -> Vec<TreeRow> {
+    pub(crate) fn visible_rows(
+        &self,
+        roots: &[PathBuf],
+        expanded: &HashSet<PathBuf>,
+    ) -> Vec<TreeRow> {
         let mut rows = Vec::new();
         for root in roots {
             let name = root
@@ -382,7 +433,7 @@ impl Tty7App {
             roots.push(PathBuf::from(home));
         }
         let _ = window;
-        let Some(code) = self.tab_code_mut() else {
+        let Some(code) = self.tab_code_mut_or_init() else {
             return;
         };
         if roots != code.roots {
@@ -454,10 +505,38 @@ impl Tty7App {
         if let Some(code) = self.tab_code_mut() {
             code.selected = Some(row_path.to_path_buf());
         }
+        // Search results are a flat list, so "expand" there has nothing to show.
+        // Clicking a directory in them means "take me to it": drop the query and
+        // open the real tree down to that directory, which is the only way the
+        // click can produce a visible result.
+        let searching = !self.file_search.read(cx).value().trim().is_empty();
+        if is_dir && searching {
+            self.file_tree_reveal(row_path, cx);
+            self.file_search
+                .update(cx, |st, cx| st.set_value("", window, cx));
+            cx.notify();
+            return;
+        }
         if is_dir {
             self.file_tree_toggle_expand(row_path, cx);
         } else {
             self.open_file_in_editor(row_path, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Expand `dir` and every ancestor of it up to its root, so a path buried
+    /// several levels down becomes visible in one step.
+    fn file_tree_reveal(&mut self, dir: &Path, cx: &mut Context<Self>) {
+        let roots = self.tab_code().map(|c| c.roots.clone()).unwrap_or_default();
+        let Some(root) = roots.iter().find(|r| dir.starts_with(r)).cloned() else {
+            return;
+        };
+        let Some(code) = self.tab_code_mut() else {
+            return;
+        };
+        for a in dir.ancestors().take_while(|a| a.starts_with(&root)) {
+            code.expanded.insert(a.to_path_buf());
         }
         cx.notify();
     }
@@ -472,9 +551,7 @@ impl Tty7App {
         let Some(code) = self.tab_code() else {
             return;
         };
-        let rows = self
-            .file_tree
-            .visible_rows(&code.roots, &code.expanded);
+        let rows = self.file_tree.visible_rows(&code.roots, &code.expanded);
         if rows.is_empty() {
             return;
         }
@@ -511,9 +588,7 @@ impl Tty7App {
                 if let Some(code) = self.tab_code_mut() {
                     if is_dir && expanded && !is_root {
                         code.expanded.remove(&path);
-                    } else if parent_in_rows
-                        && let Some(parent) = path.parent()
-                    {
+                    } else if parent_in_rows && let Some(parent) = path.parent() {
                         // Jump to the parent row (stay put at a root).
                         code.selected = Some(parent.to_path_buf());
                     }
@@ -764,89 +839,51 @@ enum TreeEditKind {
 impl Tty7App {
     /// The file-tree column: the code overlay's left side (the overlay
     /// renders the divider and the editor to its right).
-    pub(crate) fn render_file_tree_column(
+    /// Just the scrolling rows of the tree — no header, no fixed width, no
+    /// surface of its own — so a host that already has those (the right detail
+    /// panel) can drop the tree into its own column. Shares every bit of state
+    /// with [`render_file_tree_column`]: same roots, same expand set, same
+    /// click-to-open, so the panel and the code overlay are two views of one tree.
+    pub(crate) fn render_file_tree_rows(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let roots_empty = self.tab_code().map(|c| c.roots.is_empty()).unwrap_or(true);
+        // The tree is normally rooted when the code panel opens; the right panel
+        // can be the first thing to ask for it, so root it here too when empty.
+        if roots_empty {
+            self.file_tree_refresh_roots(window, cx);
+        }
         let (roots, expanded) = match self.tab_code() {
             Some(code) => (code.roots.clone(), code.expanded.clone()),
             None => (Vec::new(), std::collections::HashSet::new()),
         };
-        self.file_tree.ensure_loaded(&roots, &expanded);
-        let width = self.file_tree.width.get().clamp(MIN_WIDTH, MAX_WIDTH);
-        let rows = self.file_tree.visible_rows(&roots, &expanded);
-
-        let list = v_flex()
-            .id("file-tree-rows")
+        let query = self.file_search.read(cx).value().trim().to_lowercase();
+        let rows = if query.is_empty() {
+            self.file_tree.ensure_loaded(&roots, &expanded);
+            self.file_tree.visible_rows(&roots, &expanded)
+        } else {
+            self.file_tree.search_rows(&roots, &query)
+        };
+        v_flex()
+            .id("right-panel-tree-rows")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .px_1()
-            .py_1()
-            .children(
-                rows.iter()
-                    .flat_map(|row| self.render_tree_row(row, window, cx)),
-            );
-
-        v_flex()
-            .id("file-tree-panel")
-            .flex_none()
-            .h_full()
-            .w(px(width))
-            .bg(cx.theme().background)
+            .pb_1()
+            // Keyboard nav (arrows / enter / rename) followed the tree out of the
+            // overlay: the rows still own the focus handle its key handler reads.
             .track_focus(&self.file_tree.focus_handle)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 this.file_tree_key_down(ev, window, cx);
             }))
-            .child(self.render_tree_header(cx))
-            .child(list)
+            .children(
+                rows.iter()
+                    .flat_map(|row| self.render_tree_row(row, window, cx)),
+            )
             .into_any_element()
-    }
-
-    /// Panel header: title + refresh / new-file / hidden-files toggle.
-    fn render_tree_header(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let show_hidden = self.file_tree.show_hidden;
-        h_flex()
-            .flex_none()
-            .items_center()
-            .gap_0p5()
-            .px_2()
-            .py_1()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                div()
-                    .flex_1()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child("Files"),
-            )
-            .child(
-                Button::new("tree-refresh")
-                    .icon(IconName::LoaderCircle)
-                    .ghost()
-                    .xsmall()
-                    .tooltip("Refresh")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.file_tree_refresh_roots(window, cx);
-                    })),
-            )
-            .child(
-                Button::new("tree-toggle-hidden")
-                    .icon(IconName::Eye)
-                    .ghost()
-                    .xsmall()
-                    .tooltip(if show_hidden {
-                        "Hide dotfiles"
-                    } else {
-                        "Show dotfiles"
-                    })
-                    .on_click(cx.listener(|this, _, _w, cx| {
-                        this.file_tree.show_hidden = !this.file_tree.show_hidden;
-                        cx.notify();
-                    })),
-            )
     }
 
     /// One row (plus, when an inline edit targets it, the edit input row).
@@ -860,6 +897,12 @@ impl Tty7App {
         let is_dir = row.entry.is_dir;
         let selected = self.tab_code().and_then(|c| c.selected.as_deref()) == Some(&*path);
         let muted = cx.theme().muted_foreground;
+        // Unsaved edits used to be visible on the editor's file tabs; with those
+        // gone the tree is the only place an open buffer is represented, so it has
+        // to carry the dirty marker or unsaved work becomes invisible.
+        let dirty = self
+            .tab_code()
+            .is_some_and(|c| c.files.iter().any(|f| f.dirty && f.path == *path));
 
         // Inline rename replaces the row's label with an input.
         let renaming = matches!(
@@ -905,6 +948,7 @@ impl Tty7App {
             .py_0p5()
             .rounded(cx.theme().radius)
             .cursor_pointer()
+            // Soft inset-pill highlight on the content surface.
             .when(selected, |d| d.bg(cx.theme().accent))
             .when(!selected, |d| {
                 d.hover(|s| s.bg(cx.theme().accent.opacity(0.5)))
@@ -915,6 +959,15 @@ impl Tty7App {
                 muted
             }))
             .child(label)
+            .when(dirty, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .size(px(6.))
+                        .rounded_full()
+                        .bg(cx.theme().warning),
+                )
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener({
@@ -1085,70 +1138,6 @@ impl Tty7App {
             );
         }
         menu
-    }
-
-    /// The draggable divider on the tree's right edge.
-    pub(crate) fn render_tree_divider(&self, cx: &mut Context<Self>) -> AnyElement {
-        let width = self.file_tree.width.clone();
-        let dragging = self.file_tree.dragging.clone();
-        let idle = cx.theme().border;
-        let active = cx.theme().drag_border;
-        let line = if dragging.get() { active } else { idle };
-
-        div()
-            .id("file-tree-divider")
-            .relative()
-            .flex_none()
-            .w(px(5.))
-            .h_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor_col_resize()
-            .child(
-                gpui::canvas(|_, _, _| (), {
-                    let width = width.clone();
-                    let dragging = dragging.clone();
-                    move |bounds, _, window, _cx| {
-                        let divider_x = bounds.origin.x;
-                        window.on_mouse_event({
-                            let width = width.clone();
-                            let dragging = dragging.clone();
-                            move |ev: &MouseMoveEvent, _phase, window, _cx| {
-                                if !dragging.get() {
-                                    return;
-                                }
-                                // The tree's left edge = divider left minus
-                                // the current width; new width follows the
-                                // pointer from that fixed edge.
-                                let left = divider_x - px(width.get());
-                                let w = (ev.position.x - left).max(px(0.));
-                                width.set(w.as_f32().clamp(MIN_WIDTH, MAX_WIDTH));
-                                window.refresh();
-                            }
-                        });
-                        window.on_mouse_event({
-                            let dragging = dragging.clone();
-                            move |_ev: &MouseUpEvent, _phase, window, _cx| {
-                                if dragging.get() {
-                                    dragging.set(false);
-                                    window.refresh();
-                                }
-                            }
-                        });
-                    }
-                })
-                .absolute()
-                .size_full(),
-            )
-            .child(div().w(px(1.)).h_full().bg(line))
-            .on_mouse_down(MouseButton::Left, {
-                move |_ev, window, _cx| {
-                    dragging.set(true);
-                    window.refresh();
-                }
-            })
-            .into_any_element()
     }
 }
 

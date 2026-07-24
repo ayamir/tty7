@@ -74,7 +74,12 @@ impl Tty7App {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .p_1p5()
+            // 4px horizontal, so a row's own `pl_2` puts its content on the rail's
+            // 12px content inset — the same line the search row and the top
+            // controls use. The 8px the capsule stops short of the rail edge is
+            // what makes the active row read as inset rather than full-bleed.
+            .px_1()
+            .py_1p5()
             // Tight row-to-row spacing so the tabs read as one dense list, not a
             // set of far-apart cards (each row already has its own padding).
             .gap_0p5();
@@ -272,7 +277,7 @@ impl Tty7App {
                     .justify_between()
                     .gap_2()
                     .pl_2()
-                    .pr_1p5()
+                    .pr_2()
                     .rounded_lg()
                     // Sidebar-surface token scheme (gpui-component's Sidebar
                     // semantics), so the rows sit cohesively on the sunk rail rather
@@ -381,7 +386,7 @@ impl Tty7App {
                         .items_center()
                         .gap_1p5()
                         .pl_2()
-                        .pr_1p5()
+                        .pr_2()
                         .pt_1p5()
                         .pb_0p5()
                         .text_size(px(11.))
@@ -410,20 +415,47 @@ impl Tty7App {
             }
         }
 
-        // Top control bar: a right-aligned "+" new-tab button (the same shell
-        // picker the strip uses), with new-tab at the top of the rail rather than
-        // in a bottom button. A hairline under it separates the control row from
-        // the tab list.
-        let add_button = self.attach_new_tab_menu(
-            Button::new("sidebar-add")
-                .icon(Icon::new(IconName::Plus).size(px(15.)))
-                .ghost()
+        // The rail's own controls — new tab, and collapse — live in the top zone
+        // beside the traffic lights, right-aligned to the rail's content edge
+        // rather than sitting in the search row. Two reasons: the search row is
+        // for searching, and a collapse button that lives *inside* the rail would
+        // disappear along with it (its counterpart then appears in the title
+        // strip, see `tab_strip`). Right-aligned, they ride the rail's right edge,
+        // which is what says "these belong to this panel" when it's resized.
+        let controls = h_flex()
+            .flex_shrink_0()
+            .h(px(TITLE_BAR_HEIGHT))
+            .items_center()
+            .justify_end()
+            .gap(px(2.))
+            // Glyph, not hit box, on the content edge — see `TILE_PAD`.
+            .pr(px(crate::ui::app::CONTENT_INSET - crate::ui::app::TILE_PAD))
+            .child(
+                self.attach_new_tab_menu(
+                    Button::new("sidebar-add")
+                        .icon(Icon::new(IconName::Plus).size(px(15.)))
+                        .ghost()
+                        .xsmall()
+                        .w(px(30.))
+                        .h(px(30.))
+                        .rounded_lg(),
+                    cx,
+                ),
+            )
+            .child(
+                crate::ui::tab_strip::chrome_tile(
+                    Button::new("sidebar-collapse")
+                        .icon(Icon::new(IconName::PanelLeft).size(px(15.))),
+                    false,
+                    cx,
+                )
                 .xsmall()
                 .w(px(30.))
                 .h(px(30.))
-                .rounded_lg(),
-            cx,
-        );
+                .rounded_lg()
+                .tooltip("Hide Sidebar")
+                .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
+            );
         // Borderless "Search tabs…" that sits directly on the sunk surface: a
         // leading magnifier + an appearance-less input, no box and no divider
         // under the bar, so the control row and list read as one continuous rail
@@ -433,7 +465,7 @@ impl Tty7App {
             .items_center()
             .gap_1()
             .h(px(44.))
-            .px_3()
+            .px(px(crate::ui::app::CONTENT_INSET))
             .child(
                 Icon::new(IconName::Search)
                     .small()
@@ -444,8 +476,7 @@ impl Tty7App {
                     .flex_1()
                     .min_w_0()
                     .child(Input::new(&self.sidebar_search).appearance(false)),
-            )
-            .child(add_button);
+            );
 
         // ── Resize drag (mirrors the split divider in `pane.rs`) ──────────────
         // A backing canvas measures the rail's bounds into a per-frame cell and,
@@ -558,8 +589,10 @@ impl Tty7App {
                     // A title-bar-height top zone: on macOS the traffic lights
                     // sit on the rail's surface here, and it aligns the search box
                     // with the terminal's top (which starts below the title bar),
-                    // so the rail reads as one panel from the very top edge.
-                    .child(div().h(px(TITLE_BAR_HEIGHT)).flex_shrink_0())
+                    // so the rail reads as one panel from the very top edge. The
+                    // rail's controls ride its right end, on the title bar's own
+                    // center line — same row as the "⋯" across the window.
+                    .child(controls)
                     .child(top_bar)
                     .child(list),
             )

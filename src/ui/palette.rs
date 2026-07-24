@@ -51,6 +51,11 @@ pub enum CommandKind {
     ToggleMaximizePane,
     ToggleFullscreen,
     ToggleTabSidebar,
+    ToggleLeftPanel,
+    ToggleRightPanel,
+    /// Switch the right panel to a specific tab, opening it if it was closed —
+    /// so the palette can land you on Changes without a toggle-then-click.
+    ShowRightPanel(crate::core::config::RightPanelTab),
     ClearTerminal,
     FindInTerminal,
     ReopenClosedTab,
@@ -133,6 +138,17 @@ impl CommandKind {
             ToggleMaximizePane => "ToggleMaximizePane",
             ToggleFullscreen => "ToggleFullscreen",
             ToggleTabSidebar => "ToggleTabSidebar",
+            ToggleLeftPanel => "ToggleLeftPanel",
+            ToggleRightPanel => "ToggleRightPanel",
+            ShowRightPanel(tab) => {
+                use crate::core::config::RightPanelTab as T;
+                match tab {
+                    T::Info => "ShowRightPanelInfo",
+                    T::Outline => "ShowRightPanelOutline",
+                    T::Changes => "ShowRightPanelChanges",
+                    T::Files => "ShowRightPanelFiles",
+                }
+            }
             ClearTerminal => "ClearScrollback",
             ReopenClosedTab => "ReopenClosedTab",
             OpenSettings => "OpenSettings",
@@ -214,6 +230,24 @@ impl Command {
             Command::new("Toggle Maximize Pane", ToggleMaximizePane),
             Command::new("Toggle Fullscreen", ToggleFullscreen),
             Command::new("Toggle Tab Sidebar", ToggleTabSidebar),
+            Command::new("Toggle Left Sidebar", ToggleLeftPanel),
+            Command::new("Toggle Right Panel", ToggleRightPanel),
+            Command::new(
+                "Right Panel: Info",
+                ShowRightPanel(crate::core::config::RightPanelTab::Info),
+            ),
+            Command::new(
+                "Right Panel: Outline",
+                ShowRightPanel(crate::core::config::RightPanelTab::Outline),
+            ),
+            Command::new(
+                "Right Panel: Changes",
+                ShowRightPanel(crate::core::config::RightPanelTab::Changes),
+            ),
+            Command::new(
+                "Right Panel: Files",
+                ShowRightPanel(crate::core::config::RightPanelTab::Files),
+            ),
             Command::new("Clear", ClearTerminal),
             Command::new("Find in Terminal…", FindInTerminal),
             Command::new("Reopen Closed Tab", ReopenClosedTab),
