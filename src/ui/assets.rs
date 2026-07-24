@@ -44,6 +44,19 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
         // Lucide's `git-branch`, for the sidebar row's branch line (gpui-component
         // doesn't bundle a git glyph).
         "icons/git-branch.svg" => include_bytes!("../../assets/icons/git-branch.svg"),
+        // Filled-panel dock glyphs for the window chrome: an outlined frame with
+        // one inset solid block marking which dock is open (the "commercial-app"
+        // look). gpui-component only ships the hollow line `panel-left/right`, so
+        // tty7 carries its own filled variants for the title bar controls.
+        "icons/panel-left.svg" => include_bytes!("../../assets/icons/panel-left.svg"),
+        "icons/panel-right.svg" => include_bytes!("../../assets/icons/panel-right.svg"),
+        // Lucide's `list`, for the detail panel's Outline tab: the recorded
+        // commands are a plain list, not a terminal (`square-terminal` read as
+        // "this is a shell", which every pane already is).
+        "icons/list.svg" => include_bytes!("../../assets/icons/list.svg"),
+        // A refined `info` glyph for the Info tab: a solid dot over a round-capped
+        // stem in a slightly inset circle, cleaner than the stock hairline `i`.
+        "icons/info.svg" => include_bytes!("../../assets/icons/info.svg"),
         "icons/agents/claude.svg" => include_bytes!("../../assets/icons/agents/claude.svg"),
         "icons/agents/codex.svg" => include_bytes!("../../assets/icons/agents/codex.svg"),
         "icons/agents/gemini.svg" => include_bytes!("../../assets/icons/agents/gemini.svg"),

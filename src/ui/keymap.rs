@@ -159,6 +159,19 @@ pub(crate) fn default_bindings() -> Vec<(&'static str, &'static str)> {
         // this steers clear of collisions) — reachable from the command palette
         // and Settings → Window & Tabs, and bindable there like any other action.
         ("ToggleTabSidebar", ""),
+        // Collapse/expand the left rail, on the ⌘B every editor uses for it.
+        // Off macOS `secondary-b` is Ctrl+B, which is the tmux preset's default
+        // prefix — leave it unbound there rather than fight the prefix.
+        (
+            "ToggleLeftPanel",
+            if cfg!(target_os = "macos") {
+                "secondary-b"
+            } else {
+                ""
+            },
+        ),
+        // The right detail panel, on the ⌘J every editor uses for a dock.
+        ("ToggleRightPanel", "secondary-j"),
         // Buffer search. ⌘F on macOS; elsewhere `secondary-f` (Ctrl+F) is
         // readline's forward-char, so follow the GUI-terminal convention and open
         // find on Ctrl+Shift+F, leaving Ctrl+F to the shell. Find-again is ⌘G/⌘⇧G
@@ -193,6 +206,14 @@ pub(crate) fn default_bindings() -> Vec<(&'static str, &'static str)> {
         // No default chord — reachable from the command palette ("SFTP Panel") and
         // bindable in Settings like any other action.
         ("ToggleSftp", ""),
+        // The code panel (file tree + editor overlay), on VS Code's explorer
+        // chord. ⌘⇧E is free (no existing binding or preset uses it).
+        ("ToggleCodePanel", "secondary-shift-e"),
+        // Save the editor's active file. ⌘S is free — the terminal has no save.
+        ("EditorSave", "secondary-s"),
+        // LSP navigation in the editor panel, on the VS Code chords.
+        ("EditorGotoDefinition", "f12"),
+        ("EditorFindReferences", "shift-f12"),
         // No default chord — reachable from the command palette ("SSH: Manage
         // Profiles…") and bindable in Settings.
         ("OpenSshProfiles", ""),
@@ -471,6 +492,15 @@ fn make_binding(action: &str, keystroke: &str) -> Option<KeyBinding> {
         "ToggleMaximizePane" => KeyBinding::new(keystroke, ToggleMaximizePane, None),
         "ToggleFullscreen" => KeyBinding::new(keystroke, ToggleFullscreen, None),
         "ToggleTabSidebar" => KeyBinding::new(keystroke, ToggleTabSidebar, None),
+        "ToggleLeftPanel" => KeyBinding::new(keystroke, ToggleLeftPanel, None),
+        "ToggleRightPanel" => KeyBinding::new(keystroke, ToggleRightPanel, None),
+        // Right-panel tab jumps. No entry in the default table above — they ship
+        // unbound and exist so a user *can* bind them; the palette reaches them
+        // either way.
+        "ShowRightPanelInfo" => KeyBinding::new(keystroke, ShowRightPanelInfo, None),
+        "ShowRightPanelOutline" => KeyBinding::new(keystroke, ShowRightPanelOutline, None),
+        "ShowRightPanelChanges" => KeyBinding::new(keystroke, ShowRightPanelChanges, None),
+        "ShowRightPanelFiles" => KeyBinding::new(keystroke, ShowRightPanelFiles, None),
         // Terminal-scoped (the handler lives on the terminal surface): the "Terminal"
         // context keeps ⌘K inert in the settings tab / home page instead of binding a
         // dead global chord there.
@@ -483,6 +513,10 @@ fn make_binding(action: &str, keystroke: &str) -> Option<KeyBinding> {
         "ClearScrollback" => KeyBinding::new(keystroke, ClearScrollback, Some("Terminal")),
         "OpenSettings" => KeyBinding::new(keystroke, OpenSettings, None),
         "ToggleSftp" => KeyBinding::new(keystroke, ToggleSftp, None),
+        "ToggleCodePanel" => KeyBinding::new(keystroke, ToggleCodePanel, None),
+        "EditorSave" => KeyBinding::new(keystroke, EditorSave, None),
+        "EditorGotoDefinition" => KeyBinding::new(keystroke, EditorGotoDefinition, None),
+        "EditorFindReferences" => KeyBinding::new(keystroke, EditorFindReferences, None),
         "OpenSshProfiles" => KeyBinding::new(keystroke, OpenSshProfiles, None),
         "RestartSshSession" => KeyBinding::new(keystroke, RestartSshSession, None),
         "Quit" => KeyBinding::new(keystroke, Quit, None),

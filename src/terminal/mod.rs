@@ -28,6 +28,7 @@ mod history;
 mod hold;
 pub mod input;
 mod loopback;
+pub(crate) mod marks;
 pub mod palette;
 mod remote;
 mod reverse_search;

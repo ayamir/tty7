@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use gpui::{AnyElement, FocusHandle, FontWeight, KeyDownEvent, Window, div, prelude::*, px};
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::Button;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 
 use crate::terminal::git_diff::{
@@ -57,6 +57,13 @@ pub(crate) struct DiffOverlayState {
     /// files default open, big/binary ones closed). Keyed by path so the set
     /// survives a background refresh of the snapshot.
     pub(crate) toggled: HashSet<String>,
+    /// When set, the overlay shows only this file (repo-relative path), always
+    /// expanded — the "click a row in the Changes panel" entry point. `None` is
+    /// the whole-tree view the git line opens. Kept as a path rather than an
+    /// index so a background re-probe that reorders files doesn't swap which
+    /// file is on screen; a path that vanishes from the diff falls back to the
+    /// full list rather than showing an empty overlay.
+    pub(crate) focus: Option<String>,
 }
 
 impl Tty7App {
@@ -69,19 +76,63 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self
+        self.toggle_diff_overlay_at(cwd, None, window, cx)
+    }
+
+    /// The same toggle, scoped to one file: opens the overlay showing only
+    /// `focus` (repo-relative), which is what the Changes panel's rows do. The
+    /// toggle key is the pair — re-clicking the row that's already on screen
+    /// closes, while clicking a *different* row swaps the shown file in place
+    /// without the overlay blinking shut and re-probing.
+    pub(crate) fn toggle_diff_overlay_at(
+        &mut self,
+        cwd: PathBuf,
+        focus: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.active;
+        // Was the diff already the front overlay? If it was buried under the
+        // code panel, this click means "bring it up", not "close it" — closing
+        // something the user can't currently see would read as the click doing
+        // nothing.
+        let was_front = self.tabs.get(active).is_some_and(|t| {
+            t.overlay_top == crate::ui::app::OverlayTop::Diff || !self.code_panel_visible()
+        });
+        // Acting on the diff raises it over the code panel, whether it was
+        // already open or not.
+        if let Some(tab) = self.tabs.get_mut(active) {
+            tab.overlay_top = crate::ui::app::OverlayTop::Diff;
+        }
+        match self
             .tabs
-            .get(self.active)
-            .and_then(|t| t.diff_overlay.as_ref())
-            .is_some_and(|o| o.cwd == cwd)
+            .get_mut(active)
+            .and_then(|t| t.diff_overlay.as_mut())
+            .filter(|o| o.cwd == cwd)
         {
-            self.close_diff_overlay(window, cx);
-            return;
+            // Already open on this repo showing this exact thing, and already on
+            // top — toggle off.
+            Some(o) if o.focus == focus && was_front => {
+                self.close_diff_overlay(window, cx);
+                return;
+            }
+            // Open on this repo, different file: retarget. The snapshot is
+            // already loaded and covers every file, so there is nothing to
+            // re-probe — this is a pure re-render.
+            Some(o) => {
+                o.focus = focus;
+                // Take focus too, so Esc closes the diff rather than whatever
+                // was focused before it came forward (often the editor).
+                let handle = o.focus_handle.clone();
+                window.focus(&handle, cx);
+                cx.notify();
+                return;
+            }
+            None => {}
         }
         // The overlay steals focus (it needs Esc); snapshot the active pane so
         // closing lands back on the same terminal — same discipline as Settings.
         self.remember_active_pane(window, cx);
-        let active = self.active;
         let Some(tab) = self.tabs.get_mut(active) else {
             return; // home page — no tab body to overlay
         };
@@ -92,10 +143,19 @@ impl Tty7App {
             load: DiffLoad::Loading,
             loading: false,
             toggled: HashSet::new(),
+            focus,
         });
         window.focus(&focus_handle, cx);
         self.spawn_diff_probe(cx);
         cx.notify();
+    }
+
+    /// The file the active tab's overlay is currently scoped to, if any — the
+    /// Changes panel reads it to mark the matching row as selected, so panel and
+    /// overlay can't disagree about what's on screen.
+    pub(crate) fn diff_overlay_focus(&self, cwd: &std::path::Path) -> Option<&str> {
+        let overlay = self.tabs.get(self.active)?.diff_overlay.as_ref()?;
+        (overlay.cwd == cwd).then(|| overlay.focus.as_deref())?
     }
 
     /// Close the active tab's overlay (Esc, ✕, or the toggle) and give focus
@@ -208,7 +268,9 @@ impl Tty7App {
             DiffLoad::Ready(snap) if snap.files.is_empty() && snap.untracked.is_empty() => {
                 self.diff_message("Working tree clean", cx)
             }
-            DiffLoad::Ready(snap) => self.diff_file_list(snap, &overlay.toggled, cx),
+            DiffLoad::Ready(snap) => {
+                self.diff_file_list(snap, &overlay.toggled, focused_file(snap, overlay), cx)
+            }
         };
 
         let header = self.diff_header(overlay, cx);
@@ -256,10 +318,21 @@ impl Tty7App {
             }
             _ => (String::new(), 0, 0, 0, 0),
         };
+        // The overlay now covers the title strip, so its header *is* the title
+        // bar for as long as it's up: same height, and the same left inset the
+        // editor header uses — content clears the traffic lights whenever the
+        // rail isn't there to hold that space for us.
+        let lead = if self.left_panel_open(cx) {
+            crate::ui::app::CONTENT_INSET
+        } else {
+            crate::ui::app::TITLE_BAR_LEAD
+        };
         h_flex()
             .flex_shrink_0()
-            .h(px(40.))
-            .px_3()
+            .h(px(crate::ui::app::TITLE_BAR_HEIGHT))
+            .pl(px(lead))
+            // Trailing tile aligns on its glyph, like every other corner control.
+            .pr(px(crate::ui::app::CONTENT_INSET - crate::ui::app::TILE_PAD))
             .gap_2()
             .items_center()
             .border_b_1()
@@ -277,38 +350,80 @@ impl Tty7App {
                     .font_weight(FontWeight::MEDIUM)
                     .child(branch),
             )
-            .when(matches!(overlay.load, DiffLoad::Ready(_)), |bar| {
-                let mut summary = format!(
-                    "{} changed file{}",
-                    files,
-                    if files == 1 { "" } else { "s" }
-                );
-                if untracked > 0 {
-                    summary.push_str(&format!(" · {untracked} untracked"));
-                }
+            // Scoped to one file: the branch stays (it's still what we diff
+            // against) but the totals give way to the file's own name, with a
+            // click target back to the whole tree — otherwise the only way out
+            // of a focused view would be to close and re-open the overlay.
+            .when_some(focused_name(overlay), |bar, name| {
                 bar.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(summary),
+                    h_flex()
+                        .id("diff-overlay-unfocus")
+                        .items_center()
+                        .gap_1()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(cx.theme().list_hover))
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            let active = this.active;
+                            if let Some(overlay) = this
+                                .tabs
+                                .get_mut(active)
+                                .and_then(|t| t.diff_overlay.as_mut())
+                            {
+                                overlay.focus = None;
+                                cx.notify();
+                            }
+                        }))
+                        .child(
+                            Icon::new(IconName::ChevronLeft)
+                                .small()
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family(self.font_family.clone())
+                                .child(name),
+                        ),
                 )
-                .when(added > 0, |bar| {
-                    bar.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().success)
-                            .child(format!("+{added}")),
-                    )
-                })
-                .when(removed > 0, |bar| {
-                    bar.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().danger)
-                            .child(format!("−{removed}")),
-                    )
-                })
             })
+            .when(
+                matches!(overlay.load, DiffLoad::Ready(_)) && overlay.focus.is_none(),
+                |bar| {
+                    let mut summary = format!(
+                        "{} changed file{}",
+                        files,
+                        if files == 1 { "" } else { "s" }
+                    );
+                    if untracked > 0 {
+                        summary.push_str(&format!(" · {untracked} untracked"));
+                    }
+                    bar.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(summary),
+                    )
+                    .when(added > 0, |bar| {
+                        bar.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().success)
+                                .child(format!("+{added}")),
+                        )
+                    })
+                    .when(removed > 0, |bar| {
+                        bar.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().danger)
+                                .child(format!("−{removed}")),
+                        )
+                    })
+                },
+            )
             // A quiet "refreshing" hint while a re-probe flies over stale data.
             .when(
                 overlay.loading && matches!(overlay.load, DiffLoad::Ready(_)),
@@ -323,13 +438,16 @@ impl Tty7App {
             )
             .child(div().flex_1())
             .child(
-                Button::new("diff-overlay-close")
-                    .icon(IconName::Close)
-                    .ghost()
-                    .small()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.close_diff_overlay(window, cx);
-                    })),
+                crate::ui::tab_strip::chrome_tile(
+                    Button::new("diff-overlay-close").icon(IconName::Close),
+                    false,
+                    cx,
+                )
+                .small()
+                .tooltip("Close Diff (Esc)")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.close_diff_overlay(window, cx);
+                })),
             )
     }
 
@@ -351,14 +469,26 @@ impl Tty7App {
         &self,
         snap: &DiffSnapshot,
         toggled: &HashSet<String>,
+        focused: Option<usize>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut list = v_flex().gap_3().p_4().w_full();
         for (idx, file) in snap.files.iter().enumerate() {
-            let expanded = file_expanded(file, toggled);
+            if focused.is_some_and(|f| f != idx) {
+                continue;
+            }
+            // A file opened by name was asked for explicitly — show its body
+            // even when it's over the auto-collapse threshold. The header still
+            // toggles, so a huge file can be folded back down.
+            let expanded = if focused == Some(idx) {
+                !toggled.contains(&file.path)
+            } else {
+                file_expanded(file, toggled)
+            };
             list = list.child(self.diff_file_card(idx, file, expanded, cx));
         }
-        if !snap.untracked.is_empty() {
+        // Untracked files are a property of the tree, not of the focused file.
+        if focused.is_none() && !snap.untracked.is_empty() {
             list = list.child(self.diff_untracked_section(&snap.untracked, cx));
         }
         div()
@@ -618,6 +748,25 @@ impl Tty7App {
         }
         section.into_any_element()
     }
+}
+
+/// Resolve the overlay's focused path to an index into `snap.files`. `None`
+/// means "show everything" — either nothing is focused, or the focused path is
+/// no longer in the diff (the user reverted it while the overlay was open), in
+/// which case falling back to the full list beats an empty screen.
+fn focused_file(snap: &DiffSnapshot, overlay: &DiffOverlayState) -> Option<usize> {
+    let path = overlay.focus.as_deref()?;
+    snap.files.iter().position(|f| f.path == path)
+}
+
+/// The focused file's name for the header, only once it's known to be in the
+/// snapshot — so a stale focus doesn't label a list that shows every file.
+fn focused_name(overlay: &DiffOverlayState) -> Option<String> {
+    let DiffLoad::Ready(snap) = &overlay.load else {
+        return None;
+    };
+    let idx = focused_file(snap, overlay)?;
+    Some(snap.files[idx].path.clone())
 }
 
 /// Whether a file's body shows: small text diffs default open, big ones (and

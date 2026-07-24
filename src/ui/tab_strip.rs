@@ -5,19 +5,19 @@
 //! orchestration rather than chrome rendering.
 
 use gpui::{
-    Animation, AnimationExt as _, App, Axis, Bounds, Context, FontWeight, MouseButton,
+    Animation, AnimationExt as _, AnyElement, App, Axis, Bounds, Context, FontWeight, MouseButton,
     MouseDownEvent, Pixels, SharedString, Window, canvas, deferred, div, ease_out_quint,
     linear_color_stop, linear_gradient, prelude::*, px,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::input::Input;
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex};
+use gpui_component::{ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex};
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::core::actions::{OpenSettings, TogglePalette};
-use crate::core::config::Config;
+use crate::core::config::{Config, RightPanelTab};
 use crate::daemon::protocol::ShellSpec;
 use crate::ui::app::{Tab, Tty7App};
 use crate::ui::hints::tab_badge_label;
@@ -150,7 +150,165 @@ impl Render for DragTab {
     }
 }
 
+/// The shared styling for every icon tile in the window's chrome — title bar,
+/// rail controls, detail-panel tabs, the editor's close button.
+///
+/// `ghost()` can't be used: its hover is `secondary_hover` and its selected state
+/// `secondary_active`, both solid mid-greys that read far heavier than anything
+/// else here. So this spells out all four states in the tab rail's language —
+/// nothing at rest, a soft grey capsule on hover, the same grey opaque when
+/// selected — which is the same "inset soft-grey capsule" the sidebar rows and
+/// the popups use. (Overriding just the hover from outside doesn't work: `Button`
+/// applies its own `.hover()` during render, after any the caller set.)
+pub(crate) fn chrome_tile_variant(cx: &gpui::App) -> ButtonCustomVariant {
+    let accent = cx.theme().sidebar_accent;
+    ButtonCustomVariant::new(cx)
+        .color(cx.theme().transparent)
+        // Full `foreground`, not the softer `secondary_foreground`: the chrome
+        // glyphs read as deliberate controls rather than faint hints — the
+        // "commercial-app" weight, paired with the filled dock icons below.
+        .foreground(cx.theme().foreground)
+        .hover(accent.opacity(0.55))
+        .active(accent)
+}
+
+pub(crate) fn chrome_tile(button: Button, selected: bool, cx: &gpui::App) -> Button {
+    button.custom(chrome_tile_variant(cx)).selected(selected)
+}
+
 impl Tty7App {
+    /// The window's right-corner chrome: the detail-panel toggle and the overflow
+    /// "⋯". Built here rather than inline because it has two hosts — the title
+    /// strip while the panel is closed, and the panel's own top zone while it's
+    /// open, since whichever of the two reaches the window's right edge should
+    /// carry it. (Same arrangement as the rail: its controls sit on the rail when
+    /// it's out, and move into the strip when it's collapsed.)
+    pub(crate) fn window_chrome(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let panel_open = self.right_panel_open(cx);
+        // `.menu(label, Action)` dispatches the real action, so a click and the
+        // shortcut travel one path and the row auto-renders the shortcut hint; it
+        // needs an `action_context` inside the app's element tree to land on the
+        // root `on_action` handlers, so we hand it the focused pane (falling back
+        // to the home page's handle when no tab is open).
+        let action_ctx = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.pane.focused_or_first(window, cx))
+            .map(|leaf| leaf.read(cx).focus_handle.clone())
+            .unwrap_or_else(|| self.home_focus.clone());
+        h_flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(2.))
+            // The "⋯" glyph ends on the window's content inset like every other
+            // right edge in the chrome — hence `inset - TILE_PAD`, which puts the
+            // *glyph* there instead of its 30px hit box.
+            .pr(px(crate::ui::app::CONTENT_INSET - crate::ui::app::TILE_PAD))
+            // On Windows/Linux the window controls (─ ▢ ✕) sit on the right, right
+            // where the "⋯" lands; give it extra breathing room there so it reads
+            // as a menu affordance, not a fourth window control.
+            .when(!cfg!(target_os = "macos"), |this| this.pr_3())
+            .child(
+                div().occlude().flex_shrink_0().child(
+                    chrome_tile(
+                        Button::new("titlebar-right-panel")
+                            .icon(Icon::empty().path("icons/panel-right.svg").size(px(18.))),
+                        panel_open,
+                        cx,
+                    )
+                    .xsmall()
+                    .w(px(32.))
+                    .h(px(32.))
+                    .rounded_lg()
+                    .tooltip("Detail Panel")
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.toggle_right_panel(cx);
+                    })),
+                ),
+            )
+            .child(
+                div().occlude().flex_shrink_0().child(
+                    chrome_tile(
+                        Button::new("titlebar-menu")
+                            .icon(Icon::new(IconName::Ellipsis).size(px(18.))),
+                        false,
+                        cx,
+                    )
+                    .xsmall()
+                    .w(px(32.))
+                    .h(px(32.))
+                    .rounded_lg()
+                    .dropdown_menu_with_anchor(
+                        gpui::Anchor::TopRight,
+                        move |menu, _window, _cx| {
+                            menu.min_w(px(220.))
+                                .action_context(action_ctx.clone())
+                                .menu("Command Palette", Box::new(TogglePalette))
+                                .menu("Settings…", Box::new(OpenSettings))
+                        },
+                    ),
+                ),
+            )
+    }
+
+    /// The detail panel's tab tiles — icon-only, one per view. Lives here beside
+    /// the rest of the chrome tiles so all of them share one styling helper.
+    pub(crate) fn right_panel_tabs(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let active_tab = cx.global::<Config>().right_panel_tab;
+        [
+            (
+                RightPanelTab::Info,
+                Icon::empty().path("icons/info.svg"),
+                "Info",
+            ),
+            (
+                RightPanelTab::Outline,
+                Icon::empty().path("icons/list.svg"),
+                "Outline",
+            ),
+            // git-branch (from tty7's own assets) instead of the abstract
+            // `Replace` glyph: Changes is a working-tree diff, and the branch
+            // mark reads as version control at a glance — matching the mockup.
+            (
+                RightPanelTab::Changes,
+                Icon::empty().path("icons/git-branch.svg"),
+                "Changes",
+            ),
+            (
+                RightPanelTab::Files,
+                Icon::new(IconName::FolderClosed),
+                "Files",
+            ),
+        ]
+        .into_iter()
+        .map(|(tab, icon, label)| {
+            div()
+                .occlude()
+                .flex_shrink_0()
+                .child(
+                    chrome_tile(
+                        Button::new(("right-panel-tab", tab as usize)).icon(icon.size(px(18.))),
+                        active_tab == tab,
+                        cx,
+                    )
+                    .xsmall()
+                    .w(px(32.))
+                    .h(px(32.))
+                    .rounded_lg()
+                    .tooltip(label)
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.set_right_panel_tab(tab, cx);
+                    })),
+                )
+                .into_any_element()
+        })
+        .collect()
+    }
+
     /// The status dot pinned to a tab avatar's bottom-right corner (an agent's
     /// live status, or an SSH pane's connection phase): a solid
     /// `rgb` disc with a surface-colored separator ring so it reads as sitting
@@ -922,51 +1080,74 @@ impl Tty7App {
             // area doesn't swallow the click.
             div().occlude().flex_shrink_0().child(
                 self.attach_new_tab_menu(
-                    Button::new("tab-add")
-                        .icon(Icon::new(IconName::Plus).size(px(15.)))
-                        .ghost()
+                    chrome_tile(
+                        Button::new("tab-add")
+                            .icon(Icon::new(IconName::Plus).size(px(18.))),
+                        false,
+                        cx,
+                    )
                         .xsmall()
-                        .w(px(30.))
-                        .h(px(30.))
+                        .w(px(32.))
+                        .h(px(32.))
                         .rounded_lg(),
                     cx,
                 ),
             );
 
-        // Right-edge overflow menu: the low-frequency *global* entries (command
-        // palette, settings) that until now had no on-screen affordance at all —
-        // only keyboard shortcuts. Same ghost 30px tile as the "+", but anchored
-        // to the title bar's otherwise-empty right edge and opening from its
-        // top-right corner so the popup never spills off-screen.
-        //
-        // `.menu(label, Action)` dispatches the real action, so a click and the
-        // shortcut travel one path and the row auto-renders the shortcut hint; it
-        // needs an `action_context` inside the app's element tree to land on the
-        // root `on_action` handlers, so we hand it the focused pane (falling back
-        // to the home page's handle when no tab is open).
-        // (Settings is a full-window overlay now, so it simply covers this menu
-        // while open — no need to conditionally hide it.)
-        let action_ctx = self
-            .tabs
-            .get(active)
-            .and_then(|t| t.pane.focused_or_first(window, cx))
-            .map(|leaf| leaf.read(cx).focus_handle.clone())
-            .unwrap_or_else(|| self.home_focus.clone());
-        let menu_button = div().occlude().flex_shrink_0().child(
-            Button::new("titlebar-menu")
-                .icon(Icon::new(IconName::Ellipsis).size(px(15.)))
-                .ghost()
-                .xsmall()
-                .w(px(30.))
-                .h(px(30.))
-                .rounded_lg()
-                .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _window, _cx| {
-                    menu.min_w(px(220.))
-                        .action_context(action_ctx.clone())
-                        .menu("Command Palette", Box::new(TogglePalette))
-                        .menu("Settings…", Box::new(OpenSettings))
-                }),
-        );
+        // Sidebar mode with the rail collapsed: the rail's own controls move here
+        // rather than vanishing with it, so collapsing is never a one-way door.
+        // They keep the rail's order and spacing and just re-anchor from the rail's
+        // right edge to the window's left one, landing beside the traffic lights.
+        let rail_collapsed = !show_chips && !self.left_panel_open(cx);
+        let left_group = rail_collapsed.then(|| {
+            h_flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(2.))
+                // Negative off macOS only: the bar already inset us past the window
+                // controls, and there the reserve *is* the clearance.
+                .ml(px(crate::ui::app::title_bar_hug_offset()))
+                .child(
+                    div().occlude().flex_shrink_0().child(
+                        self.attach_new_tab_menu(
+                            chrome_tile(
+                                Button::new("titlebar-add-collapsed")
+                                    .icon(Icon::new(IconName::Plus).size(px(18.))),
+                                false,
+                                cx,
+                            )
+                            .xsmall()
+                            .w(px(32.))
+                            .h(px(32.))
+                            .rounded_lg(),
+                            cx,
+                        ),
+                    ),
+                )
+                .child(
+                    div().occlude().flex_shrink_0().child(
+                        chrome_tile(
+                            Button::new("titlebar-expand-sidebar")
+                                .icon(Icon::empty().path("icons/panel-left.svg").size(px(18.))),
+                            false,
+                            cx,
+                        )
+                        .xsmall()
+                        .w(px(32.))
+                        .h(px(32.))
+                        .rounded_lg()
+                        .tooltip("Show Sidebar")
+                        .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
+                    ),
+                )
+        });
+
+        let panel_open = self.right_panel_open(cx);
+        // The window's right-corner chrome. When the panel is open it lives on the
+        // *panel's* top zone (the panel is what reaches the window's right edge
+        // then) exactly like the rail's controls live on the rail; the strip only
+        // carries it while the panel is closed.
+        let right_chrome = (!panel_open).then(|| self.window_chrome(window, cx));
 
         // Outer strip: the clipping chip row and the always-visible "+" anchored
         // left, the overflow "⋯" pushed to the right edge by a flexible spacer.
@@ -989,23 +1170,15 @@ impl Tty7App {
             // — the original tight inset, which now holds steady on resize since
             // `strip_w` keeps the right edge tracking the window.
             .pl_0()
-            .pr_2()
-            // On Windows/Linux the window controls (─ ▢ ✕) sit on the right, right
-            // where the "⋯" lands, so its inset has to match *their* rhythm: the
-            // 34px tiles put consecutive glyph centres 34px apart, and the "⋯"
-            // centre sits `15 + pr + 17` from the minimise glyph. `pr_1` (4px)
-            // lands at 36px — reading as part of the same row, with just enough
-            // slack to not be mistaken for a fourth window control. The old
-            // `pr_3` (12px) made it 44px, visibly adrift from the group.
-            .when(!cfg!(target_os = "macos"), |this| this.pr_1())
             .min_w_0()
+            .when_some(left_group, |this, g| this.child(g))
             .child(chips)
             // In sidebar mode the rail owns "New Tab" (a "+" in its own top bar),
             // so the title bar drops its "+" to avoid a redundant second one —
             // leaving just the "⋯" overflow menu on a thin strip.
             .when(show_chips, move |this| this.child(add_button))
             .child(div().flex_1())
-            .child(menu_button)
+            .when_some(right_chrome, |this, chrome| this.child(chrome))
     }
 }
 

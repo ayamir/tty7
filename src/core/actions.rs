@@ -55,10 +55,35 @@ actions!(
         // Switch the tab bar between the horizontal title-bar strip and the
         // vertical left-side sidebar (persists `tab_bar_position`).
         ToggleTabSidebar,
+        // Collapse/expand the left tab sidebar in place (persists
+        // `sidebar_collapsed`). Unlike `ToggleTabSidebar` this does not switch
+        // the tab bar to the horizontal strip — the rail just goes away and
+        // comes back at the same width.
+        ToggleLeftPanel,
+        // Show/hide the right detail panel — session info, working-tree changes,
+        // and the file tree (persists `right_panel_visible`).
+        ToggleRightPanel,
+        // Jump straight to one of the right panel's tabs, opening the panel if
+        // it was closed. Unit actions rather than one parameterized action so
+        // config/Settings can bind them by name; unbound by default, since the
+        // panel's own tab row is the primary way in.
+        ShowRightPanelInfo,
+        ShowRightPanelOutline,
+        ShowRightPanelChanges,
+        ShowRightPanelFiles,
         OpenSettings,
         RestartDaemon,
         // Toggle the SFTP file panel for the focused native-SSH pane (WS5).
         ToggleSftp,
+        // Toggle the code panel: a full-body overlay of [file tree | editor]
+        // covering the terminal (settings-overlay style).
+        ToggleCodePanel,
+        // Save the editor panel's active file (⌘S).
+        EditorSave,
+        // LSP jump to the definition of the symbol at the editor cursor (F12).
+        EditorGotoDefinition,
+        // LSP list references to the symbol at the editor cursor (⇧F12).
+        EditorFindReferences,
         // Open the SSH profile manager/editor full-window page (WS6, FR-P1).
         OpenSshProfiles,
         // Reconnect a dead native-SSH pane in place (WS6, FR-E4).

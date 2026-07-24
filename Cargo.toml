@@ -76,8 +76,20 @@ alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev 
 notify-rust = "4"
 
 # Filesystem watcher for live config reload: watches `config.json` and reloads
-# `Config` + re-applies the theme without a restart.
+# `Config` + re-applies the theme without a restart. The code panel (file tree /
+# editor, `ui::code`) reuses it to refresh the tree and detect external edits.
 notify = "8"
+
+# Code panel (file tree + editor, `ui::code`). `ropey` and `lsp-types` are pinned
+# to the exact versions gpui-component uses so its `InputState` rope / LSP
+# provider types unify with ours; `ignore` supplies the gitignore matcher chain
+# the file tree uses to dim ignored entries (same crate ripgrep uses).
+ropey = "=2.0.0-beta.1"
+lsp-types = { version = "0.97.0", features = ["proposed"] }
+ignore = "0.4"
+# `url` does the file-path ↔ `file://` URI conversion for the LSP client
+# (percent-encoding, Windows drive letters); already in the tree via gpui.
+url = "2"
 
 # Cross-platform PTY for the daemon: a Unix pty on Unix, ConPTY on Windows, behind
 # one blocking `Read`/`Write`/`resize` API. This is what lets `daemon::pane` share
@@ -228,10 +240,16 @@ edition = "2024"
 
 [workspace.dependencies]
 # Our fork's `tty7` branch carries the local customizations tty7 relies on:
-# `PopupMenu::with_size` plus the 1px hairline menu separator. The exact commit
-# is still pinned by Cargo.lock. For co-developing the UI crate, point these
-# back at a sibling checkout: `path = "../gpui-component/crates/{ui,assets}"`.
-gpui-component = { git = "https://github.com/l0ng-ai/gpui-component", branch = "tty7", version = "0.5.2" }
+# `PopupMenu::with_size`, the 1px hairline menu separator, and the custom-button
+# label color the chrome tiles need. The exact commit is still pinned by
+# Cargo.lock. For co-developing the UI crate, point these back at a sibling
+# checkout: `path = "../gpui-component/crates/{ui,assets}"` — but never commit
+# that, since a path dependency can't resolve on CI.
+#
+# `tree-sitter-languages` compiles the grammars the code editor highlights with.
+gpui-component = { git = "https://github.com/l0ng-ai/gpui-component", branch = "tty7", version = "0.5.2", features = [
+    "tree-sitter-languages",
+] }
 gpui-component-assets = { git = "https://github.com/l0ng-ai/gpui-component", branch = "tty7", version = "0.5.1" }
 
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }

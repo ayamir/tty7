@@ -50,6 +50,11 @@ pub enum CommandKind {
     ToggleMaximizePane,
     ToggleFullscreen,
     ToggleTabSidebar,
+    ToggleLeftPanel,
+    ToggleRightPanel,
+    /// Switch the right panel to a specific tab, opening it if it was closed —
+    /// so the palette can land you on Changes without a toggle-then-click.
+    ShowRightPanel(crate::core::config::RightPanelTab),
     ClearTerminal,
     FindInTerminal,
     ReopenClosedTab,
@@ -57,6 +62,8 @@ pub enum CommandKind {
     RestartDaemon,
     /// Toggle the SFTP file panel for the focused native-SSH pane (WS5).
     ToggleSftp,
+    /// Toggle the code panel (file tree + editor overlay over the terminal).
+    ToggleCodePanel,
     /// Reconnect a dead native-SSH pane in place (WS6, FR-E4).
     RestartSshSession,
     /// Send the focused pane's selection to a running CLI coding agent's pane
@@ -130,11 +137,23 @@ impl CommandKind {
             ToggleMaximizePane => "ToggleMaximizePane",
             ToggleFullscreen => "ToggleFullscreen",
             ToggleTabSidebar => "ToggleTabSidebar",
+            ToggleLeftPanel => "ToggleLeftPanel",
+            ToggleRightPanel => "ToggleRightPanel",
+            ShowRightPanel(tab) => {
+                use crate::core::config::RightPanelTab as T;
+                match tab {
+                    T::Info => "ShowRightPanelInfo",
+                    T::Outline => "ShowRightPanelOutline",
+                    T::Changes => "ShowRightPanelChanges",
+                    T::Files => "ShowRightPanelFiles",
+                }
+            }
             ClearTerminal => "ClearScrollback",
             ReopenClosedTab => "ReopenClosedTab",
             OpenSettings => "OpenSettings",
             RestartDaemon => "RestartDaemon",
             ToggleSftp => "ToggleSftp",
+            ToggleCodePanel => "ToggleCodePanel",
             RestartSshSession => "RestartSshSession",
             SendSelectionToAgent
             | SendGitDiffToAgent
@@ -210,6 +229,24 @@ impl Command {
             Command::new("Toggle Maximize Pane", ToggleMaximizePane),
             Command::new("Toggle Fullscreen", ToggleFullscreen),
             Command::new("Toggle Tab Sidebar", ToggleTabSidebar),
+            Command::new("Toggle Left Sidebar", ToggleLeftPanel),
+            Command::new("Toggle Right Panel", ToggleRightPanel),
+            Command::new(
+                "Right Panel: Info",
+                ShowRightPanel(crate::core::config::RightPanelTab::Info),
+            ),
+            Command::new(
+                "Right Panel: Outline",
+                ShowRightPanel(crate::core::config::RightPanelTab::Outline),
+            ),
+            Command::new(
+                "Right Panel: Changes",
+                ShowRightPanel(crate::core::config::RightPanelTab::Changes),
+            ),
+            Command::new(
+                "Right Panel: Files",
+                ShowRightPanel(crate::core::config::RightPanelTab::Files),
+            ),
             Command::new("Clear", ClearTerminal),
             Command::new("Find in Terminal…", FindInTerminal),
             Command::new("Reopen Closed Tab", ReopenClosedTab),
@@ -217,6 +254,7 @@ impl Command {
             Command::new("SSH: Manage Profiles…", OpenSshProfiles),
             Command::new("Reconnect SSH Session", RestartSshSession),
             Command::new("SFTP Panel", ToggleSftp),
+            Command::new("Code Panel", ToggleCodePanel),
             Command::new("Change Theme…", OpenThemePicker),
             Command::new("Open Settings", OpenSettings),
             Command::new("Reset Font Size", ResetFontSize),

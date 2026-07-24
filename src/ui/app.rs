@@ -81,6 +81,45 @@ const RECORD_COMMIT_DELAY_MS: u64 = 650;
 /// they all line up (and reach the very top of the window).
 pub(crate) const TITLE_BAR_HEIGHT: f32 = 40.;
 
+/// The chrome tile rhythm: a 30px hit box around a 15px glyph, so the glyph sits
+/// [`TILE_PAD`] inside the box on every edge. Alignment is a property of what you
+/// can *see*, so anything lining a tile up with text or with the window edge
+/// subtracts `TILE_PAD` from the inset it wants — otherwise the invisible hit box
+/// lands on the line and the glyph reads 7.5px short of it.
+pub(crate) const TILE_SIZE: f32 = 30.;
+pub(crate) const TILE_GLYPH: f32 = 15.;
+pub(crate) const TILE_PAD: f32 = (TILE_SIZE - TILE_GLYPH) / 2.;
+
+/// The one content inset the whole window aligns to: the rail's text and icons,
+/// the title bar's chrome glyphs, and the side panels all start (or end) here, so
+/// every vertical edge in the chrome falls on one of two lines rather than the
+/// five slightly different ones each surface used to pick for itself.
+pub(crate) const CONTENT_INSET: f32 = 12.;
+
+/// What gpui-component's `TitleBar` already insets its content by, to clear the
+/// window controls: 80px on macOS (traffic lights on the left), 12px elsewhere
+/// (controls on the right). Anything laid out *inside* the bar therefore starts
+/// here, not at the window edge.
+pub(crate) const TITLE_BAR_LEAD: f32 = if cfg!(target_os = "macos") { 80. } else { 12. };
+
+/// Left offset for the tile group that sits beside the window controls.
+///
+/// On macOS the thing that can collide with the traffic lights is the tile's
+/// *hit box* — it paints a background on hover and when selected, 7.5px wider
+/// than the glyph on each side — so this aligns the box, not the glyph, and the
+/// bar's own 80px lead is already exactly the clearance macOS defines for that.
+/// Hence zero: pulling back into the reserve to "hug" the lights only made the
+/// hover capsule touch them. Off macOS the controls are on the right, nothing is
+/// there to clear, and the group aligns its glyph to the content inset like the
+/// rest of the chrome.
+pub(crate) fn title_bar_hug_offset() -> f32 {
+    if cfg!(target_os = "macos") {
+        0.
+    } else {
+        CONTENT_INSET - TILE_PAD - TITLE_BAR_LEAD
+    }
+}
+
 /// One tab: a split-pane tree plus an optional user-assigned name. Settings is
 /// no longer a tab — it's a full-window overlay (`Tty7App::settings`), so every
 /// tab is a real terminal tab.
@@ -101,6 +140,13 @@ pub struct Tab {
     /// switching back restores it; closing the tab drops it. Only the active
     /// tab's overlay is rendered. See [`crate::ui::diff_overlay`].
     pub(crate) diff_overlay: Option<crate::ui::diff_overlay::DiffOverlayState>,
+    /// This tab's code panel (file tree + editor overlay): open files, tree
+    /// roots/expansion, and visibility. Same per-tab contract as
+    /// `diff_overlay` — switching away hides it, switching back restores it,
+    /// closing the tab drops it. Shared caches (directory listings, gitignore
+    /// matchers, language servers, watchers) live on [`Tty7App`]. `None` until
+    /// the panel is first opened in this tab.
+    pub(crate) code: Option<Box<crate::ui::code_editor::TabCode>>,
     /// The sidebar group this tab last *definitively* belonged to: the
     /// repository home of its first pane's cwd — the main checkout's root, so
     /// linked worktrees of one repo share a group (deliberately not the
@@ -114,6 +160,21 @@ pub struct Tab {
     /// flickering through the Scratch group and back. A `RefCell` because the
     /// sidebar refreshes it during render, which only has `&Tab`.
     pub(crate) sidebar_group: std::cell::RefCell<Option<std::path::PathBuf>>,
+    /// Which of the two full-column overlays (code panel, diff) was raised last.
+    /// They deliberately have no fixed precedence: whichever the user just acted
+    /// on paints on top, so opening a diff over the editor shows the diff, and
+    /// clicking a file in the tree behind it brings the editor back — the same
+    /// "click it, it comes forward" rule as window stacking.
+    pub(crate) overlay_top: OverlayTop,
+}
+
+/// Stacking order for the two overlays that cover the whole column. See
+/// [`Tab::overlay_top`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum OverlayTop {
+    #[default]
+    Code,
+    Diff,
 }
 
 impl Tab {
@@ -123,6 +184,8 @@ impl Tab {
             name: None,
             last_focused: None,
             diff_overlay: None,
+            code: None,
+            overlay_top: OverlayTop::default(),
             sidebar_group: std::cell::RefCell::new(None),
         }
     }
@@ -134,6 +197,23 @@ impl Tab {
             Some(id) => self.pane.leaf_matching_or_first(|l| l.entity_id() == id),
             None => self.pane.first_leaf(),
         }
+    }
+
+    /// The pane the right panel's detail should describe. Not simply the
+    /// focused leaf: opening the panel, the diff overlay or the editor moves
+    /// focus off the terminal entirely, and `focused_or_first` would then fall
+    /// back to the *first* pane — so a split's second pane would silently swap
+    /// the panel's cwd the moment you interacted with the panel. Falling back to
+    /// `focus_target` uses the pane that held focus when it left instead, which
+    /// is the one the user still thinks of as active.
+    pub(crate) fn detail_pane(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Option<Entity<TerminalView>> {
+        self.pane
+            .focused_leaf(window, cx)
+            .or_else(|| self.focus_target())
     }
 
     /// The title used to derive the tab label: the pane the tab is working in.
@@ -350,6 +430,12 @@ pub struct Tty7App {
     pub(crate) loopback_panel: LoopbackForwardPanelState,
     /// Pane-contextual SFTP file panel (WS5), bound to a focused native-SSH pane.
     pub(crate) sftp_panel: crate::ui::sftp::SftpPanelState,
+    /// Right detail panel (info / changes / files) docked beside the terminal.
+    pub(crate) right_panel: crate::ui::right_panel::RightPanelState,
+    /// Local project file tree (left column of the body).
+    pub(crate) file_tree: crate::ui::file_tree::FileTreeState,
+    /// Code-editor panel (right column of the body).
+    pub(crate) editor: crate::ui::code_editor::EditorPanelState,
     /// Vertical tab sidebar width (px), held in a shared `Cell` so the resize
     /// drag's window-level mouse listener can mutate it without the entity handle
     /// (mirrors the split divider's `ratio`). Seeded from `Config::sidebar_width`
@@ -357,6 +443,10 @@ pub struct Tty7App {
     pub(crate) sidebar_width: Rc<Cell<f32>>,
     /// Whether the sidebar's resize handle is currently held.
     pub(crate) sidebar_dragging: Rc<Cell<bool>>,
+    /// Right detail panel width (px) and drag state, held in shared `Cell`s for
+    /// exactly the reason `sidebar_width` is — see there.
+    pub(crate) right_panel_width: Rc<Cell<f32>>,
+    pub(crate) right_panel_dragging: Rc<Cell<bool>>,
     /// Scroll handle for the sidebar's row list, so activating a tab scrolls its
     /// row into view.
     pub(crate) sidebar_scroll: gpui::ScrollHandle,
@@ -369,8 +459,12 @@ pub struct Tty7App {
     /// Filter box in the sidebar's top control bar ("Search tabs…"); its text
     /// narrows the visible rows by fuzzy-ish substring match on the tab label.
     pub(crate) sidebar_search: Entity<InputState>,
+    /// Live filter for the detail panel's Files tab (its own box, so filtering
+    /// the tree never disturbs the tab list's filter and vice versa).
+    pub(crate) file_search: Entity<InputState>,
     /// Re-renders the sidebar on each search keystroke so results narrow live.
     _sidebar_search_sub: Subscription,
+    _file_search_sub: Subscription,
     /// `Some` while the settings page is open. Settings is a full-window overlay
     /// (not a tab), so it covers the tab rail / title bar and never clutters the
     /// tab list. Holds all the settings widget state + its subscriptions.
@@ -498,6 +592,8 @@ impl Tty7App {
             )
         };
         let sftp_panel = crate::ui::sftp::SftpPanelState::new(window, cx);
+        let file_tree = crate::ui::file_tree::FileTreeState::new(window, cx);
+        let editor = crate::ui::code_editor::EditorPanelState::new(window, cx);
         // Managed-forward add-form inputs (native-SSH panes).
         let mf_bind_host = cx.new(|cx| InputState::new(window, cx).default_value("127.0.0.1"));
         let mf_bind_port = cx.new(|cx| InputState::new(window, cx).placeholder("8080"));
@@ -505,6 +601,7 @@ impl Tty7App {
         let mf_target_port = cx.new(|cx| InputState::new(window, cx).placeholder("80"));
         let mf_description = cx.new(|cx| InputState::new(window, cx).placeholder("description"));
         let sidebar_width = cx.global::<Config>().sidebar_width;
+        let right_panel_width = cx.global::<Config>().right_panel_width;
         // Live-apply hot-reloaded config: the watcher in `main.rs` swaps the
         // `Config` global on every `config.json` change, which fires this. The
         // window-aware variant so the reload can re-run `apply_theme` with the
@@ -522,6 +619,10 @@ impl Tty7App {
         let git_status_watch =
             cx.observe_global::<crate::terminal::git_status::GitStatusCache>(|this, cx| {
                 this.maybe_refresh_diff_overlay(cx);
+                // Same trigger, same freshness: the right panel's Changes list is
+                // the sidebar's `+N −M` expanded, so it re-probes whenever those
+                // numbers do rather than going stale behind them.
+                this.right_panel_refresh_changes(cx);
                 cx.notify();
             });
         // Any real keypress means "chord, not a bare hold": cancel the held-⌘
@@ -600,6 +701,12 @@ impl Tty7App {
                     cx.notify();
                 }
             });
+        let file_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search files…"));
+        let file_search_sub = cx.subscribe_in(&file_search, window, |_this, _i, ev, _w, cx| {
+            if matches!(ev, InputEvent::Change) {
+                cx.notify();
+            }
+        });
         let app = Self {
             tabs,
             active,
@@ -639,12 +746,19 @@ impl Tty7App {
                 mf_editing: None,
             },
             sftp_panel,
+            right_panel: Default::default(),
+            file_tree,
+            editor,
             sidebar_width: Rc::new(Cell::new(sidebar_width)),
             sidebar_dragging: Rc::new(Cell::new(false)),
+            right_panel_width: Rc::new(Cell::new(right_panel_width)),
+            right_panel_dragging: Rc::new(Cell::new(false)),
             sidebar_scroll: gpui::ScrollHandle::new(),
             reorder: Rc::new(RefCell::new(None)),
             sidebar_search,
             _sidebar_search_sub: sidebar_search_sub,
+            file_search,
+            _file_search_sub: file_search_sub,
             settings: None,
             ssh_prompt: crate::ui::ssh_prompt::SshPromptState::new(cx),
             ssh_close_confirm: None,
@@ -798,6 +912,8 @@ impl Tty7App {
                 name: st.name,
                 last_focused: None,
                 diff_overlay: None,
+                code: None,
+                overlay_top: OverlayTop::default(),
                 // Keep the group it had when closed — the row reappears where
                 // it lived instead of flashing through Scratch.
                 sidebar_group: std::cell::RefCell::new(st.sidebar_group),
@@ -1933,6 +2049,30 @@ impl Tty7App {
         self.set_tab_bar_position(next, cx);
     }
 
+    /// `ToggleLeftPanel` (⌘B): collapse/expand the left rail in place, persisting
+    /// the choice. In `Top` mode there is no rail to collapse, so this switches to
+    /// `Left` and shows it — the shortcut always means "give me the sidebar".
+    pub(crate) fn toggle_left_panel(&mut self, cx: &mut Context<Self>) {
+        let cfg = cx.global::<Config>();
+        let (pos, collapsed) = match cfg.tab_bar_position {
+            TabBarPosition::Top => (TabBarPosition::Left, false),
+            TabBarPosition::Left => (TabBarPosition::Left, !cfg.sidebar_collapsed),
+        };
+        self.update_config(cx, |cfg| {
+            cfg.tab_bar_position = pos;
+            cfg.sidebar_collapsed = collapsed;
+        });
+    }
+
+    /// Whether the left rail is actually on screen: `Left` mode, not collapsed,
+    /// and at least one tab (the home page has no rail). The layout, the title
+    /// strip and the collapse button all derive from this one predicate.
+    pub(crate) fn left_panel_open(&self, cx: &gpui::App) -> bool {
+        matches!(cx.global::<Config>().tab_bar_position, TabBarPosition::Left)
+            && !cx.global::<Config>().sidebar_collapsed
+            && !self.tabs.is_empty()
+    }
+
     pub(crate) fn set_notify_mode(
         &mut self,
         mode: crate::core::config::NotifyMode,
@@ -2472,7 +2612,14 @@ impl Tty7App {
             // In sidebar mode, pull the newly active row into view (a no-op when
             // the strip is horizontal — the handle tracks no painted list then).
             self.sidebar_scroll.scroll_to_item(index);
-            self.focus_active(window, cx);
+            if self.code_panel_visible() {
+                // The incoming tab has its own panel open: refresh its roots
+                // (pane cwds may have changed) and keep focus on the panel.
+                self.file_tree_refresh_roots(window, cx);
+                self.file_tree.focus_handle.focus(window, cx);
+            } else {
+                self.focus_active(window, cx);
+            }
             self.save_session(cx);
             cx.notify();
         }
@@ -2977,6 +3124,9 @@ impl Tty7App {
             ToggleMaximizePane => self.toggle_maximize(window, cx),
             ToggleFullscreen => window.toggle_fullscreen(),
             ToggleTabSidebar => self.toggle_tab_sidebar(cx),
+            ToggleLeftPanel => self.toggle_left_panel(cx),
+            ToggleRightPanel => self.toggle_right_panel(cx),
+            ShowRightPanel(tab) => self.set_right_panel_tab(tab, cx),
             ResetFontSize => self.reset_font_size(cx),
             FindInTerminal => {
                 // Open the search bar on the pane focus just returned to (the
@@ -3004,6 +3154,7 @@ impl Tty7App {
             OpenSettings => self.toggle_settings(window, cx),
             RestartDaemon => self.restart_daemon(window, cx),
             ToggleSftp => self.toggle_sftp(window, cx),
+            ToggleCodePanel => self.toggle_code_panel(window, cx),
             RestartSshSession => self.restart_ssh_session(window, cx),
             SetTheme(i) => {
                 if let Some(id) = crate::ui::presets::all(cx).get(i).map(|t| t.id.clone()) {
@@ -3034,7 +3185,7 @@ impl Tty7App {
     /// The pane the agent-feed commands deliver to: the first leaf running a
     /// recognized coding agent, preferring the active tab, then any tab. `None`
     /// when no agent runs anywhere.
-    fn agent_target_leaf(&self, cx: &App) -> Option<Entity<TerminalView>> {
+    pub(crate) fn agent_target_leaf(&self, cx: &App) -> Option<Entity<TerminalView>> {
         let runs_agent = |leaf: &Entity<TerminalView>| leaf.read(cx).agent().is_some();
         if let Some(tab) = self.tabs.get(self.active)
             && let Some(leaf) = tab.pane.leaves().into_iter().find(runs_agent)
@@ -3638,6 +3789,8 @@ impl Tty7App {
         // Keep the runtime sidebar width in step with the config (an external
         // edit to `config.json`, or our own drag-end persist which re-fires this).
         self.sidebar_width.set(cx.global::<Config>().sidebar_width);
+        self.right_panel_width
+            .set(cx.global::<Config>().right_panel_width);
         if font_size != self.font_size {
             self.font_size = font_size;
             let px_size = px(font_size);
@@ -4313,8 +4466,13 @@ impl Render for Tty7App {
         // rail never appears.
         let vertical = matches!(cx.global::<Config>().tab_bar_position, TabBarPosition::Left)
             && !self.tabs.is_empty();
+        // The rail can be collapsed away without leaving `Left` mode. When it is,
+        // the layout below has no left column, so the title strip takes over the
+        // rail's jobs: it reserves the traffic lights and carries the sidebar's
+        // own controls (new tab + expand) at its left edge.
+        let rail = vertical && !cx.global::<Config>().sidebar_collapsed;
         let strip = self.tab_strip(!vertical, window, cx);
-        let sidebar = vertical.then(|| self.tab_sidebar(window, cx));
+        let sidebar = rail.then(|| self.tab_sidebar(window, cx));
         // Gate the pane action buttons (tunnel / SFTP) + their panels to a
         // connected native-SSH pane; a foreground `ssh` or a still-connecting
         // session shows only the top-left status strip, no action buttons.
@@ -4410,11 +4568,40 @@ impl Render for Tty7App {
             // "New Worktree Tab" confirmation sheet (from the tab context menu).
             .when_some(self.render_worktree_prompt_overlay(cx), |this, el| {
                 this.child(el)
-            })
-            // Working-tree diff overlay (clicked from a sidebar git line) —
-            // last child, so it paints over every pane-contextual element
-            // above. It covers only the body: the sidebar stays interactive.
-            .when_some(self.render_diff_overlay(cx), |this, el| this.child(el));
+            });
+
+        // Working-tree diff overlay — mounted on the *column*, not on
+        // `body_area`, so it covers the title strip too and reads as one
+        // surface the way the code overlay does. Like that overlay it stops at
+        // the rail and the right panel (both are siblings), which is the point:
+        // the sidebar's git lines stay clickable to switch repo, and the
+        // Changes list stays put so you can walk down it file by file.
+        let diff_overlay = self.render_diff_overlay(cx);
+
+        // Code panel: an immersive overlay ([file tree | editor], IDE-style)
+        // covering the title strip *and* the terminal — the whole column right
+        // of the tab sidebar — so nothing of the terminal chrome distracts.
+        // The terminal underneath keeps its size (no PTY resize/reflow), and
+        // the sidebar stays visible: switching tabs re-roots the tree.
+        let code_overlay = self.render_code_overlay(window, cx);
+
+        // The two column overlays, ordered so the one the user last acted on is
+        // the later child and therefore paints on top. Neither outranks the
+        // other by construction.
+        let overlays: Vec<gpui::AnyElement> = {
+            let mut pair = vec![
+                (OverlayTop::Diff, diff_overlay),
+                (OverlayTop::Code, code_overlay),
+            ];
+            if self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| t.overlay_top == OverlayTop::Diff)
+            {
+                pair.reverse();
+            }
+            pair.into_iter().filter_map(|(_, el)| el).collect()
+        };
 
         // The two layouts. Horizontal (default): a column of [title bar / body].
         // Vertical: the rail is a full-height *left column* that reaches the very
@@ -4422,6 +4609,12 @@ impl Render for Tty7App {
         // title strip and terminal stacked in the right column. That way the rail
         // surface has no seam with the title bar and reads as one continuous
         // panel.
+        // The right detail panel is a full-height column, not a box under the title
+        // bar: it carries its own title-bar-height top zone (tab row + the window's
+        // corner chrome) exactly like the rail does on the left, so its surface
+        // runs unbroken from the very top of the window. Anything less leaves a
+        // horizontal seam where the panel's grey starts under the terminal's bar.
+        let right_panel = self.render_right_panel(window, cx);
         let main_layout = match sidebar {
             Some(sidebar) => div()
                 .flex_1()
@@ -4436,18 +4629,40 @@ impl Render for Tty7App {
                         .min_w_0()
                         .flex()
                         .flex_col()
+                        // Anchor for the code overlay: it fills this column
+                        // (title strip + body) — and, since the panel is a sibling
+                        // rather than a child, stops short of the panel for free.
+                        .relative()
                         .child(title_bar)
-                        .child(body_area),
+                        .child(body_area)
+                        .children(overlays),
                 )
+                .when_some(right_panel, |this, panel| this.child(panel))
                 .into_any_element(),
+            // Horizontal-tabs mode has no rail, but the panel is still a column
+            // beside the stacked [title bar / body], for the same reason: it has to
+            // own its own top zone to read as one surface.
             None => div()
                 .flex_1()
                 .min_h_0()
                 .w_full()
                 .flex()
-                .flex_col()
-                .child(title_bar)
-                .child(body_area)
+                .flex_row()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .relative()
+                        .child(title_bar)
+                        .child(body_area)
+                        // Both overlays cover the whole window face here (their
+                        // content pads down past the traffic lights — see
+                        // `render_code_overlay` and `diff_header`).
+                        .children(overlays),
+                )
+                .when_some(right_panel, |this, panel| this.child(panel))
                 .into_any_element(),
         };
 
@@ -4490,9 +4705,13 @@ impl Render for Tty7App {
             .text_color(cx.theme().foreground)
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_action(cx.listener(|this, _: &NewTab, window, cx| this.new_tab(window, cx)))
-            .on_action(
-                cx.listener(|this, _: &CloseActiveTab, window, cx| this.close_pane(window, cx)),
-            )
+            .on_action(cx.listener(|this, _: &CloseActiveTab, window, cx| {
+                // With focus in the editor panel, ⌘W closes the active file
+                // tab instead of the terminal pane/tab.
+                if !this.editor_close_active_if_focused(window, cx) {
+                    this.close_pane(window, cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
                 this.split(Axis::Horizontal, window, cx)
             }))
@@ -4615,12 +4834,42 @@ impl Render for Tty7App {
                 cx.listener(|this, _: &ToggleTabSidebar, _window, cx| this.toggle_tab_sidebar(cx)),
             )
             .on_action(
+                cx.listener(|this, _: &ToggleLeftPanel, _window, cx| this.toggle_left_panel(cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ToggleRightPanel, _window, cx| this.toggle_right_panel(cx)),
+            )
+            .on_action(cx.listener(|this, _: &ShowRightPanelInfo, _window, cx| {
+                this.set_right_panel_tab(crate::core::config::RightPanelTab::Info, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowRightPanelOutline, _window, cx| {
+                this.set_right_panel_tab(crate::core::config::RightPanelTab::Outline, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowRightPanelChanges, _window, cx| {
+                this.set_right_panel_tab(crate::core::config::RightPanelTab::Changes, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowRightPanelFiles, _window, cx| {
+                this.set_right_panel_tab(crate::core::config::RightPanelTab::Files, cx)
+            }))
+            .on_action(
                 cx.listener(|this, _: &OpenSettings, window, cx| this.toggle_settings(window, cx)),
             )
             .on_action(
                 cx.listener(|this, _: &RestartDaemon, window, cx| this.restart_daemon(window, cx)),
             )
             .on_action(cx.listener(|this, _: &ToggleSftp, window, cx| this.toggle_sftp(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleCodePanel, window, cx| {
+                this.toggle_code_panel(window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &EditorSave, window, cx| this.editor_save_active(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &EditorGotoDefinition, window, cx| {
+                this.editor_goto_definition(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &EditorFindReferences, window, cx| {
+                this.editor_find_references(window, cx)
+            }))
             // Quit lives on the same element-tree action path as every other Cmd
             // shortcut above, so a focused terminal routes `cmd-q` here rather
             // than relying solely on the global handler (which the keystroke
@@ -4760,6 +5009,8 @@ fn tabs_from_session(
             name: st.name.clone(),
             last_focused: None,
             diff_overlay: None,
+            code: None,
+            overlay_top: OverlayTop::default(),
             // Seed the sticky group from the saved session so the sidebar
             // renders grouped on the first frame; the first landed probe
             // corrects it if the tab's repo changed while we were gone.
@@ -4874,7 +5125,26 @@ fn new_terminal(
         },
     )
     .detach();
+    watch_pane_focus(&view, window, cx);
     view
+}
+
+/// Re-render the app whenever `view` takes focus. Nothing else does this: a
+/// pane owns its own focus handle, so clicking between splits notifies the
+/// *pane*, not us, and any chrome that describes "the active pane" — the right
+/// panel's Info and Changes tabs — would keep showing the pane you left until
+/// some unrelated notify happened to repaint. Focus changes are user-paced, so
+/// the extra frames are free.
+fn watch_pane_focus(view: &Entity<TerminalView>, window: &mut Window, cx: &mut Context<Tty7App>) {
+    let handle = view.read(cx).focus_handle.clone();
+    let app = cx.weak_entity();
+    window
+        .on_focus_in(&handle, cx, move |_window, cx| {
+            if let Some(app) = app.upgrade() {
+                app.update(cx, |_, cx| cx.notify());
+            }
+        })
+        .detach();
 }
 
 /// Build a native (russh) SSH terminal view for `spec`, wiring the same
@@ -4908,6 +5178,7 @@ pub(crate) fn new_terminal_native(
         },
     )
     .detach();
+    watch_pane_focus(&view, window, cx);
     Ok(view)
 }
 

@@ -509,6 +509,16 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
             Ok(())
         }
 
+        ClientMsg::QueryProcs { pane_id } => {
+            let mut w = write_stream;
+            // An unknown/dead pane answers empty rather than `Error`: the details
+            // panel polls while the user watches, and a pane closing mid-flight is
+            // ordinary, not a failure worth surfacing.
+            let procs = registry.get(pane_id).map(|p| p.procs()).unwrap_or_default();
+            DaemonMsg::Procs(procs).encode(&mut w)?;
+            Ok(())
+        }
+
         ClientMsg::ListForwards { pane_id } => {
             let mut w = write_stream;
             let list = crate::daemon::ssh::SshManager::global().list_forwards(pane_id);

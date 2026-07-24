@@ -473,6 +473,40 @@ pub struct ManagedForward {
     pub status: ForwardStatus,
 }
 
+/// One process running under a pane's shell, for the details panel's process
+/// list. `depth` is hops from the shell (the shell itself is 0), which is all the
+/// UI needs to indent the tree — sending the parent pid would make the client
+/// rebuild a hierarchy the daemon already walked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcEntry {
+    pub pid: u32,
+    pub name: String,
+    pub depth: u8,
+    /// Whether this process (or its group) currently owns the terminal — the one
+    /// the user is actually looking at.
+    #[serde(default)]
+    pub foreground: bool,
+}
+
+/// A TCP port a pane's process tree is listening on. The pane that started a dev
+/// server is exactly the context in which "which port is this on?" gets asked, so
+/// the answer belongs next to the process list rather than in a global inspector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortEntry {
+    pub port: u16,
+    pub pid: u32,
+    pub name: String,
+}
+
+/// Reply to `QueryProcs`: what a pane is running, and what it's listening on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneProcs {
+    /// Depth-first from the shell, so rendering in order gives a readable tree.
+    pub procs: Vec<ProcEntry>,
+    /// Ascending by port; deduped, since one listener can bind several addresses.
+    pub ports: Vec<PortEntry>,
+}
+
 fn default_term() -> String {
     "xterm-256color".to_string()
 }
@@ -815,6 +849,15 @@ pub enum ClientMsg {
     /// Ask for the managed forwards attributed to `pane_id`. Control-connection
     /// message; the daemon replies with a `ForwardList`.
     ListForwards { pane_id: u64 },
+    /// One-shot query for a pane's process tree and listening ports, over a
+    /// short-lived control connection; the daemon replies with `PaneProcs`.
+    ///
+    /// Deliberately pull-based, unlike `Cwd`/`Agent` which the daemon pushes:
+    /// walking the process table and probing sockets costs far more than sniffing
+    /// an OSC sequence, and the answer is only ever looked at while the details
+    /// panel's Info tab is open. Pushing it on a timer would burn that cost for
+    /// every pane, forever, to feed a view that's usually closed.
+    QueryProcs { pane_id: u64 },
     /// Ask which protocol version the daemon speaks (control connection); the
     /// daemon replies `Version`. A daemon that predates versioning doesn't know
     /// this kind and drops the connection instead of replying — the client
@@ -895,6 +938,8 @@ pub enum DaemonMsg {
     /// Reply to `AddForward` / `RemoveForward` / `ListForwards`: the managed
     /// forwards currently attributed to the requested pane (WS4).
     ForwardList(Vec<ManagedForward>),
+    /// Reply to `QueryProcs`.
+    Procs(PaneProcs),
     /// Reply to `Version`.
     Version(DaemonVersion),
     /// A request failed (e.g. `Attach` to an unknown/dead pane id).
@@ -950,6 +995,9 @@ mod kind {
     /// `Version` — protocol-version handshake. 40 sits clear of every reserved
     /// range above (WS3 16–19, WS4 20–24, SFTP 30–36).
     pub const VERSION: u8 = 40;
+    /// `QueryProcs` — a pane's process tree + listening ports, for the details
+    /// panel. 50 sits clear of every range above and of `VERSION`.
+    pub const QUERY_PROCS: u8 = 50;
 
     // Daemon -> client
     pub const SPAWNED: u8 = 1;
@@ -985,6 +1033,8 @@ mod kind {
     /// `Version` — reply to the client-space `VERSION` request (same value by
     /// design; the spaces are independent).
     pub const VERSION_REPLY: u8 = 40;
+    /// `Procs` — reply to the client-space `QUERY_PROCS` request.
+    pub const PROCS: u8 = 50;
 }
 
 /// Write one framed message: `[u32 LE len][u8 kind][payload]`.
@@ -1126,6 +1176,9 @@ impl ClientMsg {
                 pane_id,
                 forward_id,
             } => write_frame(w, kind::REMOVE_FORWARD, &to_json(&(pane_id, forward_id))?),
+            ClientMsg::QueryProcs { pane_id } => {
+                write_frame(w, kind::QUERY_PROCS, &to_json(pane_id)?)
+            }
             ClientMsg::ListForwards { pane_id } => {
                 write_frame(w, kind::LIST_FORWARDS, &to_json(pane_id)?)
             }
@@ -1189,6 +1242,9 @@ impl ClientMsg {
                 job_id: from_json(&payload)?,
             },
             kind::SFTP_TRANSFER_LIST => ClientMsg::SftpTransferList {
+                pane_id: from_json(&payload)?,
+            },
+            kind::QUERY_PROCS => ClientMsg::QueryProcs {
                 pane_id: from_json(&payload)?,
             },
             kind::ADD_FORWARD => {
@@ -1269,6 +1325,7 @@ impl DaemonMsg {
                 write_frame(w, kind::SFTP_TRANSFER_PROGRESS, &to_json(jobs)?)
             }
             DaemonMsg::ForwardList(list) => write_frame(w, kind::FORWARD_LIST, &to_json(list)?),
+            DaemonMsg::Procs(procs) => write_frame(w, kind::PROCS, &to_json(procs)?),
             DaemonMsg::Version(version) => write_frame(w, kind::VERSION_REPLY, &to_json(version)?),
             DaemonMsg::Error(msg) => write_frame(w, kind::ERROR, &to_json(msg)?),
         }
@@ -1316,6 +1373,7 @@ impl DaemonMsg {
             },
             kind::SFTP_TRANSFER_PROGRESS => DaemonMsg::SftpTransferProgress(from_json(&payload)?),
             kind::FORWARD_LIST => DaemonMsg::ForwardList(from_json(&payload)?),
+            kind::PROCS => DaemonMsg::Procs(from_json(&payload)?),
             kind::VERSION_REPLY => DaemonMsg::Version(from_json(&payload)?),
             kind::ERROR => DaemonMsg::Error(from_json(&payload)?),
             other => {
