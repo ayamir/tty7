@@ -596,7 +596,14 @@ mod tests {
 
     #[test]
     fn uri_round_trips_paths_with_spaces() {
-        let p = Path::new("/tmp/a dir/file.rs");
+        // `Url::from_file_path` requires an *absolute* path in the host's own
+        // shape, so a POSIX literal here would simply fail to convert on
+        // Windows rather than exercise the percent-encoding under test.
+        let p = if cfg!(windows) {
+            Path::new(r"C:\tmp\a dir\file.rs")
+        } else {
+            Path::new("/tmp/a dir/file.rs")
+        };
         let uri = uri_for_path(p).unwrap();
         assert!(uri.starts_with("file:///"));
         assert!(uri.contains("a%20dir"));
