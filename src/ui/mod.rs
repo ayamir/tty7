@@ -16,6 +16,7 @@ pub mod palette;
 pub mod pane;
 pub mod perf;
 pub mod presets;
+pub mod reorder;
 pub mod settings;
 pub mod sftp;
 pub mod ssh_connect;

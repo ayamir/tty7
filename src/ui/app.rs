@@ -10,7 +10,7 @@ use gpui_component::input::{InputEvent, InputState};
 use gpui_component::select::{SearchableVec, SelectEvent, SelectState};
 use gpui_component::slider::{SliderEvent, SliderState};
 use gpui_component::{ActiveTheme as _, IndexPath, TitleBar, WindowExt as _};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -360,6 +360,12 @@ pub struct Tty7App {
     /// Scroll handle for the sidebar's row list, so activating a tab scrolls its
     /// row into view.
     pub(crate) sidebar_scroll: gpui::ScrollHandle,
+    /// `Some` while a tab / group is being dragged to a new position, in either
+    /// the strip or the rail: the frozen geometry the live preview reflow is
+    /// computed against (see [`crate::ui::reorder`]). Shared by `Rc` because the
+    /// `on_drag` that opens it only gets `&mut App`, not the entity. Cleared on
+    /// the first frame after gpui ends the drag.
+    pub(crate) reorder: Rc<RefCell<Option<crate::ui::reorder::Reorder>>>,
     /// Filter box in the sidebar's top control bar ("Search tabs…"); its text
     /// narrows the visible rows by fuzzy-ish substring match on the tab label.
     pub(crate) sidebar_search: Entity<InputState>,
@@ -636,6 +642,7 @@ impl Tty7App {
             sidebar_width: Rc::new(Cell::new(sidebar_width)),
             sidebar_dragging: Rc::new(Cell::new(false)),
             sidebar_scroll: gpui::ScrollHandle::new(),
+            reorder: Rc::new(RefCell::new(None)),
             sidebar_search,
             _sidebar_search_sub: sidebar_search_sub,
             settings: None,
@@ -753,7 +760,7 @@ impl Tty7App {
     /// Snapshot the current tabs/active index into a `Session` and persist it.
     /// Called after every structural change; the write is a small synchronous
     /// JSON dump and any error is swallowed inside `Session::save`.
-    fn save_session(&self, cx: &App) {
+    pub(crate) fn save_session(&self, cx: &App) {
         let tabs: Vec<SessionTab> = self
             .tabs
             .iter()
@@ -2770,33 +2777,25 @@ impl Tty7App {
         cx.notify();
     }
 
-    /// Reorder tabs: move the tab at `from` to position `to` (drag-and-drop).
-    /// Keeps the same tab active across the move and re-persists the session.
-    pub(crate) fn move_tab(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+    /// Rearrange the whole tab vector into `order` (old indices in their new
+    /// order) — the single path by which a drag-reorder lands, used by the
+    /// sidebar where a single visual move can imply a larger permutation
+    /// (relocating a tab inside its group without disturbing the group order,
+    /// or moving an entire group). Keeps the same tab active and re-persists.
+    pub(crate) fn apply_tab_order(&mut self, order: &[usize], cx: &mut Context<Self>) {
+        if order.len() != self.tabs.len() || order.iter().enumerate().all(|(i, &o)| i == o) {
             return;
         }
-        // Reordering shifts indices; a pending rename keyed on a fixed index would
-        // commit onto the wrong tab. Drop it.
+        // Reordering shifts indices: a rename pending on a fixed one would
+        // commit onto the wrong tab.
         self.renaming = None;
         let was_active = self.active;
-        let tab = self.tabs.remove(from);
-        self.tabs.insert(to, tab);
-        // Re-derive the active index so the same logical tab stays selected:
-        // removal shifts indices after `from` left, insertion shifts indices at
-        // or after `to` right.
-        self.active = if was_active == from {
-            to
-        } else {
-            let mut a = was_active;
-            if from < a {
-                a -= 1;
-            }
-            if to <= a {
-                a += 1;
-            }
-            a
-        };
+        let mut slots: Vec<Option<Tab>> = std::mem::take(&mut self.tabs)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.tabs = order.iter().filter_map(|&i| slots[i].take()).collect();
+        self.active = order.iter().position(|&i| i == was_active).unwrap_or(0);
         self.save_session(cx);
         cx.notify();
     }
@@ -4282,6 +4281,32 @@ impl Tty7App {
 
 impl Render for Tty7App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A live drag-reorder commits when the drag *ends*, which in gpui means
+        // the mouse was released (nothing else clears an active drag): the first
+        // frame without one retires the preview and applies the order it was
+        // last showing. Deliberately not an `on_drop` handler — those only fire
+        // when the pointer is over that particular element at release, so a
+        // release a hair outside the rail or the strip would silently lose the
+        // move. What you were looking at is what you get, wherever you let go.
+        // One place at the root covers every surface that can start a drag.
+        if cx.has_active_drag() {
+            // Still dragging: forget last frame's answer so only what this
+            // frame actually draws can be committed (see `clear_pending`).
+            crate::ui::reorder::clear_pending(&self.reorder);
+        } else if let Some(order) = crate::ui::reorder::take_pending(&self.reorder) {
+            self.apply_tab_order(&order, cx);
+        }
+        // While a tab or group is in hand, the cursor is a closed hand for the
+        // whole window. It has to be set on the *drag* rather than styled on
+        // the element: gpui overrides every hovered element's cursor with the
+        // active drag's for the duration, and that override is `None` — a plain
+        // arrow — unless something fills it in. Set once per drag (it forces a
+        // refresh, so re-setting it every frame would spin).
+        if self.reorder.borrow().is_some()
+            && cx.active_drag_cursor_style() != Some(gpui::CursorStyle::ClosedHand)
+        {
+            cx.set_active_drag_cursor_style(gpui::CursorStyle::ClosedHand, window);
+        }
         // Vertical-tab mode: the sidebar owns the tab list, so the title-bar strip
         // drops its chips (keeping only "+"/"⋯"). Gated on having tabs — the
         // zero-tab home page keeps the full-width horizontal layout, so an empty
