@@ -621,7 +621,17 @@ impl Tty7App {
                         // Unlike a row, a header does nothing on click — its
                         // only affordance is the drag, so the open hand is the
                         // honest hover cursor (it closes once you pick it up).
-                        header.cursor_grab().on_drag(DragGroup, {
+                        // Windows has no open-hand system cursor, and gpui's
+                        // Windows backend falls every unmapped `CursorStyle`
+                        // through to `IDC_ARROW` — which reads as "nothing to
+                        // do here". Point there instead: it's the same cursor
+                        // the rows use, and it at least says "interactive".
+                        let header = if cfg!(target_os = "windows") {
+                            header.cursor_pointer()
+                        } else {
+                            header.cursor_grab()
+                        };
+                        header.on_drag(DragGroup, {
                             let state = self.reorder.clone();
                             let slots = group_slots.clone();
                             move |_drag, grab, _window, cx| {
