@@ -278,6 +278,10 @@ struct SearchState {
     /// The query the in-flight (or last completed) walk covers. Render compares
     /// against the live input, so a repaint mid-walk doesn't queue a second one.
     pending: String,
+    /// The dotfile setting that walk ran under. The walk bakes it in — hidden
+    /// and ignored entries never enter the hits — so flipping the eye toggle
+    /// has to re-walk, even though the query never moved.
+    hidden: bool,
     hits: Vec<TreeEntry>,
 }
 
@@ -286,12 +290,13 @@ impl SearchState {
     /// should carry — `None` when the current one already covers it. An empty
     /// query drops the hits so the next one can't flash the previous one's
     /// results before its own land.
-    fn retarget(&mut self, query: &str) -> Option<u64> {
-        if self.pending == query {
+    fn retarget(&mut self, query: &str, show_hidden: bool) -> Option<u64> {
+        if self.pending == query && self.hidden == show_hidden {
             return None;
         }
         self.generation += 1;
         self.pending = query.to_string();
+        self.hidden = show_hidden;
         if query.is_empty() {
             self.hits.clear();
             return None;
@@ -338,6 +343,10 @@ pub(crate) struct FileTreeState {
     /// when any root set changes. Events invalidate the path-keyed caches
     /// above, which are tab-agnostic.
     watcher: Option<notify::RecommendedWatcher>,
+    /// What `watcher` currently spans. The union can move without the active
+    /// tab's roots moving — closing a tab drops roots from it — so the rebuild
+    /// check compares this rather than trusting the per-tab comparison.
+    watched: HashSet<PathBuf>,
     events_tx: smol::channel::Sender<PathBuf>,
     pub(crate) focus_handle: FocusHandle,
 }
@@ -370,6 +379,7 @@ impl FileTreeState {
             editing: None,
             editing_subs: Vec::new(),
             watcher: None,
+            watched: HashSet::new(),
             events_tx: tx,
             focus_handle: cx.focus_handle(),
         }
@@ -379,6 +389,9 @@ impl FileTreeState {
     fn rebuild_watcher(&mut self, roots: &HashSet<PathBuf>) {
         use notify::{RecursiveMode, Watcher};
         self.watcher = None;
+        // Recorded before the watches go on, not after: a root that fails to
+        // watch is logged once, not retried on every render.
+        self.watched = roots.clone();
         if roots.is_empty() {
             return;
         }
@@ -471,7 +484,7 @@ impl FileTreeState {
     /// debounced background walk when it isn't the one already in flight.
     /// Called from render, so the steady state is one string comparison.
     fn sync_search(&mut self, query: &str, roots: &[PathBuf], cx: &mut Context<Tty7App>) {
-        let Some(generation) = self.search.retarget(query) else {
+        let Some(generation) = self.search.retarget(query, self.show_hidden) else {
             return;
         };
         let mut loader = self.loader();
@@ -657,26 +670,29 @@ impl Tty7App {
         let Some(code) = self.tab_code_mut_or_init() else {
             return;
         };
-        // Everything below is only correct work when the root set actually
+        // Dropping the caches is only correct work when the root set actually
         // moved, and doing it unconditionally would spin: render calls this
         // whenever the roots are empty, so a tab that can't produce any (no
         // panes, no `HOME`) would clear the caches and re-notify every frame.
-        if roots == code.roots {
-            return;
+        if roots != code.roots {
+            code.roots = roots;
+            // Refresh listings but keep expansion state; the caches are shared
+            // (path-keyed), so a stale entry only costs a relist.
+            self.file_tree.invalidate_all();
+            cx.notify();
         }
-        code.roots = roots;
-        // Refresh listings but keep expansion state; the caches are shared
-        // (path-keyed), so a stale entry only costs a relist.
-        self.file_tree.invalidate_all();
-        // One watcher over every tab's roots.
+        // One watcher over every tab's roots — which can move while this tab's
+        // stay put (closing a tab takes its roots out of the union), so this
+        // compares the union itself rather than riding on the check above.
         let union: HashSet<PathBuf> = self
             .tabs
             .iter()
             .filter_map(|t| t.code.as_deref())
             .flat_map(|c| c.roots.iter().cloned())
             .collect();
-        self.file_tree.rebuild_watcher(&union);
-        cx.notify();
+        if union != self.file_tree.watched {
+            self.file_tree.rebuild_watcher(&union);
+        }
     }
 
     /// Watcher callback (debounced): drop affected listing caches so the next
@@ -1475,12 +1491,14 @@ mod tests {
     #[test]
     fn search_retarget_spawns_once_per_query_and_older_walks_lose() {
         let mut search = SearchState::default();
-        let first = search.retarget("fo").expect("a new query walks");
+        let first = search.retarget("fo", false).expect("a new query walks");
         assert!(
-            search.retarget("fo").is_none(),
+            search.retarget("fo", false).is_none(),
             "a repaint mid-walk must not queue a second one"
         );
-        let second = search.retarget("foo").expect("a changed query walks");
+        let second = search
+            .retarget("foo", false)
+            .expect("a changed query walks");
         assert_ne!(first, second);
 
         assert!(
@@ -1490,13 +1508,21 @@ mod tests {
         assert!(search.accept(second, vec![entry("foo.rs", false)]));
         assert_eq!(search.hits.len(), 1);
 
+        // The eye toggle filters hits inside the walk, so flipping it re-walks
+        // the query that's already on screen.
+        let third = search
+            .retarget("foo", true)
+            .expect("showing dotfiles re-walks");
+        assert_ne!(second, third);
+        assert!(search.retarget("foo", true).is_none());
+
         // Clearing the box drops the hits so the next query can't flash them,
         // and a restart re-walks the same query rather than sitting on it.
-        assert!(search.retarget("").is_none());
+        assert!(search.retarget("", true).is_none());
         assert!(search.hits.is_empty());
-        search.retarget("foo").expect("typing again walks");
+        search.retarget("foo", true).expect("typing again walks");
         search.restart();
-        assert!(search.retarget("foo").is_some(), "restart re-walks");
+        assert!(search.retarget("foo", true).is_some(), "restart re-walks");
     }
 
     // The gitignore chain moved onto the background loader with the matchers
