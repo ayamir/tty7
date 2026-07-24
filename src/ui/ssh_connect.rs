@@ -299,6 +299,7 @@ fn build_spec_inner(
         term: "xterm-256color".to_string(),
         verify_host_keys: profile.verify_host_keys.unwrap_or(global_verify_host_keys),
         skip_banner: profile.skip_banner,
+        shell_integration: profile.shell_integration,
         login_script: profile.login_scripts.clone(),
         display_name: (!profile.name.is_empty()).then(|| profile.name.clone()),
         profile_id: Some(profile.id.to_string()),

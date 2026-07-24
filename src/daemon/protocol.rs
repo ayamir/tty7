@@ -536,6 +536,19 @@ pub struct NativeSshSpec {
     pub verify_host_keys: bool,
     #[serde(default)]
     pub skip_banner: bool,
+    /// Bootstrap tty7's shell integration (OSC 133 prompt marks + cwd
+    /// reporting) into the remote shell — what powers the inline line editor,
+    /// exit-code marks and cwd tracking for this pane. See
+    /// [`crate::daemon::shell_integration::remote`].
+    ///
+    /// On by default, and a remote we can't integrate declines itself (the
+    /// probe answers "unknown shell" and the session starts bare), so this is
+    /// for the case the probe can't detect: a remote where the bootstrap *would*
+    /// work but the user would rather it didn't — a bash host where the
+    /// login-shell → `--rcfile` swap upsets something, or simply a host they
+    /// want left exactly as stock ssh leaves it.
+    #[serde(default = "default_true")]
+    pub shell_integration: bool,
     /// Lines sent verbatim (each + `\n`) to the shell channel after it starts,
     /// sequentially, with no expect-logic.
     #[serde(default)]
@@ -592,6 +605,7 @@ impl std::fmt::Debug for NativeSshSpec {
             .field("term", &self.term)
             .field("verify_host_keys", &self.verify_host_keys)
             .field("skip_banner", &self.skip_banner)
+            .field("shell_integration", &self.shell_integration)
             .field("login_script", &self.login_script)
             .field("display_name", &self.display_name)
             .field("profile_id", &self.profile_id)
@@ -1919,6 +1933,7 @@ mod tests {
                 term: "xterm-256color".into(),
                 verify_host_keys: true,
                 skip_banner: false,
+                shell_integration: true,
                 login_script: vec![],
                 display_name: None,
                 profile_id: None,
@@ -1942,6 +1957,7 @@ mod tests {
             term: "xterm-256color".into(),
             verify_host_keys: true,
             skip_banner: false,
+            shell_integration: true,
             login_script: vec!["tmux attach".into()],
             display_name: Some("prod-web".into()),
             profile_id: Some("uuid-1".into()),
@@ -1965,6 +1981,10 @@ mod tests {
                 .unwrap();
         assert_eq!(spec.term, "xterm-256color"); // defaulted
         assert!(spec.verify_host_keys); // defaulted true
+        // A spec persisted before shell integration existed must come back
+        // opted *in* — `#[serde(default)]` on a bool would silently turn it off
+        // for every reconnect to a pane saved by an older build.
+        assert!(spec.shell_integration);
         assert_eq!(spec.password, None);
         assert!(spec.jump.is_none());
     }

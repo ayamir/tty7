@@ -169,19 +169,26 @@ pub fn complete(line: &str, cursor: usize, cwd: Option<&Path>) -> Option<Complet
         // back to filesystem paths. A signature slot that declares suggestions
         // or generators owns the position: it returns `Some` (possibly with no
         // sync candidates but pending scripts) rather than ceding to paths.
-        match cwd {
-            // No local cwd — a remote pane. The filesystem here is not the one
-            // the command will run against, so offer nothing rather than this
-            // machine's names, which would be inserted into a remote command
-            // line where they do not exist. Command completion above still
-            // works; real remote-aware path completion would have to source
-            // the listing from the remote and is out of scope.
-            None => (Vec::new(), Vec::new()),
-            Some(cwd) => match complete_signature(&chars, word_start, &word, cwd) {
-                Some(sig) => (sig.cands, sig.pending),
-                None => {
-                    // No signature: generic paths, narrowed to directories when
-                    // the command only takes those (`cd`, `pushd`, …).
+        //
+        // A missing `cwd` means a remote pane, and it disables only the parts
+        // that read *this* machine: paths and generators (see
+        // [`complete_signature`]). The rest of a signature is static text —
+        // `git push`, `--verbose` — and is just as true on the remote, so it is
+        // still offered. Withholding it too would make every Tab in a remote
+        // pane a no-match, and a no-match hands the line to the shell, which
+        // costs the user the inline editor for that prompt.
+        match complete_signature(&chars, word_start, &word, cwd) {
+            Some(sig) => (sig.cands, sig.pending),
+            None => match cwd {
+                // No signature and no local filesystem to fall back on. Offering
+                // this machine's names would insert them into a remote command
+                // line where they do not exist; returning nothing instead lets
+                // the caller hand the Tab to the remote's own completion, which
+                // can actually see that filesystem.
+                None => (Vec::new(), Vec::new()),
+                // No signature: generic paths, narrowed to directories when
+                // the command only takes those (`cd`, `pushd`, …).
+                Some(cwd) => {
                     let dirs_only = current_command(&chars, word_start)
                         .is_some_and(|c| DIR_ONLY_COMMANDS.contains(&c.as_str()));
                     (complete_path(&word, cwd, dirs_only), Vec::new())
@@ -350,11 +357,19 @@ struct SigResult {
 /// value, suggestion, or generator slot (so a bare argument still lists files).
 /// A slot with generators returns `Some` even with zero sync candidates — its
 /// results are still inbound, and falling back to paths there is exactly #51.
+///
+/// `cwd` is `None` for a remote pane, which suppresses the two things that would
+/// answer with *this* machine's state: path completion, and generators. The
+/// generator exclusion matters more than it looks — a generator is a local
+/// `/bin/sh -c` (see [`super::generator`]), so `git checkout <Tab>` against a
+/// remote would offer the branches of whatever repo the *local* cwd happens to
+/// sit in. Wrong filenames are obvious when they fail; wrong branch names look
+/// plausible and land in a real command.
 fn complete_signature(
     chars: &[char],
     word_start: usize,
     word: &str,
-    cwd: &Path,
+    cwd: Option<&Path>,
 ) -> Option<SigResult> {
     // Only the current simple command matters: start after the last shell
     // separator so `foo | git <tab>` completes `git`, not `foo`.
@@ -398,10 +413,15 @@ fn complete_signature(
     if let Some(arg) = pending_value {
         let mut out = Vec::new();
         push_arg_suggestions(&mut out, arg, word);
-        if arg.wants_paths() {
-            out.extend(complete_path(word, cwd, arg.wants_dirs_only()));
+        if let Some(cwd) = cwd {
+            if arg.wants_paths() {
+                out.extend(complete_path(word, cwd, arg.wants_dirs_only()));
+            }
         }
-        let pending = collect_generators(arg);
+        let pending = match cwd {
+            Some(_) => collect_generators(arg),
+            None => Vec::new(),
+        };
         // A slot that declares suggestions or generators owns the position even
         // when nothing matches yet; only a truly featureless value slot cedes to
         // path completion.
@@ -435,10 +455,14 @@ fn complete_signature(
     let mut claims_slot = false;
     if let Some(arg) = node.args().first() {
         push_arg_suggestions(&mut out, arg, word);
-        if arg.wants_paths() {
-            out.extend(complete_path(word, cwd, arg.wants_dirs_only()));
+        if let Some(cwd) = cwd {
+            if arg.wants_paths() {
+                out.extend(complete_path(word, cwd, arg.wants_dirs_only()));
+            }
         }
-        pending = collect_generators(arg);
+        if cwd.is_some() {
+            pending = collect_generators(arg);
+        }
         // Suggestions/generators mean this positional owns the slot: don't cede
         // to paths just because the sync list came back empty.
         claims_slot = !arg.suggestions.is_empty() || !pending.is_empty();
@@ -1081,12 +1105,57 @@ mod tests {
         assert!(complete("cat only", 8, None).is_none());
         // Nor does a bare argument position dump anything.
         assert!(complete("cat ", 4, None).is_none());
-        // A signature-owned slot must not shell out to a local generator either.
-        assert!(complete("git checkout ", 13, None).is_none());
 
         // Command position still works — that source never touches the cwd.
         let c = complete("ech", 3, None).expect("command completion needs no cwd");
         assert!(c.candidates.iter().any(|c| c.text == "echo"));
+    }
+
+    /// The static half of a signature — subcommands, flags — describes the
+    /// *command*, not the machine, so it survives the loss of a local cwd. This
+    /// is what keeps Tab useful in a remote pane: a position with no candidates
+    /// hands the line to the shell (`handoff_tab_to_shell`), which costs the
+    /// user the inline editor until the next prompt, so answering "nothing" for
+    /// every `git <Tab>` was a real regression once remote panes gained an
+    /// editor at all.
+    #[test]
+    fn a_remote_pane_still_gets_a_signatures_static_candidates() {
+        let c = complete("git ", 4, None).expect("subcommands need no filesystem");
+        assert!(c.candidates.iter().any(|c| c.text == "commit"));
+        assert!(c.candidates.iter().any(|c| c.text == "push"));
+
+        // Prefix filtering works the same as it does locally.
+        let c = complete("git ch", 6, None).expect("subcommands need no filesystem");
+        assert!(c.candidates.iter().any(|c| c.text == "checkout"));
+        assert!(!c.candidates.iter().any(|c| c.text == "commit"));
+
+        // Flags too.
+        let c = complete("git commit --", 13, None).expect("flags need no filesystem");
+        assert!(c.candidates.iter().any(|c| c.text == "--message"));
+    }
+
+    /// Generators are local `/bin/sh -c` child processes, so against a remote
+    /// they would answer with this machine's state — `git checkout <Tab>`
+    /// offering the branches of whatever repo tty7's own cwd sits in. Unlike a
+    /// wrong filename, a wrong branch name is plausible enough to be accepted.
+    #[test]
+    fn a_remote_pane_never_runs_a_generator() {
+        // Locally this slot is generator-owned (the branch list).
+        let local = complete("git checkout ", 13, Some(Path::new("/"))).unwrap();
+        assert!(
+            !local.pending.is_empty(),
+            "expected the local branch generator to still be declared"
+        );
+
+        // Remotely the same slot may keep its static candidates, but must not
+        // schedule a single script.
+        if let Some(remote) = complete("git checkout ", 13, None) {
+            assert!(
+                remote.pending.is_empty(),
+                "a remote pane scheduled local generators: {:?}",
+                remote.pending
+            );
+        }
     }
 
     #[test]

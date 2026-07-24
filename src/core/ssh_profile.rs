@@ -74,6 +74,12 @@ pub struct SshProfile {
     pub warn_on_close: Option<bool>,
     /// Suppress the server login banner.
     pub skip_banner: bool,
+    /// Bootstrap tty7's shell integration into the remote shell (prompt marks,
+    /// exit codes, cwd — what the inline line editor runs on). On by default;
+    /// a remote we can't integrate declines itself, so this is the escape hatch
+    /// for one we *can* but shouldn't.
+    #[serde(default = "default_true")]
+    pub shell_integration: bool,
     /// Commands sent automatically right after the shell opens.
     pub login_scripts: Vec<String>,
     /// Request X11 forwarding.
@@ -110,6 +116,7 @@ impl Default for SshProfile {
             connect_timeout_s: None,
             warn_on_close: None,
             skip_banner: false,
+            shell_integration: true,
             login_scripts: Vec::new(),
             x11: false,
             algorithms: Algorithms::default(),
@@ -434,6 +441,22 @@ pub fn expand_tilde(path: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Profiles written before the shell-integration switch existed must load
+    /// with it *on*: a plain `#[serde(default)]` would give `false` and quietly
+    /// opt every existing profile out of the feature it never knew about.
+    #[test]
+    fn profiles_saved_before_the_switch_existed_default_to_integrated() {
+        let profile: SshProfile =
+            serde_json::from_str(r#"{"name":"prod","host":"h","user":"u"}"#).unwrap();
+        assert!(profile.shell_integration);
+        // …and a profile that explicitly opted out stays opted out.
+        let off: SshProfile = serde_json::from_str(
+            r#"{"name":"prod","host":"h","user":"u","shell_integration":false}"#,
+        )
+        .unwrap();
+        assert!(!off.shell_integration);
+    }
+
     #[test]
     fn quick_connect_parses_basic_forms() {
         let q = parse_quick_connect("deploy@10.0.0.5").unwrap();
@@ -678,4 +701,12 @@ fn new_id() -> Uuid {
 /// Serde default for [`SshProfile::port`]: the standard SSH port.
 fn default_port() -> u16 {
     22
+}
+
+/// Serde default for [`SshProfile::shell_integration`]. Named rather than
+/// `#[serde(default)]` because the default is `true`, and because profiles
+/// written before the field existed must deserialize as opted *in* — the
+/// integration is the behavior we want everywhere it works.
+fn default_true() -> bool {
+    true
 }

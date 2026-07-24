@@ -486,6 +486,7 @@ pub(crate) struct SshProfileForm {
     agent_forward: bool,
     x11: bool,
     skip_banner: bool,
+    shell_integration: bool,
     verify_host_keys: Option<bool>,
     warn_on_close: Option<bool>,
 
@@ -1957,6 +1958,7 @@ impl Tty7App {
             agent_forward: profile.agent_forward,
             x11: profile.x11,
             skip_banner: profile.skip_banner,
+            shell_integration: profile.shell_integration,
             verify_host_keys: profile.verify_host_keys,
             warn_on_close: profile.warn_on_close,
             _subs: subs,
@@ -2010,6 +2012,7 @@ impl Tty7App {
             connect_timeout_s: val(&form.connect_timeout).parse().ok(),
             warn_on_close: form.warn_on_close,
             skip_banner: form.skip_banner,
+            shell_integration: form.shell_integration,
             login_scripts: split_lines(&form.login_scripts.read(cx).value()),
             x11: form.x11,
             algorithms: Algorithms {
@@ -2569,6 +2572,22 @@ impl Tty7App {
                         .on_click(cx.listener(|this, on: &bool, _w, cx| {
                             if let Some(f) = this.ssh_form_mut() {
                                 f.x11 = *on;
+                                cx.notify();
+                            }
+                        }))
+                        .into_any_element(),
+                    cx,
+                ),
+            )
+            .child(
+                self.settings_row(
+                    "Shell integration",
+                    "Let the remote shell report prompts, exit codes and directory.",
+                    Switch::new("ssh-form-shell-integration")
+                        .checked(form.shell_integration)
+                        .on_click(cx.listener(|this, on: &bool, _w, cx| {
+                            if let Some(f) = this.ssh_form_mut() {
+                                f.shell_integration = *on;
                                 cx.notify();
                             }
                         }))

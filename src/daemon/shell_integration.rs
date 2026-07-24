@@ -53,6 +53,12 @@
 //! Across all of them: **the user's own dotfiles are never modified** — the
 //! mechanisms above only affect shells tty7 itself launches.
 //!
+//! All of the above configure a *local* process spawn. Native-SSH panes have no
+//! spawn to configure — only the command string an `exec` channel request
+//! carries — so they take a different route to the same place: probe the remote
+//! for its login shell, then send a script that recreates these very files on
+//! the remote side and `exec`s through them. See [`remote`].
+//!
 //! **cmd** stays unintegrated by design, not omission. It exposes exactly one
 //! hook, the `PROMPT` env var, which can emit the `A`/`B` marks but not `C` or
 //! `D`: it has no preexec/postexec, and `PROMPT` is expanded when it is *set*,
@@ -1222,6 +1228,481 @@ pub fn setup(program: Option<&str>, args: &[String], has_custom_args: bool) -> O
         .insert("TTY7_SHELL_INTEGRATION".to_string(), String::new());
 
     Some(injection)
+}
+
+/// Reaching a shell on *another machine* — the native-SSH panes (`daemon::ssh`).
+///
+/// Everything above this point injects by arranging a *local* process spawn: we
+/// write files into a throwaway dir and hand the child an env var or an argv
+/// entry pointing at them. None of that is available over SSH, where the only
+/// lever is the one string the `exec` channel request carries — sshd runs it as
+/// `$SHELL -c <string>` and that is the whole interface.
+///
+/// So the remote path inverts the mechanism: instead of *configuring* a spawn,
+/// we send a short script that **materializes the same files on the remote side
+/// and then `exec`s the real shell through them**. The shell that comes out the
+/// other end is configured exactly as a local one — same `ZDOTDIR` redirector
+/// chain, same bash rcfile replaying the login-file chain, same fish `-C` — so
+/// the integration bodies above are reused verbatim rather than forked.
+///
+/// **Why probe first.** The bootstrap script cannot be shell-agnostic: sshd
+/// hands it to the user's *login* shell, so a POSIX script is parsed by fish (a
+/// syntax error) and a fish script by zsh. Warp solves this with a single
+/// expression contorted to parse identically in sh/bash/zsh/fish; we instead
+/// spend one cheap round-trip on [`PROBE_COMMAND`] — deliberately written to be
+/// valid in all of them because it contains no substitution, no assignment and
+/// no grouping — and then emit a script in the dialect we now know we're
+/// talking to. The result reads like ordinary shell code instead of a puzzle,
+/// and it also tells us when to keep our hands off entirely: a remote whose
+/// login shell isn't one of the three (or isn't POSIX at all — a Windows
+/// `cmd.exe`, where the probe echoes a literal `$SHELL`) parses as `None` and
+/// the caller falls back to a plain shell request. That negative answer is the
+/// load-bearing half: it is what keeps a non-Unix remote from being handed a
+/// script it would choke on, and it's why the probe exists rather than us just
+/// sending a bootstrap and hoping.
+///
+/// The probe's cost is paid once per *connection*, not once per pane — the
+/// caller caches it on the connection registry key, so extra tabs to a host
+/// already open cost nothing.
+pub mod remote {
+    use super::{FISH_INTEGRATION, bash_rcfile, zsh_redirectors};
+
+    /// Asks the remote for the login shell it would have started.
+    ///
+    /// Runs under whatever that shell is, so it is restricted to the
+    /// intersection of sh/bash/zsh/fish/csh syntax: two `echo`s and a `;`.
+    /// Notably absent is any command substitution — fish only learned `$(…)` in
+    /// 3.4 and csh never had it — and any assignment, which fish spells
+    /// differently from everyone else.
+    ///
+    /// The marker line is what makes the answer parseable rather than guessed:
+    /// a remote `.zshenv`/`config.fish` that prints something of its own (banner,
+    /// version-manager chatter) is ignored, because we only read the line that
+    /// follows the marker. See [`parse_probe`].
+    pub const PROBE_COMMAND: &str = "echo __tty7_shell; echo $SHELL";
+
+    /// The line [`PROBE_COMMAND`] prints immediately before the shell path.
+    const PROBE_MARKER: &str = "__tty7_shell";
+
+    /// Heredoc delimiter for the rc files the bootstrap writes remotely. Quoted
+    /// at the use site (`<<'…'`) so the bodies are copied *literally* — they are
+    /// full of `$`, backticks and backslashes that must reach the file intact.
+    const HEREDOC: &str = "__TTY7_RC_EOF__";
+
+    /// A remote login shell we know how to integrate.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum RemoteShell {
+        Zsh,
+        Bash,
+        Fish,
+    }
+
+    impl RemoteShell {
+        fn from_path(path: &str) -> Option<Self> {
+            match path.rsplit('/').next()? {
+                "zsh" => Some(Self::Zsh),
+                "bash" => Some(Self::Bash),
+                "fish" => Some(Self::Fish),
+                _ => None,
+            }
+        }
+    }
+
+    /// Read [`PROBE_COMMAND`]'s output: the first non-empty line after the
+    /// marker is the remote's `$SHELL`.
+    ///
+    /// Returns `None` — meaning "launch a plain shell, inject nothing" — unless
+    /// that line is an absolute path to a shell we support. The absolute-path
+    /// requirement is what rejects a non-POSIX remote: `cmd.exe` echoes the
+    /// string `$SHELL` back unexpanded, and PowerShell prints an empty line, so
+    /// neither can be mistaken for an answer.
+    pub fn parse_probe(output: &str) -> Option<(RemoteShell, String)> {
+        let mut lines = output
+            .lines()
+            .map(|l| l.trim_end_matches('\r').trim())
+            .skip_while(|l| *l != PROBE_MARKER);
+        lines.next()?; // the marker itself
+        let path = lines.find(|l| !l.is_empty())?;
+        if !path.starts_with('/') {
+            return None;
+        }
+        RemoteShell::from_path(path).map(|shell| (shell, path.to_string()))
+    }
+
+    /// The script to send as the channel's `exec` request: it sets the remote up
+    /// for integration and `exec`s `shell_path` as the session's shell.
+    ///
+    /// Every arm ends in an `exec` of the user's own shell, and every arm
+    /// reaches that `exec` even if its setup failed — a remote with a full or
+    /// read-only `$TMPDIR` loses the integration, never the session.
+    pub fn bootstrap_command(shell: RemoteShell, shell_path: &str) -> String {
+        match shell {
+            RemoteShell::Zsh => zsh_bootstrap(shell_path),
+            RemoteShell::Bash => bash_bootstrap(shell_path),
+            RemoteShell::Fish => fish_bootstrap(shell_path),
+        }
+    }
+
+    /// Quote for a POSIX-family shell (zsh/bash): wrap in single quotes and
+    /// spell an embedded quote the only way single-quoting allows.
+    fn shell_quote(s: &str) -> String {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+
+    /// Quote for fish, whose single quotes — unlike POSIX's fully literal ones —
+    /// honour exactly two escapes, `\\` and `\'`. Both need doubling up, and
+    /// nothing else may be touched: the fish body is dense with `\e`, `\a` and
+    /// `$argv`, all of which must survive verbatim.
+    fn fish_quote(s: &str) -> String {
+        format!("'{}'", s.replace('\\', r"\\").replace('\'', r"\'"))
+    }
+
+    /// `command cat > <dir>/<name> <<'EOF' … EOF`, the remote-side equivalent of
+    /// the local `std::fs::write`.
+    ///
+    /// `command` bypasses any alias or function the remote's own startup files
+    /// have put in the way — sshd's `$SHELL -c` still reads `.zshenv`, so we are
+    /// not running in a pristine environment.
+    fn write_file(out: &mut String, name: &str, body: &str) {
+        out.push_str(&format!(
+            "command cat > \"$__tty7_d/{name}\" <<'{HEREDOC}'\n{}\n{HEREDOC}\n",
+            body.trim_end_matches('\n')
+        ));
+    }
+
+    /// Recreate the local `ZDOTDIR` redirector dir on the remote, point `ZDOTDIR`
+    /// at it, and exec zsh as a login shell — the same shape as [`setup_zsh`],
+    /// with the throwaway dir built by a script instead of by `std::fs`.
+    ///
+    /// `ZDOTDIR` is only exported once every redirector is confirmed written:
+    /// pointing zsh at a half-populated dir would silently cost the user their
+    /// dotfiles, which is far worse than not integrating at all.
+    ///
+    /// [`setup_zsh`]: super::setup_zsh
+    fn zsh_bootstrap(shell_path: &str) -> String {
+        let mut out = String::new();
+        out.push_str("__tty7_d=${TMPDIR:-/tmp}/tty7-zdotdir-$$\n");
+        out.push_str("command mkdir -p \"$__tty7_d\" 2>/dev/null\n");
+
+        let mut guard = String::new();
+        for (name, contents) in zsh_redirectors() {
+            // The cleanup hook rides along in .zshrc, after the integration body
+            // — see ZSH_CLEANUP_HOOK for why it can't be a plain `rm` here.
+            let body = if name == ".zshrc" {
+                format!("{contents}{ZSH_CLEANUP_HOOK}")
+            } else {
+                contents
+            };
+            write_file(&mut out, name, &body);
+            guard.push_str(&format!("[ -s \"$__tty7_d/{name}\" ] && "));
+        }
+        out.push_str(&format!(
+            "{guard}export ZDOTDIR=\"$__tty7_d\" TTY7_RM_DIR=\"$__tty7_d\"\n"
+        ));
+        out.push_str(&format!("exec {} -l\n", shell_quote(shell_path)));
+        out
+    }
+
+    /// Write the rcfile and exec bash *non-login* through it, exactly as
+    /// [`setup_bash`] does locally and for the same reason: `--rcfile` is
+    /// silently ignored for a login shell, so the rcfile replays the login-file
+    /// chain itself.
+    ///
+    /// [`setup_bash`]: super::setup_bash
+    fn bash_bootstrap(shell_path: &str) -> String {
+        let quoted = shell_quote(shell_path);
+        let mut out = String::new();
+        out.push_str("__tty7_d=${TMPDIR:-/tmp}/tty7-bashrc-$$\n");
+        out.push_str("command mkdir -p \"$__tty7_d\" 2>/dev/null\n");
+        write_file(
+            &mut out,
+            "bashrc",
+            &format!("{}{BASH_CLEANUP_HOOK}", bash_rcfile()),
+        );
+        out.push_str("if [ -s \"$__tty7_d/bashrc\" ]; then\n");
+        out.push_str("export TTY7_RM_DIR=\"$__tty7_d\"\n");
+        out.push_str(&format!("exec {quoted} --rcfile \"$__tty7_d/bashrc\" -i\n"));
+        out.push_str("fi\n");
+        out.push_str(&format!("exec {quoted} -l\n"));
+        out
+    }
+
+    /// fish needs nothing on disk at either end: `-C` runs the body after the
+    /// user's own `config.fish`, so the whole bootstrap is one `exec`.
+    fn fish_bootstrap(shell_path: &str) -> String {
+        format!(
+            "exec {} -C {} -l\n",
+            fish_quote(shell_path),
+            fish_quote(FISH_INTEGRATION)
+        )
+    }
+
+    /// Remove the throwaway rc dir once the shell has finished reading it.
+    ///
+    /// Unlike a local pane — where the terminal owns the dir and deletes it on
+    /// drop — nothing on the tty7 side can reach the remote filesystem, so the
+    /// shell has to clean up after itself. The deletion can't happen in the
+    /// bootstrap script (zsh hasn't read the files yet) nor at the end of the
+    /// rc file (zsh still has `.zlogin` to read), so it hangs off the first
+    /// `precmd`: by the time a prompt is drawn every startup file has been read,
+    /// and unlinking them is invisible to the running shell.
+    ///
+    /// The path arrives in an exported `TTY7_RM_DIR` because a quoted heredoc
+    /// copies its body literally — there is no interpolation to splice a Rust
+    /// value into. It's immediately demoted to a plain shell variable so it
+    /// doesn't leak into every child process.
+    ///
+    /// The hook doesn't unregister itself, unlike its neighbours: re-running a
+    /// two-line no-op each prompt is cheaper than the array surgery removing it
+    /// would cost.
+    const ZSH_CLEANUP_HOOK: &str = r#"
+# --- tty7 remote cleanup (zsh) ---
+if [[ -n "$TTY7_RM_DIR" ]]; then
+  typeset -g __tty7_rm_dir=$TTY7_RM_DIR
+  unset TTY7_RM_DIR
+  __tty7_rm_rcdir() {
+    [[ -n "$__tty7_rm_dir" ]] || return 0
+    command rm -rf -- "$__tty7_rm_dir"
+    unset __tty7_rm_dir
+  }
+  autoload -Uz add-zsh-hook
+  add-zsh-hook precmd __tty7_rm_rcdir
+fi
+# --- end tty7 remote cleanup ---
+"#;
+
+    /// The bash counterpart of [`ZSH_CLEANUP_HOOK`], registered through the
+    /// `precmd_functions` array that the integration body's vendored
+    /// bash-preexec drives.
+    ///
+    /// This sits *outside* that body's install guard, so on a remote that
+    /// already has tty7 integration in its own `.bashrc` the guard skips the
+    /// install and no `precmd_functions` ever runs — the dir then outlives the
+    /// session. That is the one case we let leak: a few KB under `/tmp` on a
+    /// host the user has explicitly set up, versus the alternative of an `EXIT`
+    /// trap that would clobber whatever trap their dotfiles installed.
+    const BASH_CLEANUP_HOOK: &str = r#"
+# --- tty7 remote cleanup (bash) ---
+if [[ -n "$TTY7_RM_DIR" ]]; then
+  __tty7_rm_dir=$TTY7_RM_DIR
+  unset TTY7_RM_DIR
+  __tty7_rm_rcdir() {
+    [[ -n "$__tty7_rm_dir" ]] || return 0
+    command rm -rf -- "$__tty7_rm_dir"
+    unset __tty7_rm_dir
+  }
+  precmd_functions+=(__tty7_rm_rcdir)
+fi
+# --- end tty7 remote cleanup ---
+"#;
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::{BASH_INTEGRATION, ZSH_INTEGRATION};
+        use super::*;
+
+        #[test]
+        fn probe_reads_the_line_after_the_marker() {
+            assert_eq!(
+                parse_probe("__tty7_shell\n/bin/zsh\n"),
+                Some((RemoteShell::Zsh, "/bin/zsh".to_string()))
+            );
+            // Startup chatter ahead of the marker is ignored — a remote
+            // `.zshenv` that echoes a banner must not be read as the answer.
+            assert_eq!(
+                parse_probe("Welcome to prod!\n__tty7_shell\n/usr/local/bin/fish\n"),
+                Some((RemoteShell::Fish, "/usr/local/bin/fish".to_string()))
+            );
+            assert_eq!(
+                parse_probe("__tty7_shell\r\n/bin/bash\r\n"),
+                Some((RemoteShell::Bash, "/bin/bash".to_string()))
+            );
+        }
+
+        #[test]
+        fn probe_declines_anything_that_isnt_a_shell_we_know() {
+            // cmd.exe echoes the variable back unexpanded; PowerShell prints
+            // nothing. Neither may be mistaken for a POSIX remote.
+            assert_eq!(parse_probe("__tty7_shell\n$SHELL\n"), None);
+            assert_eq!(parse_probe("__tty7_shell\n\n"), None);
+            // A shell we have no integration body for.
+            assert_eq!(parse_probe("__tty7_shell\n/bin/ksh\n"), None);
+            // No marker at all: the command never ran as intended.
+            assert_eq!(parse_probe("/bin/zsh\n"), None);
+        }
+
+        #[test]
+        fn zsh_bootstrap_gates_zdotdir_on_every_redirector_landing() {
+            let script = bootstrap_command(RemoteShell::Zsh, "/bin/zsh");
+            // Pointing zsh at a partially-written dir would drop the user's
+            // dotfiles, so all four files are checked before ZDOTDIR is set.
+            for name in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
+                assert!(
+                    script.contains(&format!("[ -s \"$__tty7_d/{name}\" ] &&")),
+                    "missing landing check for {name}"
+                );
+            }
+            let export = script.find("export ZDOTDIR=").expect("exports ZDOTDIR");
+            let exec = script.find("exec '/bin/zsh' -l").expect("execs zsh");
+            assert!(export < exec);
+            // The integration body must actually reach the remote .zshrc.
+            assert!(script.contains("__tty7_report_cwd"));
+        }
+
+        #[test]
+        fn file_writing_bootstraps_end_in_a_bare_exec_of_the_users_shell() {
+            // The last thing either script does is hand over an unintegrated
+            // shell, so a remote where the setup failed loses the integration
+            // and nothing else. (fish writes no files and so has no failure
+            // path to fall out of — it is a single `exec`, checked below.)
+            for (shell, path) in [
+                (RemoteShell::Zsh, "/bin/zsh"),
+                (RemoteShell::Bash, "/bin/bash"),
+            ] {
+                let script = bootstrap_command(shell, path);
+                let last = script.trim_end().lines().last().unwrap();
+                assert_eq!(
+                    last,
+                    format!("exec '{path}' -l"),
+                    "{shell:?} bootstrap must end by exec'ing {path} bare"
+                );
+            }
+        }
+
+        #[test]
+        fn bash_bootstrap_forces_a_non_login_shell_through_the_rcfile() {
+            let script = bootstrap_command(RemoteShell::Bash, "/bin/bash");
+            // `--rcfile` is ignored for login shells, so the integrated arm must
+            // be `-i`, with the rcfile replaying the login chain itself.
+            assert!(script.contains("exec '/bin/bash' --rcfile \"$__tty7_d/bashrc\" -i"));
+            assert!(script.contains("source /etc/profile"));
+        }
+
+        #[test]
+        fn fish_bootstrap_is_one_exec_carrying_the_escaped_body() {
+            let script = bootstrap_command(RemoteShell::Fish, "/usr/bin/fish");
+            // The whole bootstrap is a single (multi-line) command: fish reads
+            // `-C` after its own config.fish, so there is nothing to write to
+            // disk and no failure path to fall out of.
+            assert!(script.starts_with("exec '/usr/bin/fish' -C '"));
+            assert!(script.trim_end().ends_with("' -l"));
+            assert!(!script.contains("mkdir"));
+
+            // fish single quotes honour exactly \\ and \', so both must be
+            // doubled up on the way in. The body's `printf '\e]%s\a' $argv[1]`
+            // therefore arrives with its quotes escaped *and* its backslashes
+            // doubled — get either wrong and fish sees a terminated string or
+            // an escape sequence instead of the literal text.
+            assert!(script.contains(r"printf \'\\e]%s\\a\' $argv[1]"));
+        }
+
+        #[test]
+        fn quoting_survives_paths_and_bodies_that_fight_back() {
+            assert_eq!(shell_quote("/o'dd/zsh"), r"'/o'\''dd/zsh'");
+            assert_eq!(fish_quote(r"a'b\c"), r"'a\'b\\c'");
+        }
+
+        #[test]
+        fn heredoc_delimiter_cannot_appear_in_a_body_it_delimits() {
+            // A body containing the delimiter on its own line would end the
+            // heredoc early and spill shell code into the script.
+            for body in [ZSH_INTEGRATION, BASH_INTEGRATION, FISH_INTEGRATION] {
+                assert!(!body.contains(HEREDOC));
+            }
+            assert!(!bash_rcfile().contains(HEREDOC));
+        }
+
+        /// Parse `script` with the real shell, without running it. Returns
+        /// `None` when that shell isn't installed here, which is a skip and not
+        /// a failure — these tests are a local safety net, not a CI dependency.
+        ///
+        /// Unix-only, and not merely for convenience: on Windows a bare `bash`
+        /// resolves through `PATH` to `C:\Windows\System32\bash.exe` — the WSL
+        /// launcher, not a shell — which on a machine with no distro installed
+        /// exits non-zero with an empty stderr and is indistinguishable from a
+        /// rejected script. (`is_msys_bash` above exists for the same trap on
+        /// the production path.) Nothing is lost by skipping: these scripts are
+        /// destined for a remote POSIX host, so their syntax has nothing to do
+        /// with the platform running the test, and the Unix CI jobs cover them.
+        #[cfg(unix)]
+        fn parse_check(
+            shell: &str,
+            syntax_only_flag: &str,
+            script: &str,
+        ) -> Option<(bool, String)> {
+            use std::io::Write as _;
+            use std::process::{Command, Stdio};
+
+            let mut child = Command::new(shell)
+                .arg(syntax_only_flag)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .ok()?;
+            child
+                .stdin
+                .take()
+                .expect("piped stdin")
+                .write_all(script.as_bytes())
+                .expect("write script");
+            let out = child.wait_with_output().expect("wait for parse check");
+            Some((
+                out.status.success(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            ))
+        }
+
+        /// The bootstrap scripts, and the rc files they carry, must parse under
+        /// the shells they're written for.
+        ///
+        /// This is worth a real subprocess where the local paths' unit tests
+        /// aren't, because a syntax error costs far more here: a local shell
+        /// with a broken rcfile still opens (bash just complains), but a remote
+        /// one takes the whole `exec` request down with it and the user gets a
+        /// session that dies on connect. Quoting is also doing much more work
+        /// on this path — a heredoc, two escaping dialects, and a body that
+        /// travels as an argv entry — so there is correspondingly more to break.
+        ///
+        /// Skipped where the shell isn't installed; `-n` / `--no-execute` parse
+        /// without running anything, so this never spawns a shell session.
+        #[cfg(unix)]
+        #[test]
+        fn bootstrap_scripts_parse_under_their_real_shells() {
+            let cases = [
+                (RemoteShell::Zsh, "zsh", "-n", "/bin/zsh"),
+                (RemoteShell::Bash, "bash", "-n", "/bin/bash"),
+                (RemoteShell::Fish, "fish", "--no-execute", "/usr/bin/fish"),
+            ];
+            for (shell, bin, flag, path) in cases {
+                let script = bootstrap_command(shell, path);
+                if let Some((ok, stderr)) = parse_check(bin, flag, &script) {
+                    assert!(ok, "{bin} rejected its bootstrap script:\n{stderr}");
+                }
+            }
+        }
+
+        /// A quoted heredoc's body is data, so the check above never parses the
+        /// rc files it writes — they have to be fed to the shell separately.
+        #[cfg(unix)]
+        #[test]
+        fn heredoc_bodies_parse_under_their_real_shells() {
+            for (name, contents) in zsh_redirectors() {
+                let body = if name == ".zshrc" {
+                    format!("{contents}{ZSH_CLEANUP_HOOK}")
+                } else {
+                    contents
+                };
+                if let Some((ok, stderr)) = parse_check("zsh", "-n", &body) {
+                    assert!(ok, "zsh rejected the remote {name}:\n{stderr}");
+                }
+            }
+            let rcfile = format!("{}{BASH_CLEANUP_HOOK}", bash_rcfile());
+            if let Some((ok, stderr)) = parse_check("bash", "-n", &rcfile) {
+                assert!(ok, "bash rejected the remote rcfile:\n{stderr}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
