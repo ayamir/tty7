@@ -1615,6 +1615,16 @@ fi
         /// Parse `script` with the real shell, without running it. Returns
         /// `None` when that shell isn't installed here, which is a skip and not
         /// a failure — these tests are a local safety net, not a CI dependency.
+        ///
+        /// Unix-only, and not merely for convenience: on Windows a bare `bash`
+        /// resolves through `PATH` to `C:\Windows\System32\bash.exe` — the WSL
+        /// launcher, not a shell — which on a machine with no distro installed
+        /// exits non-zero with an empty stderr and is indistinguishable from a
+        /// rejected script. (`is_msys_bash` above exists for the same trap on
+        /// the production path.) Nothing is lost by skipping: these scripts are
+        /// destined for a remote POSIX host, so their syntax has nothing to do
+        /// with the platform running the test, and the Unix CI jobs cover them.
+        #[cfg(unix)]
         fn parse_check(
             shell: &str,
             syntax_only_flag: &str,
@@ -1656,6 +1666,7 @@ fi
         ///
         /// Skipped where the shell isn't installed; `-n` / `--no-execute` parse
         /// without running anything, so this never spawns a shell session.
+        #[cfg(unix)]
         #[test]
         fn bootstrap_scripts_parse_under_their_real_shells() {
             let cases = [
@@ -1673,6 +1684,7 @@ fi
 
         /// A quoted heredoc's body is data, so the check above never parses the
         /// rc files it writes — they have to be fed to the shell separately.
+        #[cfg(unix)]
         #[test]
         fn heredoc_bodies_parse_under_their_real_shells() {
             for (name, contents) in zsh_redirectors() {
