@@ -80,16 +80,11 @@ notify-rust = "4"
 # editor, `ui::code`) reuses it to refresh the tree and detect external edits.
 notify = "8"
 
-# Code panel (file tree + editor, `ui::code`). `ropey` and `lsp-types` are pinned
-# to the exact versions gpui-component uses so its `InputState` rope / LSP
-# provider types unify with ours; `ignore` supplies the gitignore matcher chain
-# the file tree uses to dim ignored entries (same crate ripgrep uses).
-ropey = "=2.0.0-beta.1"
-lsp-types = { version = "0.97.0", features = ["proposed"] }
+# Code panel (file tree + editor, `ui::code`): `ignore` supplies the gitignore
+# matcher chain the file tree uses to dim ignored entries (same crate ripgrep
+# uses). The editor itself needs nothing else — text storage and syntax
+# highlighting both live inside gpui-component's `InputState`.
 ignore = "0.4"
-# `url` does the file-path ↔ `file://` URI conversion for the LSP client
-# (percent-encoding, Windows drive letters); already in the tree via gpui.
-url = "2"
 
 # Cross-platform PTY for the daemon: a Unix pty on Unix, ConPTY on Windows, behind
 # one blocking `Read`/`Write`/`resize` API. This is what lets `daemon::pane` share

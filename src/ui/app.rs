@@ -144,8 +144,8 @@ pub struct Tab {
     /// roots/expansion, and visibility. Same per-tab contract as
     /// `diff_overlay` — switching away hides it, switching back restores it,
     /// closing the tab drops it. Shared caches (directory listings, gitignore
-    /// matchers, language servers, watchers) live on [`Tty7App`]. `None` until
-    /// the panel is first opened in this tab.
+    /// matchers, watchers) live on [`Tty7App`]. `None` until the panel is
+    /// first opened in this tab.
     pub(crate) code: Option<Box<crate::ui::code_editor::TabCode>>,
     /// The sidebar group this tab last *definitively* belonged to: the
     /// repository home of its first pane's cwd — the main checkout's root, so
@@ -4864,12 +4864,6 @@ impl Render for Tty7App {
             .on_action(
                 cx.listener(|this, _: &EditorSave, window, cx| this.editor_save_active(window, cx)),
             )
-            .on_action(cx.listener(|this, _: &EditorGotoDefinition, window, cx| {
-                this.editor_goto_definition(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &EditorFindReferences, window, cx| {
-                this.editor_find_references(window, cx)
-            }))
             // Quit lives on the same element-tree action path as every other Cmd
             // shortcut above, so a focused terminal routes `cmd-q` here rather
             // than relying solely on the global handler (which the keystroke
