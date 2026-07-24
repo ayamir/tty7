@@ -13,11 +13,15 @@
 //! sidebar row does, Changes probes the same `git_diff` the diff overlay does, and
 //! Files renders the same rows as the code panel's tree.
 
-use gpui::{AnyElement, Context, Window, div, prelude::*, px};
+use gpui::{AnyElement, Context, MouseButton, Window, WindowControlArea, div, prelude::*, px};
 use gpui_component::button::Button;
 use gpui_component::input::Input;
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_component::{
+    ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Sizable as _, h_flex, v_flex,
+};
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use crate::core::config::{Config, RightPanelTab};
 use crate::daemon::protocol::PaneProcs;
@@ -51,10 +55,17 @@ pub(crate) struct RightPanelState {
     pub(crate) procs_pane: Option<u64>,
     /// Last completed process/port query for `procs_pane`.
     pub(crate) procs: Option<PaneProcs>,
-    /// A query is in flight. Also the poll loop's own guard: the loop reschedules
-    /// itself from the completion handler, so this being set means "a tick is
-    /// already on the way" and a re-render must not start a second chain.
+    /// A poll cycle is live — a query is in flight *or* the inter-tick timer is
+    /// waiting between ticks. The render path checks this before starting the
+    /// loop, so a re-render never starts a second chain. It must stay set across
+    /// the timer too: clearing it the instant a query returned let every repaint
+    /// in the 2s gap kick off another query, collapsing the interval into a tight
+    /// query→notify→repaint→query loop that made the list flicker.
     pub(crate) procs_loading: bool,
+    /// Bumped on every pane switch to retire the in-flight poll loop: a tick whose
+    /// generation no longer matches drops its result and stops rescheduling, so the
+    /// freshly started loop for the new pane is the only one left running.
+    pub(crate) procs_gen: u64,
 }
 
 /// How often the Info tab re-queries processes and ports while it's open. Fast
@@ -134,10 +145,43 @@ impl Tty7App {
                 // bolted under the title bar: its surface runs the full height of
                 // the window, and the tab row sits *on* it rather than on the
                 // terminal's bar above a seam.
-                .child(
+                .child({
+                    // The top zone sits level with the real `TitleBar`, but the
+                    // bar only spans the terminal column — so, exactly like the
+                    // rail's top strip (`tab_sidebar`), make this one act like the
+                    // title bar it aligns with: drag to move, double-click to zoom.
+                    // A press arms a flag and the first *move* starts the window
+                    // move, so a plain click on a tab — and a double-click — still
+                    // lands intact; the tabs and corner chrome take their own.
+                    let should_move = Rc::new(Cell::new(false));
                     h_flex()
+                        .id("right-panel-titlebar-drag")
                         .flex_none()
                         .h(px(crate::ui::app::TITLE_BAR_HEIGHT))
+                        // gpui-component's `TitleBar` centres its content inside a
+                        // `border_b_1` box — border-box shrinks the content height
+                        // by that 1px, nudging its centred glyphs up half a pixel.
+                        // The corner chrome (⋯, panel toggle) lives in *both* the
+                        // title bar and here, so mirror that hidden border to keep
+                        // its centre line identical; without it the glyphs jump
+                        // down a physical pixel the moment the panel opens.
+                        .border_b_1()
+                        .border_color(cx.theme().transparent)
+                        .window_control_area(WindowControlArea::Drag)
+                        .on_mouse_down(MouseButton::Left, {
+                            let should_move = should_move.clone();
+                            move |_, _, _| should_move.set(true)
+                        })
+                        .on_mouse_up(MouseButton::Left, {
+                            let should_move = should_move.clone();
+                            move |_, _, _| should_move.set(false)
+                        })
+                        .on_mouse_move(move |_, window, _| {
+                            if should_move.replace(false) {
+                                window.start_window_move();
+                            }
+                        })
+                        .on_double_click(|_, window, _| window.titlebar_double_click())
                         .items_center()
                         .gap(px(2.))
                         .pl(px(CONTENT_INSET - crate::ui::app::TILE_PAD))
@@ -145,8 +189,8 @@ impl Tty7App {
                         .child(div().flex_1())
                         // The panel is what reaches the window's right edge while
                         // it's open, so it carries the corner chrome.
-                        .child(self.window_chrome(window, cx)),
-                )
+                        .child(self.window_chrome(window, cx))
+                })
                 .child(body)
                 .child(handle)
                 .into_any_element(),
@@ -252,15 +296,20 @@ impl Tty7App {
     /// what the icon-only tab row can't. `trailing` carries a tab's own controls
     /// where it has any, so they sit on the label's line rather than earning a
     /// second header row.
+    /// A tab's header: the name in a weightier small-caps than the old faint
+    /// label, plus an optional live count trailing it (files, commands, changed
+    /// files) so the header states scale at a glance, and an optional control on
+    /// the right. The count is the quiet mono tally the sidebar group headers use.
     fn panel_title(
         &self,
         text: &str,
+        count: Option<String>,
         trailing: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         h_flex()
             .flex_none()
-            .h(px(28.))
+            .h(px(32.))
             .items_center()
             .justify_between()
             .pl(px(CONTENT_INSET))
@@ -272,10 +321,25 @@ impl Tty7App {
                 CONTENT_INSET
             }))
             .child(
-                div()
-                    .text_size(px(10.))
-                    .text_color(cx.theme().muted_foreground)
-                    .child(text.to_uppercase()),
+                h_flex()
+                    .items_baseline()
+                    .gap(px(7.))
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(cx.theme().secondary_foreground)
+                            .child(text.to_uppercase()),
+                    )
+                    .when_some(count, |this, c| {
+                        this.child(
+                            div()
+                                .text_size(px(11.))
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_color(cx.theme().muted_foreground.opacity(0.75))
+                                .child(c),
+                        )
+                    }),
             )
             .when_some(trailing, |this, t| this.child(t))
             .into_any_element()
@@ -366,7 +430,7 @@ impl Tty7App {
     /// row comes from an accessor the sidebar already uses, so the panel can
     /// never disagree with the row that spawned it.
     fn render_panel_info(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let title = self.panel_title("Info", None, cx);
+        let title = self.panel_title("Info", None, None, cx);
         let mut rows: Vec<(&'static str, String)> = Vec::new();
         // Held aside from `rows` because they're not key/value lines: the actions
         // hang off the cwd, and the two lists get their own sub-headers below.
@@ -416,25 +480,31 @@ impl Tty7App {
         // ticking while this tab is the one being looked at.
         self.sync_procs(pane_id, cx);
 
-        let mut list = v_flex().px(px(CONTENT_INSET)).py(px(2.)).gap(px(5.));
+        let mono = cx.theme().mono_font_family.clone();
+        let mut list = v_flex().px(px(CONTENT_INSET)).py(px(2.)).gap(px(3.));
         for (k, v) in rows {
             list = list.child(
                 h_flex()
                     .items_baseline()
-                    .gap(px(8.))
-                    .text_size(px(11.5))
+                    .gap(px(9.))
+                    .py(px(1.))
+                    .text_size(px(12.))
                     .child(
                         div()
                             .flex_none()
-                            .w(px(52.))
+                            .w(px(46.))
                             .text_color(cx.theme().muted_foreground)
                             .child(k),
                     )
                     .child(
+                        // The value is the datum — a path, a branch, a host, a
+                        // count — so it takes the mono face, set apart from the
+                        // sans key beside it.
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
+                            .font_family(mono.clone())
                             .text_color(cx.theme().foreground)
                             .child(v),
                     ),
@@ -442,6 +512,10 @@ impl Tty7App {
         }
 
         let inner = v_flex()
+            // Three labelled bands — Session / Processes / Ports — instead of one
+            // flat column, so the pane's facts, what it's running, and what it's
+            // listening on read as distinct groups.
+            .child(self.panel_subtitle("Session", false, cx))
             .child(list)
             .when_some(cwd_for_actions, |this, cwd| {
                 this.child(self.cwd_actions(cwd, cx))
@@ -504,14 +578,20 @@ impl Tty7App {
             .into_any_element()
     }
 
-    /// A small caps divider inside a tab's body, for the sub-lists that hang off
-    /// the Info tab. Lighter than [`panel_title`], which is the tab's own header.
-    fn panel_subtitle(&self, text: &str, cx: &mut Context<Self>) -> AnyElement {
+    /// A small-caps band label inside a tab's body, for the sub-lists that hang
+    /// off the Info tab. Lighter than [`panel_title`], which is the tab's own
+    /// header. `divider` draws a hairline above it, so the second and third bands
+    /// separate from the one before; the first band passes `false`.
+    fn panel_subtitle(&self, text: &str, divider: bool, cx: &mut Context<Self>) -> AnyElement {
         div()
+            .when(divider, |d| {
+                d.mt(px(6.)).border_t_1().border_color(cx.theme().border)
+            })
             .px(px(CONTENT_INSET))
-            .pt(px(12.))
-            .pb(px(3.))
-            .text_size(px(10.))
+            .pt(px(if divider { 12. } else { 10. }))
+            .pb(px(4.))
+            .text_size(px(10.5))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
             .text_color(cx.theme().muted_foreground)
             .child(text.to_uppercase())
             .into_any_element()
@@ -525,13 +605,13 @@ impl Tty7App {
         if procs.len() < 2 {
             return None;
         }
-        let mut list = v_flex().px(px(CONTENT_INSET)).gap(px(1.));
+        let mono = cx.theme().mono_font_family.clone();
+        let mut list = v_flex().px(px(CONTENT_INSET)).py(px(1.)).gap(px(2.));
         for p in procs {
             list = list.child(
                 h_flex()
-                    .items_baseline()
-                    .gap(px(6.))
-                    .text_size(px(11.5))
+                    .items_center()
+                    .gap(px(8.))
                     .child(
                         div()
                             .flex_1()
@@ -540,6 +620,8 @@ impl Tty7App {
                             // Indent by depth so the tree reads without drawing
                             // connector glyphs into a 260px column.
                             .pl(px(f32::from(p.depth) * 10.))
+                            .text_size(px(12.))
+                            .font_family(mono.clone())
                             .text_color(if p.foreground {
                                 cx.theme().foreground
                             } else {
@@ -547,18 +629,17 @@ impl Tty7App {
                             })
                             .child(p.name.clone()),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(10.5))
-                            .text_color(cx.theme().muted_foreground)
-                            .child(p.pid.to_string()),
-                    ),
+                    .child(info_chip(
+                        &p.pid.to_string(),
+                        cx.theme().accent,
+                        cx.theme().muted_foreground,
+                        &mono,
+                    )),
             );
         }
         Some(
             v_flex()
-                .child(self.panel_subtitle("Processes", cx))
+                .child(self.panel_subtitle("Processes", true, cx))
                 .child(list)
                 .into_any_element(),
         )
@@ -571,25 +652,26 @@ impl Tty7App {
         if ports.is_empty() {
             return None;
         }
-        let mut list = v_flex().px(px(CONTENT_INSET)).gap(px(1.));
+        let mono = cx.theme().mono_font_family.clone();
+        let mut list = v_flex().px(px(CONTENT_INSET)).py(px(1.)).gap(px(2.));
         for p in ports {
             list = list.child(
                 h_flex()
-                    .items_baseline()
+                    .items_center()
                     .gap(px(8.))
-                    .text_size(px(11.5))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(52.))
-                            .text_color(cx.theme().foreground)
-                            .child(p.port.to_string()),
-                    )
+                    .child(info_chip(
+                        &p.port.to_string(),
+                        cx.theme().accent,
+                        cx.theme().foreground,
+                        &mono,
+                    ))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
+                            .text_size(px(12.))
+                            .font_family(mono.clone())
                             .text_color(cx.theme().muted_foreground)
                             .child(p.name.clone()),
                     ),
@@ -597,7 +679,7 @@ impl Tty7App {
         }
         Some(
             v_flex()
-                .child(self.panel_subtitle("Ports", cx))
+                .child(self.panel_subtitle("Ports", true, cx))
                 .child(list)
                 .into_any_element(),
         )
@@ -618,17 +700,24 @@ impl Tty7App {
             // Drop the previous pane's answer rather than showing it under the new
             // pane's heading until the first tick lands.
             self.right_panel.procs = None;
+            // Retire the old pane's loop and free the guard so the new pane's loop
+            // can start below; the retired tick bows out on the generation check.
+            self.right_panel.procs_gen += 1;
+            self.right_panel.procs_loading = false;
         }
         if !self.right_panel.procs_loading {
-            self.spawn_procs_query(pane_id, cx);
+            self.right_panel.procs_loading = true;
+            let generation = self.right_panel.procs_gen;
+            self.spawn_procs_query(pane_id, generation, cx);
         }
     }
 
     /// One query, then reschedule — the poll loop. It reschedules only while the
     /// panel is open on Info, so the loop is self-terminating: close the panel or
     /// switch tabs and the next completion simply doesn't queue another.
-    fn spawn_procs_query(&mut self, pane_id: u64, cx: &mut Context<Self>) {
-        self.right_panel.procs_loading = true;
+    fn spawn_procs_query(&mut self, pane_id: u64, generation: u64, cx: &mut Context<Self>) {
+        // `procs_loading` is set by the caller (`sync_procs`) and deliberately
+        // stays set across the whole cycle, including the timer wait below.
         cx.spawn(async move |this, cx| {
             let procs = cx
                 .background_executor()
@@ -636,16 +725,21 @@ impl Tty7App {
                 .await;
             let keep_polling = this
                 .update(cx, |app, cx| {
-                    app.right_panel.procs_loading = false;
-                    // A pane switch while we flew makes this answer stale; drop it
-                    // and let the new pane's own query land.
-                    if app.right_panel.procs_pane != Some(pane_id) {
+                    // A pane switch while we flew bumped the generation: drop this
+                    // answer and leave the guard to whoever owns the new one.
+                    if app.right_panel.procs_gen != generation {
                         return false;
                     }
                     app.right_panel.procs = Some(procs);
                     cx.notify();
                     let cfg = cx.global::<Config>();
-                    cfg.right_panel_visible && cfg.right_panel_tab == RightPanelTab::Info
+                    let wanted =
+                        cfg.right_panel_visible && cfg.right_panel_tab == RightPanelTab::Info;
+                    if !wanted {
+                        // Loop ends here; release the guard so reopening restarts it.
+                        app.right_panel.procs_loading = false;
+                    }
+                    wanted
                 })
                 .unwrap_or(false);
             if !keep_polling {
@@ -654,11 +748,16 @@ impl Tty7App {
             cx.background_executor().timer(PROCS_POLL).await;
             let _ = this.update(cx, |app, cx| {
                 // Re-check rather than trusting the pre-sleep decision: two seconds
-                // is plenty of time to close the panel.
+                // is plenty of time to switch panes or close the panel.
+                if app.right_panel.procs_gen != generation {
+                    return;
+                }
                 let cfg = cx.global::<Config>();
                 let wanted = cfg.right_panel_visible && cfg.right_panel_tab == RightPanelTab::Info;
-                if wanted && app.right_panel.procs_pane == Some(pane_id) {
-                    app.spawn_procs_query(pane_id, cx);
+                if wanted {
+                    app.spawn_procs_query(pane_id, generation, cx);
+                } else {
+                    app.right_panel.procs_loading = false;
                 }
             });
         })
@@ -674,41 +773,59 @@ impl Tty7App {
     /// Newest first because that's the end you came from: you scrolled past the
     /// thing you want, and the list should start where your attention is.
     fn render_panel_outline(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let title = self.panel_title("Outline", None, cx);
         let Some(leaf) = self
             .tabs
             .get(self.active)
             .and_then(|t| t.detail_pane(window, cx))
         else {
+            let title = self.panel_title("Outline", None, None, cx);
             return self.panel_scroll(self.panel_empty("No active session.", cx), title);
         };
-        let marks = leaf.read(cx).command_marks();
-        if marks.is_empty() {
+        // Count first (a cheap getter) so the borrow ends before `panel_title`
+        // needs `&mut cx`; the list re-borrows the marks below.
+        let count = leaf.read(cx).command_marks().len();
+        if count == 0 {
             // Two very different causes, one honest sentence: nothing has run
             // yet, or this shell never reported OSC 133 (no integration, a bare
             // `sh`, a nested PTY that eats the marks).
+            let title = self.panel_title("Outline", None, None, cx);
             return self.panel_scroll(
                 self.panel_empty("No commands recorded for this pane.", cx),
                 title,
             );
         }
+        let title = self.panel_title("Outline", Some(count.to_string()), None, cx);
 
+        let mono = cx.theme().mono_font_family.clone();
         let mut list = v_flex().px(px(CONTENT_INSET - 4.)).py(px(2.)).gap(px(1.));
+        let marks = leaf.read(cx).command_marks();
         for mark in marks.iter().rev() {
             let row = mark.row;
             let leaf = leaf.clone();
-            // A command that failed is the one you're most often looking for, so
-            // it gets the only color in the list.
             let failed = mark.exit.is_some_and(|c| c != 0);
+            let running = !mark.done;
+            // A leading status marker reads as a shape first: a hollow ring for a
+            // clean finish, a filled dot while it runs, and — the only tinted one
+            // — a danger dot for a nonzero exit. The failure is what you scan for.
+            let dot = {
+                let d = div().flex_none().size(px(7.)).rounded_full();
+                if failed {
+                    d.bg(cx.theme().danger)
+                } else if running {
+                    d.bg(cx.theme().muted_foreground)
+                } else {
+                    d.border_1()
+                        .border_color(cx.theme().muted_foreground.opacity(0.55))
+                }
+            };
             list = list.child(
                 h_flex()
                     .id(gpui::SharedString::from(format!("panel-mark-{row}")))
-                    .items_baseline()
-                    .gap(px(6.))
+                    .items_center()
+                    .gap(px(8.))
                     .px(px(4.))
-                    .py(px(2.))
-                    .rounded(px(4.))
-                    .text_size(px(11.5))
+                    .py(px(3.))
+                    .rounded(px(5.))
                     .cursor_pointer()
                     .hover(|s| s.bg(cx.theme().sidebar_accent.opacity(0.55)))
                     .on_click(cx.listener(move |_this, _, _window, cx| {
@@ -716,18 +833,21 @@ impl Tty7App {
                             view.scroll_to_mark(row, cx);
                         });
                     }))
+                    .child(dot)
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
+                            // Commands are code: the mono face sets them apart from
+                            // the sans labels and lines the list up like a log.
+                            .text_size(px(12.))
+                            .font_family(mono.clone())
                             .text_color(if failed {
                                 cx.theme().danger
                             } else {
                                 cx.theme().foreground
                             })
-                            // Commands wrap in the shell but must not here: one
-                            // row per command is what makes the list scannable.
                             .child(one_line(&mark.text)),
                     )
                     // Only nonzero exits earn a badge. Annotating every success
@@ -738,19 +858,9 @@ impl Tty7App {
                             div()
                                 .flex_none()
                                 .text_size(px(10.5))
+                                .font_family(mono.clone())
                                 .text_color(cx.theme().danger)
                                 .child(code.to_string()),
-                        )
-                    })
-                    // A command still running is worth marking: it's why the
-                    // pane is busy.
-                    .when(!mark.done, |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .text_size(px(10.5))
-                                .text_color(cx.theme().muted_foreground)
-                                .child("…"),
                         )
                     }),
             );
@@ -764,7 +874,6 @@ impl Tty7App {
     /// diff overlay's hunk cards, which need far more than 260px to be readable.
     /// Clicking a row opens the full overlay on that repo.
     fn render_panel_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let title = self.panel_title("Changes", None, cx);
         let cwd = self
             .tabs
             .get(self.active)
@@ -777,6 +886,7 @@ impl Tty7App {
             });
 
         let Some(cwd) = cwd else {
+            let title = self.panel_title("Changes", None, None, cx);
             return self.panel_scroll(self.panel_empty("No working directory.", cx), title);
         };
         // Probe on first paint for this cwd, and whenever the pane moves to a
@@ -787,6 +897,18 @@ impl Tty7App {
             self.right_panel.diff = None;
             self.spawn_right_panel_diff(cwd.clone(), cx);
         }
+
+        // Count of changed files for the header tally — computed before the title
+        // so the diff borrow ends before `panel_title` takes `&mut cx`.
+        let count = match &self.right_panel.diff {
+            Some(Some(snap)) => {
+                let n = snap.files.len() + snap.untracked.len();
+                (n > 0).then(|| n.to_string())
+            }
+            _ => None,
+        };
+        let title = self.panel_title("Changes", count, None, cx);
+        let mono = cx.theme().mono_font_family.clone();
 
         let inner = match &self.right_panel.diff {
             None => self.panel_empty("Loading…", cx),
@@ -811,12 +933,11 @@ impl Tty7App {
                     list = list.child(
                         h_flex()
                             .id(gpui::SharedString::from(format!("panel-change-{path}")))
-                            .items_baseline()
+                            .items_center()
                             .gap(px(8.))
                             .px(px(4.))
-                            .py(px(2.))
-                            .rounded(px(4.))
-                            .text_size(px(11.5))
+                            .py(px(3.))
+                            .rounded(px(5.))
                             .cursor_pointer()
                             .hover(|s| s.bg(cx.theme().sidebar_accent.opacity(0.55)))
                             .when(selected, |s| s.bg(cx.theme().sidebar_accent))
@@ -835,36 +956,62 @@ impl Tty7App {
                                     );
                                 })
                             })
+                            // A neutral status letter, kind by glyph not by hue —
+                            // tracked edits are `M`; untracked get `U` below.
+                            .child(git_badge("M", cx.theme().muted_foreground, &mono))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
+                                    .text_size(px(12.))
+                                    .font_family(mono.clone())
                                     .text_color(cx.theme().foreground)
                                     .child(path),
                             )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_color(cx.theme().success)
-                                    .child(format!("+{added}")),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_color(cx.theme().danger)
-                                    .child(format!("−{removed}")),
-                            ),
+                            // +N / −M keep the terminal-git greens and reds, the
+                            // one place hue earns its keep; a zero side is dropped
+                            // rather than shown as `+0`.
+                            .when(added > 0, |this| {
+                                this.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(11.))
+                                        .font_family(mono.clone())
+                                        .text_color(cx.theme().success)
+                                        .child(format!("+{added}")),
+                                )
+                            })
+                            .when(removed > 0, |this| {
+                                this.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(11.))
+                                        .font_family(mono.clone())
+                                        .text_color(cx.theme().danger)
+                                        .child(format!("−{removed}")),
+                                )
+                            }),
                     );
                 }
                 if !untracked.is_empty() {
                     list = list.child(
-                        div()
-                            .pt(px(4.))
+                        h_flex()
+                            .items_center()
+                            .gap(px(8.))
                             .px(px(4.))
-                            .text_size(px(11.))
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{} untracked", untracked.len())),
+                            .py(px(3.))
+                            .child(git_badge(
+                                "U",
+                                cx.theme().muted_foreground.opacity(0.75),
+                                &mono,
+                            ))
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{} untracked", untracked.len())),
+                            ),
                     );
                 }
                 list.into_any_element()
@@ -913,7 +1060,7 @@ impl Tty7App {
     /// views of one tree rather than two trees.
     fn render_panel_files(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let controls = self.files_controls(cx);
-        let title = self.panel_title("Files", Some(controls), cx);
+        let title = self.panel_title("Files", None, Some(controls), cx);
         let search = self.files_search(cx);
         let rows = self.render_file_tree_rows(window, cx);
         v_flex()
@@ -924,6 +1071,38 @@ impl Tty7App {
             .child(rows)
             .into_any_element()
     }
+}
+
+/// A small status letter (`M`/`U`/…) for a change row. The *kind* is told by the
+/// glyph in the mono face, not by colour, so the list stays monochrome; callers
+/// pass a muted tone and reserve real hue for the `+N −M` counts beside it.
+fn git_badge(letter: &str, color: gpui::Hsla, mono: &gpui::SharedString) -> AnyElement {
+    div()
+        .flex_none()
+        .w(px(14.))
+        .text_center()
+        .text_size(px(10.5))
+        .font_family(mono.clone())
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(color)
+        .child(letter.to_string())
+        .into_any_element()
+}
+
+/// A pid / port pill: a mono number on the soft-grey capsule the rest of the
+/// chrome uses, so a numeric datum reads as a tag rather than loose text.
+fn info_chip(text: &str, bg: gpui::Hsla, fg: gpui::Hsla, mono: &gpui::SharedString) -> AnyElement {
+    div()
+        .flex_none()
+        .px(px(5.))
+        .py(px(1.5))
+        .rounded(px(4.))
+        .bg(bg)
+        .text_size(px(10.5))
+        .font_family(mono.clone())
+        .text_color(fg)
+        .child(text.to_string())
+        .into_any_element()
 }
 
 /// The one-word status the Info row shows next to the agent's name.

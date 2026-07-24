@@ -945,7 +945,7 @@ impl Tty7App {
             .gap_1()
             .pl(px(6.0 + row.depth as f32 * INDENT))
             .pr_1()
-            .py_0p5()
+            .py_1()
             .rounded(cx.theme().radius)
             .cursor_pointer()
             // Soft inset-pill highlight on the content surface.
@@ -953,8 +953,10 @@ impl Tty7App {
             .when(!selected, |d| {
                 d.hover(|s| s.bg(cx.theme().accent.opacity(0.5)))
             })
+            // Folders take the full foreground, files the muted tone — a neutral
+            // weight difference, no hue, so the tree keeps the terminal's calm.
             .child(Icon::new(icon).xsmall().text_color(if is_dir {
-                cx.theme().primary
+                cx.theme().foreground
             } else {
                 muted
             }))

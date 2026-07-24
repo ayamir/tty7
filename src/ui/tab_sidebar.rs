@@ -748,11 +748,11 @@ impl Tty7App {
             .child(
                 self.attach_new_tab_menu(
                     Button::new("sidebar-add")
-                        .icon(Icon::new(IconName::Plus).size(px(15.)))
+                        .icon(Icon::new(IconName::Plus).size(px(18.)))
                         .ghost()
                         .xsmall()
-                        .w(px(30.))
-                        .h(px(30.))
+                        .w(px(32.))
+                        .h(px(32.))
                         .rounded_lg(),
                     cx,
                 ),
@@ -760,13 +760,13 @@ impl Tty7App {
             .child(
                 crate::ui::tab_strip::chrome_tile(
                     Button::new("sidebar-collapse")
-                        .icon(Icon::new(IconName::PanelLeft).size(px(15.))),
+                        .icon(Icon::empty().path("icons/panel-left.svg").size(px(18.))),
                     false,
                     cx,
                 )
                 .xsmall()
-                .w(px(30.))
-                .h(px(30.))
+                .w(px(32.))
+                .h(px(32.))
                 .rounded_lg()
                 .tooltip("Hide Sidebar")
                 .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),

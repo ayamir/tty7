@@ -164,7 +164,10 @@ pub(crate) fn chrome_tile_variant(cx: &gpui::App) -> ButtonCustomVariant {
     let accent = cx.theme().sidebar_accent;
     ButtonCustomVariant::new(cx)
         .color(cx.theme().transparent)
-        .foreground(cx.theme().secondary_foreground)
+        // Full `foreground`, not the softer `secondary_foreground`: the chrome
+        // glyphs read as deliberate controls rather than faint hints — the
+        // "commercial-app" weight, paired with the filled dock icons below.
+        .foreground(cx.theme().foreground)
         .hover(accent.opacity(0.55))
         .active(accent)
 }
@@ -213,13 +216,13 @@ impl Tty7App {
                 div().occlude().flex_shrink_0().child(
                     chrome_tile(
                         Button::new("titlebar-right-panel")
-                            .icon(Icon::new(IconName::PanelRight).size(px(15.))),
+                            .icon(Icon::empty().path("icons/panel-right.svg").size(px(18.))),
                         panel_open,
                         cx,
                     )
                     .xsmall()
-                    .w(px(30.))
-                    .h(px(30.))
+                    .w(px(32.))
+                    .h(px(32.))
                     .rounded_lg()
                     .tooltip("Detail Panel")
                     .on_click(cx.listener(|this, _, _window, cx| {
@@ -231,13 +234,13 @@ impl Tty7App {
                 div().occlude().flex_shrink_0().child(
                     chrome_tile(
                         Button::new("titlebar-menu")
-                            .icon(Icon::new(IconName::Ellipsis).size(px(15.))),
+                            .icon(Icon::new(IconName::Ellipsis).size(px(18.))),
                         false,
                         cx,
                     )
                     .xsmall()
-                    .w(px(30.))
-                    .h(px(30.))
+                    .w(px(32.))
+                    .h(px(32.))
                     .rounded_lg()
                     .dropdown_menu_with_anchor(
                         gpui::Anchor::TopRight,
@@ -257,10 +260,29 @@ impl Tty7App {
     pub(crate) fn right_panel_tabs(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let active_tab = cx.global::<Config>().right_panel_tab;
         [
-            (RightPanelTab::Info, IconName::Info, "Info"),
-            (RightPanelTab::Outline, IconName::SquareTerminal, "Outline"),
-            (RightPanelTab::Changes, IconName::Replace, "Changes"),
-            (RightPanelTab::Files, IconName::FolderClosed, "Files"),
+            (
+                RightPanelTab::Info,
+                Icon::empty().path("icons/info.svg"),
+                "Info",
+            ),
+            (
+                RightPanelTab::Outline,
+                Icon::empty().path("icons/list.svg"),
+                "Outline",
+            ),
+            // git-branch (from tty7's own assets) instead of the abstract
+            // `Replace` glyph: Changes is a working-tree diff, and the branch
+            // mark reads as version control at a glance — matching the mockup.
+            (
+                RightPanelTab::Changes,
+                Icon::empty().path("icons/git-branch.svg"),
+                "Changes",
+            ),
+            (
+                RightPanelTab::Files,
+                Icon::new(IconName::FolderClosed),
+                "Files",
+            ),
         ]
         .into_iter()
         .map(|(tab, icon, label)| {
@@ -269,14 +291,13 @@ impl Tty7App {
                 .flex_shrink_0()
                 .child(
                     chrome_tile(
-                        Button::new(("right-panel-tab", tab as usize))
-                            .icon(Icon::new(icon).size(px(15.))),
+                        Button::new(("right-panel-tab", tab as usize)).icon(icon.size(px(18.))),
                         active_tab == tab,
                         cx,
                     )
                     .xsmall()
-                    .w(px(30.))
-                    .h(px(30.))
+                    .w(px(32.))
+                    .h(px(32.))
                     .rounded_lg()
                     .tooltip(label)
                     .on_click(cx.listener(move |this, _, _window, cx| {
@@ -1061,13 +1082,13 @@ impl Tty7App {
                 self.attach_new_tab_menu(
                     chrome_tile(
                         Button::new("tab-add")
-                            .icon(Icon::new(IconName::Plus).size(px(15.))),
+                            .icon(Icon::new(IconName::Plus).size(px(18.))),
                         false,
                         cx,
                     )
                         .xsmall()
-                        .w(px(30.))
-                        .h(px(30.))
+                        .w(px(32.))
+                        .h(px(32.))
                         .rounded_lg(),
                     cx,
                 ),
@@ -1091,13 +1112,13 @@ impl Tty7App {
                         self.attach_new_tab_menu(
                             chrome_tile(
                                 Button::new("titlebar-add-collapsed")
-                                    .icon(Icon::new(IconName::Plus).size(px(15.))),
+                                    .icon(Icon::new(IconName::Plus).size(px(18.))),
                                 false,
                                 cx,
                             )
                             .xsmall()
-                            .w(px(30.))
-                            .h(px(30.))
+                            .w(px(32.))
+                            .h(px(32.))
                             .rounded_lg(),
                             cx,
                         ),
@@ -1107,13 +1128,13 @@ impl Tty7App {
                     div().occlude().flex_shrink_0().child(
                         chrome_tile(
                             Button::new("titlebar-expand-sidebar")
-                                .icon(Icon::new(IconName::PanelLeft).size(px(15.))),
+                                .icon(Icon::empty().path("icons/panel-left.svg").size(px(18.))),
                             false,
                             cx,
                         )
                         .xsmall()
-                        .w(px(30.))
-                        .h(px(30.))
+                        .w(px(32.))
+                        .h(px(32.))
                         .rounded_lg()
                         .tooltip("Show Sidebar")
                         .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
