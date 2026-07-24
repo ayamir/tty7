@@ -14,8 +14,10 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 pub(super) struct Backend {
     tray: TrayIcon,
-    /// The icon state currently shown, so a snapshot diff that doesn't flip
-    /// attention skips the bitmap rebuild.
+    /// Whether the amber badge is currently stamped, so a snapshot diff that
+    /// doesn't flip attention skips the bitmap rebuild. macOS tracks nothing:
+    /// its template glyph never changes (see `icon.rs`).
+    #[cfg(not(target_os = "macos"))]
     attention: bool,
 }
 
@@ -37,12 +39,15 @@ impl Backend {
             }
         }));
 
+        #[cfg(target_os = "macos")]
+        let img = icon::render()?;
+        #[cfg(not(target_os = "macos"))]
         let img = icon::render(false)?;
         let icon = Icon::from_rgba(img.data, img.width, img.height).ok()?;
         let tray = TrayIconBuilder::new()
             .with_icon(icon)
-            // The calm glyph is a template on macOS (system recolors it for
-            // the bar); a no-op on Windows.
+            // The glyph is a template on macOS (system recolors it for the
+            // bar, in both states); a no-op on Windows.
             .with_icon_as_template(true)
             .with_tooltip("tty7")
             .with_menu(Box::new(build_menu(&TraySnapshot::default())))
@@ -57,26 +62,50 @@ impl Backend {
                 return None;
             }
         };
+
+        // tray-icon hardcodes the NSImage height to 18 pt; override to a
+        // larger size so the glyph fills more of the menu bar. The bitmap
+        // itself is already rendered at `icon::SIZE` px (retina-ready).
+        #[cfg(target_os = "macos")]
+        if let Some(status_item) = tray.ns_status_item() {
+            if let Some(mtm) = objc2::MainThreadMarker::new() {
+                if let Some(button) = status_item.button(mtm) {
+                    if let Some(nsimage) = button.image() {
+                        // 22 pt matches the macOS menu bar height; the glyph
+                        // scales proportionally from its 96×96 viewBox.
+                        let target_h: f64 = 22.0;
+                        let aspect = nsimage.size().width / nsimage.size().height;
+                        nsimage.setSize(objc2_foundation::NSSize::new(target_h * aspect, target_h));
+                    }
+                }
+            }
+        }
         Some(Self {
             tray,
+            #[cfg(not(target_os = "macos"))]
             attention: false,
         })
     }
 
     /// Push a changed snapshot into the native item: menu always (it's what
-    /// changed), icon only across an attention flip.
+    /// changed); on Windows, the badge only across an attention flip. The
+    /// macOS icon is a template image in every state — the system recolors it
+    /// for the bar, and it never carries an attention mark (status lives in
+    /// the tooltip and menu).
     pub(super) fn update(&mut self, snap: &TraySnapshot) {
         self.tray.set_menu(Some(Box::new(build_menu(snap))));
         let _ = self.tray.set_tooltip(Some(snap.tooltip()));
-        let attention = snap.attention();
-        if attention != self.attention {
-            self.attention = attention;
-            if let Some(img) = icon::render(attention)
-                && let Ok(icon) = Icon::from_rgba(img.data, img.width, img.height)
-            {
-                // Attention leaves template mode: the amber badge needs
-                // its real color (macOS; the flag is a no-op on Windows).
-                let _ = self.tray.set_icon_with_as_template(Some(icon), !attention);
+        // Windows: flip the amber corner badge on the colored icon.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let attention = snap.attention();
+            if attention != self.attention {
+                self.attention = attention;
+                if let Some(img) = icon::render(attention)
+                    && let Ok(icon) = Icon::from_rgba(img.data, img.width, img.height)
+                {
+                    let _ = self.tray.set_icon(Some(icon));
+                }
             }
         }
     }

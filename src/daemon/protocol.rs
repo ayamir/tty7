@@ -76,6 +76,18 @@ pub struct ShellSpec {
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// True when `args` were authored by tty7's own shell discovery
+    /// (`core::shells`) rather than by the user, and so may be replaced by
+    /// shell integration — Git Bash's `-i -l` is tty7's way of saying "an
+    /// interactive login shell", which `setup_bash`'s `--rcfile … -i` plus its
+    /// replayed login-file chain expresses differently but equivalently.
+    /// User-configured args get no such liberty; see
+    /// `daemon::shell_integration::setup`'s `has_custom_args`.
+    ///
+    /// Defaults to `false` on the wire so an older client's frame — which can
+    /// only carry user-configured args — keeps them untouched.
+    #[serde(default)]
+    pub args_are_tty7_defaults: bool,
 }
 
 /// Whether a short `ssh` option flag consumes the following argument as its
@@ -120,14 +132,21 @@ pub struct PaneInfo {
     pub alive: bool,
 }
 
-/// A foreground remote session the daemon can prove from the local process table.
+/// A pane whose filesystem is not the host's — either a remote session, or a
+/// local one behind a boundary the host's own tools can't follow (WSL).
+///
+/// The common consequence, whatever the kind, is that the pane's cwd names a
+/// path in *that* namespace: see `TerminalView::local_cwd`, which is what keeps
+/// a local `git` / `read_dir` / spawn away from it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteContext {
     pub kind: RemoteKind,
     /// Original foreground argv. Kept so follow-up operations can preserve ssh
-    /// config flags such as `-F`, `-p`, and `-J` rather than guessing.
+    /// config flags such as `-F`, `-p`, and `-J` rather than guessing. Empty
+    /// for kinds that aren't detected from a foreground process.
     pub argv: Vec<String>,
-    /// The destination token (`host`, `user@host`, or ssh config alias).
+    /// The destination token: `host`, `user@host`, or ssh config alias for the
+    /// ssh kinds; the distro name for [`RemoteKind::Wsl`].
     pub target: String,
 }
 
@@ -142,6 +161,15 @@ pub enum RemoteKind {
     /// (`daemon::ssh`). Forwarding / SFTP reach the connection through the
     /// in-memory registry.
     NativeSsh,
+    /// A `wsl.exe` pane: not remote in the network sense, but its shell lives
+    /// inside a distro with its own filesystem namespace, so a cwd it reports
+    /// (`/home/me/proj`) means nothing to the Windows-side host — and on
+    /// Windows is *drive-relative* rather than invalid, so it silently resolves
+    /// to `C:\home\me\proj`. Set at spawn time from the `ShellSpec`, not
+    /// detected from the process table. Nothing SSH-specific applies to it:
+    /// callers that mean "an SSH pane" must test the kind, not merely that a
+    /// `RemoteContext` is present.
+    Wsl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -542,6 +570,19 @@ pub struct NativeSshSpec {
     pub verify_host_keys: bool,
     #[serde(default)]
     pub skip_banner: bool,
+    /// Bootstrap tty7's shell integration (OSC 133 prompt marks + cwd
+    /// reporting) into the remote shell — what powers the inline line editor,
+    /// exit-code marks and cwd tracking for this pane. See
+    /// [`crate::daemon::shell_integration::remote`].
+    ///
+    /// On by default, and a remote we can't integrate declines itself (the
+    /// probe answers "unknown shell" and the session starts bare), so this is
+    /// for the case the probe can't detect: a remote where the bootstrap *would*
+    /// work but the user would rather it didn't — a bash host where the
+    /// login-shell → `--rcfile` swap upsets something, or simply a host they
+    /// want left exactly as stock ssh leaves it.
+    #[serde(default = "default_true")]
+    pub shell_integration: bool,
     /// Lines sent verbatim (each + `\n`) to the shell channel after it starts,
     /// sequentially, with no expect-logic.
     #[serde(default)]
@@ -598,6 +639,7 @@ impl std::fmt::Debug for NativeSshSpec {
             .field("term", &self.term)
             .field("verify_host_keys", &self.verify_host_keys)
             .field("skip_banner", &self.skip_banner)
+            .field("shell_integration", &self.shell_integration)
             .field("login_script", &self.login_script)
             .field("display_name", &self.display_name)
             .field("profile_id", &self.profile_id)
@@ -1454,6 +1496,7 @@ mod tests {
                 shell: Some(ShellSpec {
                     program: "wsl.exe".into(),
                     args: vec!["--distribution".into(), "Ubuntu".into()],
+                    args_are_tty7_defaults: true,
                 }),
             },
             ClientMsg::Attach {
@@ -1589,6 +1632,13 @@ mod tests {
                 argv: vec!["ssh".into(), "-p".into(), "2222".into(), "dev".into()],
                 target: "dev".into(),
             })),
+            // A WSL pane's context rides the same wire; `kind` is serialized
+            // kebab-case, so this pins the encoding of the new variant.
+            DaemonMsg::RemoteContext(Some(RemoteContext {
+                kind: RemoteKind::Wsl,
+                argv: Vec::new(),
+                target: "Ubuntu-24.04".into(),
+            })),
             DaemonMsg::RemoteContext(None),
             DaemonMsg::Agent(Some(crate::core::cli_agent::CLIAgent::Claude)),
             DaemonMsg::Agent(Some(crate::core::cli_agent::CLIAgent::Codex)),
@@ -1597,7 +1647,13 @@ mod tests {
                 status: crate::core::cli_agent::AgentStatus::Waiting,
                 message: Some("Claude needs your permission to use Bash".into()),
                 session_id: Some("abc-123".into()),
+                launch_argv: Some(vec![
+                    "claude".into(),
+                    "--dangerously-skip-permissions".into(),
+                ]),
                 rich: true,
+                cwd: Some("/repo/.claude/worktrees/fix-x".into()),
+                activity: 12,
             })),
             DaemonMsg::AgentStatus(None),
             DaemonMsg::LoopbackForward(LoopbackForward { local_port: 49152 }),
@@ -1748,6 +1804,8 @@ mod tests {
         let shell = ShellSpec {
             program: "fish".to_string(),
             args: vec!["-l".to_string()],
+            // Set so the round-trip covers the flag, not just program + args.
+            args_are_tty7_defaults: true,
         };
         let msg = ClientMsg::Spawn {
             cwd: Some(PathBuf::from("/work")),
@@ -1933,6 +1991,7 @@ mod tests {
                 term: "xterm-256color".into(),
                 verify_host_keys: true,
                 skip_banner: false,
+                shell_integration: true,
                 login_script: vec![],
                 display_name: None,
                 profile_id: None,
@@ -1956,6 +2015,7 @@ mod tests {
             term: "xterm-256color".into(),
             verify_host_keys: true,
             skip_banner: false,
+            shell_integration: true,
             login_script: vec!["tmux attach".into()],
             display_name: Some("prod-web".into()),
             profile_id: Some("uuid-1".into()),
@@ -1979,6 +2039,10 @@ mod tests {
                 .unwrap();
         assert_eq!(spec.term, "xterm-256color"); // defaulted
         assert!(spec.verify_host_keys); // defaulted true
+        // A spec persisted before shell integration existed must come back
+        // opted *in* — `#[serde(default)]` on a bool would silently turn it off
+        // for every reconnect to a pane saved by an older build.
+        assert!(spec.shell_integration);
         assert_eq!(spec.password, None);
         assert!(spec.jump.is_none());
     }

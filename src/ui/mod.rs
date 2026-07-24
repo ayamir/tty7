@@ -19,6 +19,7 @@ pub mod palette;
 pub mod pane;
 pub mod perf;
 pub mod presets;
+pub mod reorder;
 pub mod right_panel;
 pub mod settings;
 pub mod sftp;

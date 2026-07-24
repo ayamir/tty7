@@ -35,6 +35,7 @@ mod reverse_search;
 pub mod search;
 mod signature;
 mod size;
+mod smart_select;
 mod typeahead;
 pub mod view;
 

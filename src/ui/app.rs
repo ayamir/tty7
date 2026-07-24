@@ -10,7 +10,7 @@ use gpui_component::input::{InputEvent, InputState};
 use gpui_component::select::{SearchableVec, SelectEvent, SelectState};
 use gpui_component::slider::{SliderEvent, SliderState};
 use gpui_component::{ActiveTheme as _, IndexPath, TitleBar, WindowExt as _};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -383,6 +383,10 @@ pub struct Tty7App {
     /// the same repo shows the just-refreshed branch/diff line, not a stale
     /// per-row copy. Never read.
     _git_status_watch: Subscription,
+    /// Keeps the window-appearance observer alive: while
+    /// `Config::theme_follow_system` is on, an OS light/dark flip re-resolves
+    /// the theme slot and repaints. Never read.
+    _appearance_watch: Subscription,
     /// `Some` while the command palette overlay is open; `None` when closed.
     /// The view owns its search input, filtered list and keyboard handling and
     /// emits a `PaletteEvent`; we build the catalog and run the chosen command.
@@ -446,6 +450,12 @@ pub struct Tty7App {
     /// Scroll handle for the sidebar's row list, so activating a tab scrolls its
     /// row into view.
     pub(crate) sidebar_scroll: gpui::ScrollHandle,
+    /// `Some` while a tab / group is being dragged to a new position, in either
+    /// the strip or the rail: the frozen geometry the live preview reflow is
+    /// computed against (see [`crate::ui::reorder`]). Shared by `Rc` because the
+    /// `on_drag` that opens it only gets `&mut App`, not the entity. Cleared on
+    /// the first frame after gpui ends the drag.
+    pub(crate) reorder: Rc<RefCell<Option<crate::ui::reorder::Reorder>>>,
     /// Filter box in the sidebar's top control bar ("Search tabs…"); its text
     /// narrows the visible rows by fuzzy-ish substring match on the tab label.
     pub(crate) sidebar_search: Entity<InputState>,
@@ -627,13 +637,40 @@ impl Tty7App {
         // so treat it like a release. Dismissing on *both* flips also keeps a
         // reveal scheduled just before the switch from popping the badges up
         // in a window the user already left.
-        let activation_watch = cx.observe_window_activation(window, |this, _window, cx| {
+        let activation_watch = cx.observe_window_activation(window, |this, window, cx| {
             this.dismiss_mod_hint(cx);
             // The panes' link-modifier tracking loses the release the same
             // way, and a stale "⌘ held" is worse than missing badges: a
             // plain unmodified click would open links. Treat the flip as a
             // release; holding ⌘ again re-arms it via `on_modifiers_changed`.
             this.set_link_modifier(false, cx);
+            // Coming back is the only cue we get that the working tree may
+            // have moved while the user was elsewhere: an edit in another
+            // editor, a `git` command in another app, an agent in another
+            // window. None of those reach a pane's poll loop, so without this
+            // the sidebar's `+N −N` would keep showing pre-alt-tab numbers
+            // until the user happened to run a command in the pane.
+            if window.is_window_active() {
+                this.refresh_git_status_all(cx);
+            }
+        });
+        // Follow OS light/dark flips live: while "sync with system" is on, an
+        // appearance change re-resolves the theme slot and repaints. While it's
+        // off the appearance only ever changes because `apply_theme` pinned it
+        // to the theme — skip, or the pin would re-trigger a redundant apply.
+        let this = cx.weak_entity();
+        let appearance_watch = window.observe_window_appearance(move |window, cx| {
+            if !cx.global::<Config>().theme_follow_system {
+                return;
+            }
+            apply_theme(Some(window), cx);
+            let _ = this.update(cx, |this, cx| {
+                // The editor targets the on-screen theme, and with no global
+                // override the opacity slider follows it — keep both in step.
+                this.rebuild_theme_editor(window, cx);
+                this.sync_window_opacity_slider(window, cx);
+                cx.notify();
+            });
         });
         // Paint the configured color theme (defaults to a light one) and build
         // the menu bar.
@@ -685,6 +722,7 @@ impl Tty7App {
             _keystroke_watch: keystroke_watch,
             _activation_watch: activation_watch,
             _git_status_watch: git_status_watch,
+            _appearance_watch: appearance_watch,
             palette: None,
             palette_sub: None,
             closed: Vec::new(),
@@ -716,6 +754,7 @@ impl Tty7App {
             right_panel_width: Rc::new(Cell::new(right_panel_width)),
             right_panel_dragging: Rc::new(Cell::new(false)),
             sidebar_scroll: gpui::ScrollHandle::new(),
+            reorder: Rc::new(RefCell::new(None)),
             sidebar_search,
             _sidebar_search_sub: sidebar_search_sub,
             file_search,
@@ -789,11 +828,20 @@ impl Tty7App {
                 return true;
             }
             // From the home page (zero tabs) there are no running sessions to
-            // reassure about — prompting would be pure friction. Close directly.
+            // reassure about — prompting would be pure friction. Close directly,
+            // but still quit with the window: closing our only window without
+            // quitting leaves a windowless process sitting in the Dock that no
+            // longer responds to being clicked (#147). Deferred onto the next
+            // tick so the close itself completes first, same as the confirmed
+            // path below.
             if weak_app
                 .upgrade()
                 .is_some_and(|app| app.read(cx).tabs.is_empty())
             {
+                cx.spawn(async move |cx| {
+                    let _ = cx.update(|cx| cx.quit());
+                })
+                .detach();
                 return true;
             }
             let answer = window.prompt(
@@ -826,7 +874,7 @@ impl Tty7App {
     /// Snapshot the current tabs/active index into a `Session` and persist it.
     /// Called after every structural change; the write is a small synchronous
     /// JSON dump and any error is swallowed inside `Session::save`.
-    fn save_session(&self, cx: &App) {
+    pub(crate) fn save_session(&self, cx: &App) {
         let tabs: Vec<SessionTab> = self
             .tabs
             .iter()
@@ -1195,8 +1243,90 @@ impl Tty7App {
 
     /// Switch the active color theme by id, repaint, and persist the choice so
     /// it survives a restart. The theme carries its own dark/light brightness.
+    /// While the system is being followed, the choice lands in the slot for the
+    /// *current* OS appearance (the theme visibly on screen changes either way).
     pub(crate) fn set_preset(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        cx.global_mut::<Config>().theme_preset = id.to_string();
+        let dark_now = crate::ui::theme::system_dark(cx);
+        let cfg = cx.global_mut::<Config>();
+        if !cfg.theme_follow_system {
+            cfg.theme_preset = id.to_string();
+        } else if dark_now {
+            cfg.theme_preset_dark = id.to_string();
+        } else {
+            cfg.theme_preset_light = id.to_string();
+        }
+        self.after_theme_change(window, cx);
+    }
+
+    /// Set the theme for one follow-system slot explicitly (the Light / Dark
+    /// cards in Settings). Only visibly changes anything when that slot is the
+    /// one currently on screen; either way the choice is persisted.
+    pub(crate) fn set_slot_preset(
+        &mut self,
+        dark_slot: bool,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cfg = cx.global_mut::<Config>();
+        if dark_slot {
+            cfg.theme_preset_dark = id.to_string();
+        } else {
+            cfg.theme_preset_light = id.to_string();
+        }
+        self.after_theme_change(window, cx);
+    }
+
+    /// Turn "sync with system appearance" on/off (the Appearance switch).
+    /// Turning it off never visibly changes the theme: whatever is on screen
+    /// is adopted as the manual choice. Turning it on seeds the slot matching
+    /// the manual theme's own brightness with that theme — so the look only
+    /// changes when the OS is currently in the *other* mode, where switching
+    /// to that mode's slot is exactly what the feature promises.
+    pub(crate) fn set_theme_follow_system(
+        &mut self,
+        on: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if on {
+            let manual = cx.global::<Config>().theme_preset.clone();
+            let manual_dark = crate::ui::presets::by_id(cx, &manual).dark;
+            let cfg = cx.global_mut::<Config>();
+            cfg.theme_follow_system = true;
+            if manual_dark {
+                cfg.theme_preset_dark = manual;
+            } else {
+                cfg.theme_preset_light = manual;
+            }
+        } else {
+            // Resolve while following is still on (the pin is released, so
+            // this reads the real OS appearance).
+            let effective = crate::ui::theme::effective_preset_id(cx);
+            let cfg = cx.global_mut::<Config>();
+            cfg.theme_follow_system = false;
+            cfg.theme_preset = effective;
+        }
+        self.after_theme_change(window, cx);
+        // Re-aim an open picker panel at a slot that exists in the new mode —
+        // after the apply above, so `system_dark` reads the unpinned OS value.
+        let slot = if on {
+            if crate::ui::theme::system_dark(cx) {
+                crate::ui::settings::ThemeSlot::Dark
+            } else {
+                crate::ui::settings::ThemeSlot::Light
+            }
+        } else {
+            crate::ui::settings::ThemeSlot::Manual
+        };
+        if let Some(s) = self.active_settings_mut() {
+            s.theme_panel_slot = slot;
+        }
+    }
+
+    /// The shared tail of every theme-selection change: repaint, persist, and
+    /// keep the dependent Settings widgets in step.
+    fn after_theme_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         apply_theme(Some(window), cx);
         set_menus(cx);
         cx.global::<Config>().save();
@@ -1208,10 +1338,21 @@ impl Tty7App {
         cx.notify();
     }
 
-    /// Show/hide the theme picker panel beside the Appearance page.
-    pub(crate) fn toggle_theme_panel(&mut self, cx: &mut Context<Self>) {
+    /// Show/hide the theme picker panel beside the Appearance page. Clicking
+    /// the card whose slot the open panel already targets closes it; clicking
+    /// another card re-aims the open panel at that slot.
+    pub(crate) fn toggle_theme_panel(
+        &mut self,
+        slot: crate::ui::settings::ThemeSlot,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(s) = self.active_settings_mut() {
-            s.theme_panel_open = !s.theme_panel_open;
+            if s.theme_panel_open && s.theme_panel_slot == slot {
+                s.theme_panel_open = false;
+            } else {
+                s.theme_panel_open = true;
+                s.theme_panel_slot = slot;
+            }
             cx.notify();
         }
     }
@@ -1237,7 +1378,7 @@ impl Tty7App {
     /// and open the color editor on it. This is the entry point for customizing a
     /// read-only built-in (or an imported iTerm scheme).
     pub(crate) fn fork_active_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = cx.global::<Config>().theme_preset.clone();
+        let id = crate::ui::theme::effective_preset_id(cx);
         let theme = crate::ui::presets::by_id(cx, &id);
         match crate::ui::presets::fork_to_file(&theme) {
             Ok(new_id) => {
@@ -1258,7 +1399,7 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let id = cx.global::<Config>().theme_preset.clone();
+        let id = crate::ui::theme::effective_preset_id(cx);
         let mut theme = crate::ui::presets::by_id(cx, &id);
         if !theme.editable() {
             return;
@@ -1300,7 +1441,7 @@ impl Tty7App {
     /// set, else the active theme's own value, else fully opaque.
     pub(crate) fn effective_window_opacity(cx: &App) -> f32 {
         let config = cx.global::<Config>();
-        let theme = crate::ui::presets::by_id(cx, &config.theme_preset);
+        let theme = crate::ui::presets::by_id(cx, &crate::ui::theme::effective_preset_id(cx));
         config.window_opacity.or(theme.opacity).unwrap_or(1.0)
     }
 
@@ -1427,7 +1568,7 @@ impl Tty7App {
         if self.settings.is_none() {
             return;
         }
-        let id = cx.global::<Config>().theme_preset.clone();
+        let id = crate::ui::theme::effective_preset_id(cx);
         let theme = crate::ui::presets::by_id(cx, &id);
         if !theme.editable() {
             if let Some(s) = self.settings.as_mut() {
@@ -2016,6 +2157,14 @@ impl Tty7App {
         self.update_config(cx, |cfg| cfg.copy_on_select = on);
     }
 
+    pub(crate) fn set_smart_select(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.smart_select = on);
+    }
+
+    pub(crate) fn set_tab_completion(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.tab_completion = on);
+    }
+
     pub(crate) fn set_startup_mode(
         &mut self,
         mode: crate::core::config::StartupMode,
@@ -2074,6 +2223,24 @@ impl Tty7App {
         window.focus(&handle, cx);
     }
 
+    /// Ask every pane in the window to re-probe its git status. Called when the
+    /// window regains focus: the sidebar shows a git line for *every* tab, not
+    /// just the active one, so refreshing only the focused pane would leave the
+    /// rest of the list stale — which is exactly the list the user is scanning
+    /// right after switching back.
+    ///
+    /// Panes sharing a cwd fold into one probe in the shared cache, and the
+    /// throttle there counts per repo rather than per cwd, so once the cache
+    /// knows where each pane lives the cost of a window with many panes is
+    /// bounded by the number of distinct repos — not by the number of
+    /// subdirectories they happen to sit in, which would be the same full-repo
+    /// `git diff` asked several times over.
+    fn refresh_git_status_all(&mut self, cx: &mut Context<Self>) {
+        for leaf in self.tabs.iter().flat_map(|tab| tab.pane.leaves()) {
+            leaf.update(cx, |view, cx| view.refresh_git_status_now(cx));
+        }
+    }
+
     /// Where a freshly opened tab should be inserted, per `new_tab_position`:
     /// right after the active tab, or appended at the end. Clamped to the tab
     /// count so the zero-tab home state (active 0, no tabs) inserts at 0.
@@ -2097,11 +2264,14 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) {
         // Inherit the cwd of the active tab's focused terminal so the new tab
-        // opens in the same directory the user is currently working in.
+        // opens in the same directory the user is currently working in. Local
+        // cwds only: the new tab is a local shell, and an inherited cwd wins
+        // over every fallback in `pane::initial_working_directory`, so a remote
+        // path would be handed straight to the spawn as a working directory.
         let cwd = self.tabs.get(self.active).and_then(|t| {
             t.pane
                 .focused_or_first(window, cx)
-                .and_then(|leaf| leaf.read(cx).cwd())
+                .and_then(|leaf| leaf.read(cx).local_cwd())
         });
         let tab = new_terminal(self.font_size, cwd, None, shell, window, cx);
         // Leaving the current tab for the new one; snapshot its focused pane
@@ -2196,8 +2366,10 @@ impl Tty7App {
         };
         // The new pane inherits the cwd — and the shell, when the pane being
         // split was opened with an explicit pick (a WSL/fish tab splits into
-        // more WSL/fish, not back to the default).
-        let cwd = target.read(cx).cwd();
+        // more WSL/fish, not back to the default). Local cwds only: the
+        // native-SSH branch below has the daemon discard it regardless, and the
+        // local branch would otherwise spawn against a remote path.
+        let cwd = target.read(cx).local_cwd();
         // Splitting a native-SSH pane opens another SSH pane on the same
         // connection rather than dropping back to a local shell. Re-resolve the
         // persisted (secret-free) spec from its saved profile so keychain
@@ -2501,7 +2673,7 @@ impl Tty7App {
         // Capture the tab's cwd *before* its panes are killed (the daemon can't
         // report it afterwards): if it sat in a tty7-managed worktree, the
         // cleanup offer below needs it.
-        let worktree_cwd = self.tab_cwd(index, window, cx);
+        let worktree_cwd = self.tab_local_cwd(index, window, cx);
         // Snapshot the tab (layout + each pane's current cwd + name) onto the
         // recently-closed stack so Cmd+Shift+T can bring it back.
         let snapshot = tab_to_session(&self.tabs[index], cx);
@@ -2548,11 +2720,14 @@ impl Tty7App {
         let Some(cwd) = cwd else { return };
         // Every leaf of every surviving tab, not just focused panes — a shell
         // tucked away in a split occupies the worktree all the same.
+        // Local paths only: this list is what stops a worktree being removed
+        // out from under a live shell, and a remote cwd can neither occupy a
+        // local worktree nor be compared against one meaningfully.
         let open_cwds: Vec<std::path::PathBuf> = self
             .tabs
             .iter()
             .flat_map(|tab| tab.pane.leaves())
-            .filter_map(|leaf| leaf.read(cx).cwd())
+            .filter_map(|leaf| leaf.read(cx).local_cwd())
             .collect();
         cx.spawn(async move |this, cx| {
             let Some(wt) = cx
@@ -2646,6 +2821,30 @@ impl Tty7App {
         }
     }
 
+    /// "Mark as Unread" (tab context menu): re-flag every finished (`Done`)
+    /// agent turn in the tab as unread, so the avatar's green dot swells back
+    /// into its count badge until the user next looks at those panes. The
+    /// active tab's focus target is told the dismissed menu is about to hand
+    /// focus back to it, so that focus-in doesn't immediately re-read the mark
+    /// (see `TerminalView::mark_agent_result_unread`).
+    pub(crate) fn mark_tab_unread(&mut self, index: usize, cx: &mut Context<Self>) {
+        use crate::core::cli_agent::AgentStatus;
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let refocus = (index == self.active).then(|| tab.focus_target()).flatten();
+        for leaf in tab.pane.leaves() {
+            let refocus_incoming = refocus.as_ref() == Some(&leaf);
+            leaf.update(cx, |view, cx| {
+                if view.agent_session().map(|s| s.status) == Some(AgentStatus::Done) {
+                    view.mark_agent_result_unread(refocus_incoming);
+                    cx.notify();
+                }
+            });
+        }
+        cx.notify();
+    }
+
     /// The cwd of the tab's label-driving terminal (focused leaf, else first) —
     /// what the tab context menu's "Copy Working Directory" copies and "New
     /// Worktree Tab" derives the repo from.
@@ -2662,6 +2861,18 @@ impl Tty7App {
             .and_then(|leaf| leaf.read(cx).cwd())
     }
 
+    /// [`tab_cwd`](Self::tab_cwd) restricted to a directory on this machine —
+    /// for the worktree operations, which shell out to a local `git`. "Copy
+    /// Working Directory" deliberately keeps using `tab_cwd`: copying a remote
+    /// pane's remote path is exactly what the user wants there.
+    fn tab_local_cwd(&self, index: usize, window: &Window, cx: &App) -> Option<std::path::PathBuf> {
+        self.tabs
+            .get(index)?
+            .pane
+            .focused_or_first(window, cx)
+            .and_then(|leaf| leaf.read(cx).local_cwd())
+    }
+
     /// "New Worktree Tab": probe the repository containing the tab's cwd for
     /// defaults (a fresh generated name, the current branch as start point) on
     /// the background executor, then open the confirmation sheet
@@ -2673,7 +2884,7 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(cwd) = self.tab_cwd(index, window, cx) else {
+        let Some(cwd) = self.tab_local_cwd(index, window, cx) else {
             window.push_notification("This tab has no working directory yet", cx);
             return;
         };
@@ -2713,33 +2924,25 @@ impl Tty7App {
         cx.notify();
     }
 
-    /// Reorder tabs: move the tab at `from` to position `to` (drag-and-drop).
-    /// Keeps the same tab active across the move and re-persists the session.
-    pub(crate) fn move_tab(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+    /// Rearrange the whole tab vector into `order` (old indices in their new
+    /// order) — the single path by which a drag-reorder lands, used by the
+    /// sidebar where a single visual move can imply a larger permutation
+    /// (relocating a tab inside its group without disturbing the group order,
+    /// or moving an entire group). Keeps the same tab active and re-persists.
+    pub(crate) fn apply_tab_order(&mut self, order: &[usize], cx: &mut Context<Self>) {
+        if order.len() != self.tabs.len() || order.iter().enumerate().all(|(i, &o)| i == o) {
             return;
         }
-        // Reordering shifts indices; a pending rename keyed on a fixed index would
-        // commit onto the wrong tab. Drop it.
+        // Reordering shifts indices: a rename pending on a fixed one would
+        // commit onto the wrong tab.
         self.renaming = None;
         let was_active = self.active;
-        let tab = self.tabs.remove(from);
-        self.tabs.insert(to, tab);
-        // Re-derive the active index so the same logical tab stays selected:
-        // removal shifts indices after `from` left, insertion shifts indices at
-        // or after `to` right.
-        self.active = if was_active == from {
-            to
-        } else {
-            let mut a = was_active;
-            if from < a {
-                a -= 1;
-            }
-            if to <= a {
-                a += 1;
-            }
-            a
-        };
+        let mut slots: Vec<Option<Tab>> = std::mem::take(&mut self.tabs)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.tabs = order.iter().filter_map(|&i| slots[i].take()).collect();
+        self.active = order.iter().position(|&i| i == was_active).unwrap_or(0);
         self.save_session(cx);
         cx.notify();
     }
@@ -3050,7 +3253,10 @@ impl Tty7App {
             .tabs
             .get(self.active)
             .and_then(|t| t.pane.focused_or_first(window, cx))
-            .and_then(|view| view.read(cx).cwd());
+            // Local `git` shell-out, so a remote pane's cwd is not usable —
+            // it reports "no known directory" rather than silently diffing
+            // whatever the path collides with locally.
+            .and_then(|view| view.read(cx).local_cwd());
         let Some(cwd) = cwd else {
             crate::terminal::notify_desktop(Some("tty7"), "This pane has no known directory.");
             return;
@@ -3059,9 +3265,9 @@ impl Tty7App {
         // which is what a review pass wants. Both invocations are quick; the
         // prompt builder caps runaway diffs.
         let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&cwd)
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(args).current_dir(&cwd);
+            crate::core::proc::hide_console(&mut cmd)
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
@@ -3098,6 +3304,7 @@ impl Tty7App {
             self.build_font_selects(&mut subs, window, cx);
         let (shell_program_input, shell_args_input, wd_path_input) =
             self.build_shell_inputs(&mut subs, window, cx);
+        let link_file_command_input = self.build_link_file_command_input(&mut subs, window, cx);
         let scroll_slider = self.build_scroll_slider(&mut subs, window, cx);
         let window_opacity_slider = self.build_window_opacity_slider(&mut subs, window, cx);
         // Live filter for the theme picker panel; each keystroke re-renders the
@@ -3133,10 +3340,12 @@ impl Tty7App {
             shell_program_input,
             shell_args_input,
             wd_path_input,
+            link_file_command_input,
             scroll_slider,
             window_opacity_slider,
             theme_editor: None,
             theme_panel_open: false,
+            theme_panel_slot: crate::ui::settings::ThemeSlot::Manual,
             theme_search,
             recording: None,
             rebinding_note: None,
@@ -3316,6 +3525,59 @@ impl Tty7App {
             }),
         );
         (shell_program_input, shell_args_input, wd_path_input)
+    }
+
+    /// File-open command template input (Links section), committing on Enter/blur.
+    fn build_link_file_command_input(
+        &mut self,
+        subs: &mut Vec<Subscription>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        let value = cx
+            .global::<Config>()
+            .link_file_command
+            .clone()
+            .unwrap_or_default();
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("open in default app")
+                .default_value(value)
+        });
+        subs.push(
+            cx.subscribe_in(&input, window, move |this, _i, ev, _w, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    this.commit_link_file_command(cx);
+                }
+            }),
+        );
+        input
+    }
+
+    /// Persist the file-open command template from the Links settings input. An
+    /// empty value clears the override (falls back to the built-in open).
+    fn commit_link_file_command(&mut self, cx: &mut Context<Self>) {
+        let Some(command) = self.active_settings().map(|s| {
+            s.link_file_command_input
+                .read(cx)
+                .value()
+                .trim()
+                .to_string()
+        }) else {
+            return;
+        };
+        let command = if command.is_empty() {
+            None
+        } else {
+            Some(command)
+        };
+        let cfg = cx.global_mut::<Config>();
+        if cfg.link_file_command == command {
+            return; // no change — avoid a redundant disk write on every Blur
+        }
+        cfg.link_file_command = command;
+        cfg.save();
+        cx.notify();
     }
 
     /// Window-opacity slider for the Appearance page (20%–100%). Emits `Change`
@@ -3718,8 +3980,14 @@ impl Tty7App {
                 }
             };
             Some(rgb)
-        } else if v.remote_context().is_some() {
-            // A foreground `ssh` typed into a shell: a plain neutral dot.
+        } else if v
+            .remote_context()
+            .is_some_and(|r| r.kind != crate::daemon::protocol::RemoteKind::Wsl)
+        {
+            // A foreground `ssh` typed into a shell: a plain neutral dot. The
+            // kind check matters: a WSL pane also carries a `RemoteContext` (so
+            // its cwd is treated as foreign — see `local_cwd`), but it is not an
+            // SSH session and this dot means "SSH".
             Some(0x9CA3AF)
         } else {
             None
@@ -3777,6 +4045,11 @@ impl Tty7App {
         cx.notify();
     }
 
+    /// The focused pane when it is an SSH session of either kind.
+    ///
+    /// Not every pane carrying a `RemoteContext` is one: a WSL pane has one too,
+    /// so that its cwd is treated as foreign (see `TerminalView::local_cwd`),
+    /// and it must not reach anything SSH-shaped from here.
     pub(crate) fn active_ssh_pane(
         &self,
         window: &Window,
@@ -3788,7 +4061,8 @@ impl Tty7App {
             .pane
             .focused_or_first(window, cx)?;
         let pane = pane.read(cx);
-        Some((pane.pane_id, pane.remote_context()?))
+        let remote = pane.remote_context()?;
+        (remote.kind != crate::daemon::protocol::RemoteKind::Wsl).then_some((pane.pane_id, remote))
     }
 
     /// The focused pane when it is a *connected native* SSH session — the gate for
@@ -4160,6 +4434,32 @@ impl Tty7App {
 
 impl Render for Tty7App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A live drag-reorder commits when the drag *ends*, which in gpui means
+        // the mouse was released (nothing else clears an active drag): the first
+        // frame without one retires the preview and applies the order it was
+        // last showing. Deliberately not an `on_drop` handler — those only fire
+        // when the pointer is over that particular element at release, so a
+        // release a hair outside the rail or the strip would silently lose the
+        // move. What you were looking at is what you get, wherever you let go.
+        // One place at the root covers every surface that can start a drag.
+        if cx.has_active_drag() {
+            // Still dragging: forget last frame's answer so only what this
+            // frame actually draws can be committed (see `clear_pending`).
+            crate::ui::reorder::clear_pending(&self.reorder);
+        } else if let Some(order) = crate::ui::reorder::take_pending(&self.reorder) {
+            self.apply_tab_order(&order, cx);
+        }
+        // While a tab or group is in hand, the cursor is a closed hand for the
+        // whole window. It has to be set on the *drag* rather than styled on
+        // the element: gpui overrides every hovered element's cursor with the
+        // active drag's for the duration, and that override is `None` — a plain
+        // arrow — unless something fills it in. Set once per drag (it forces a
+        // refresh, so re-setting it every frame would spin).
+        if self.reorder.borrow().is_some()
+            && cx.active_drag_cursor_style() != Some(gpui::CursorStyle::ClosedHand)
+        {
+            cx.set_active_drag_cursor_style(gpui::CursorStyle::ClosedHand, window);
+        }
         // Vertical-tab mode: the sidebar owns the tab list, so the title-bar strip
         // drops its chips (keeping only "+"/"⋯"). Gated on having tabs — the
         // zero-tab home page keeps the full-width horizontal layout, so an empty
@@ -4627,7 +4927,13 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
         Pane::Leaf(view) => {
             let view = view.read(cx);
             SessionPane::Leaf {
-                cwd: view.cwd(),
+                // Local cwd only. A restored pane whose daemon pane is gone
+                // respawns on the *default local shell* (a shell pick isn't
+                // persisted), so a remote cwd would come back paired with a
+                // local shell that cannot chdir into it. Native-SSH panes
+                // reconnect from `ssh_spec` and the daemon discards the cwd
+                // for them anyway (`server::SpawnNativeSsh`).
+                cwd: view.local_cwd(),
                 pane_id: Some(view.pane_id),
                 // Persist the secret-free native-SSH spec so a *dead* pane can be
                 // reconnected on restore (FR-E4/C2); `None` for local panes. A
@@ -4635,9 +4941,12 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
                 ssh_spec: view.ssh_spec(),
                 // The running agent + its native session id (when its hooks
                 // reported one), so a pane the daemon loses can resume the
-                // agent conversation instead of just reopening a shell.
+                // agent conversation instead of just reopening a shell. The
+                // observed launch argv rides along so the resume command keeps
+                // the user's flags (`--dangerously-skip-permissions`, …).
                 agent: view.agent(),
                 agent_session_id: view.agent_session().and_then(|s| s.session_id),
+                agent_launch_argv: view.agent_session().and_then(|s| s.launch_argv),
             }
         }
         Pane::Split {
@@ -4659,6 +4968,7 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
             ssh_spec: None,
             agent: None,
             agent_session_id: None,
+            agent_launch_argv: None,
         },
     }
 }
@@ -4730,6 +5040,7 @@ fn session_to_pane(
             ssh_spec,
             agent,
             agent_session_id,
+            agent_launch_argv,
         } => {
             // Only restore the pane id when the daemon confirms it's still live;
             // a stale id (daemon restarted, pane killed) falls back to a spawn.
@@ -4761,7 +5072,7 @@ fn session_to_pane(
             if restore.is_none()
                 && cx.global::<Config>().restore_agent_sessions
                 && let (Some(agent), Some(id)) = (agent, agent_session_id)
-                && let Some(cmd) = agent.resume_command(id)
+                && let Some(cmd) = agent.resume_command(id, agent_launch_argv.as_deref())
             {
                 view.read(cx).run_command_line(&cmd);
             }

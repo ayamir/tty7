@@ -100,6 +100,14 @@ struct ShellState {
     /// back) from the stale pre-submit state — even when 1 Hz polling misses
     /// the intermediate not-at-prompt window of a fast command.
     seq: u64,
+    /// Monotonic count of *entered-prompt edges*: bumped only when a report
+    /// flips `at_prompt` false → true. Unlike `seq` it ignores same-prompt
+    /// redraws — prompt frameworks re-emit the PS1-embedded `133;B` on every
+    /// `reset-prompt` / completion-list reprint, and each re-emission is
+    /// another `Prompt` frame. The Tab handoff keys its release off this
+    /// (see `TerminalView::editor_handoff`): only a command actually running
+    /// (`133;C` → not-at-prompt) starts a new cycle.
+    cycle: u64,
 }
 
 /// The shared handles the reader thread writes into as daemon frames arrive;
@@ -670,6 +678,8 @@ impl RemoteTerminal {
                                         at_prompt,
                                         last_exit,
                                         seq: guard.seq + 1,
+                                        cycle: guard.cycle
+                                            + u64::from(at_prompt && !guard.at_prompt),
                                     };
                                 }
                                 // The shell just reported a fresh prompt, so at
@@ -702,6 +712,17 @@ impl RemoteTerminal {
                             }
                             DaemonMsg::RemoteContext(ctx) => {
                                 flush_batch!();
+                                // Crossing the local/remote boundary invalidates
+                                // the cwd: it names a directory in the namespace
+                                // we just left. Drop it so the pane reports none
+                                // until the new shell's OSC 7 lands — otherwise
+                                // an `exit` from `ssh` leaves the remote's last
+                                // path in place, and a local shell without shell
+                                // integration never overwrites it, so the local
+                                // `git` probe keeps running against it.
+                                if let Ok(mut guard) = cwd.lock() {
+                                    *guard = None;
+                                }
                                 if let Ok(mut guard) = remote.lock() {
                                     *guard = ctx;
                                 }
@@ -931,6 +952,13 @@ impl RemoteTerminal {
     /// tells whether the shell has reported back since.
     pub fn prompt_seq(&self) -> u64 {
         self.shell_state.lock().map(|s| s.seq).unwrap_or(0)
+    }
+
+    /// Monotonic count of entered-prompt edges — see [`ShellState::cycle`].
+    /// Stable across same-prompt redraws (which bump `seq` but not this);
+    /// only leaving the prompt for a command and coming back advances it.
+    pub fn prompt_cycle(&self) -> u64 {
+        self.shell_state.lock().map(|s| s.cycle).unwrap_or(0)
     }
 
     /// Exit code of the most recently completed foreground command, as sniffed
@@ -1587,6 +1615,7 @@ fn terminal_config_from_user(user_config: &crate::core::config::Config) -> Confi
     Config {
         scrolling_history: user_config.scrollback_limit,
         default_cursor_style: alacritty_cursor_style(user_config.cursor_style),
+        semantic_escape_chars: user_config.word_separators.clone(),
         ..Config::default()
     }
 }
@@ -2404,7 +2433,10 @@ mod tests {
             status: AgentStatus::Waiting,
             message: Some("Claude needs your permission".into()),
             session_id: Some("sid-1".into()),
+            launch_argv: None,
             rich: true,
+            cwd: None,
+            activity: 0,
         }))
         .encode(&mut daemon_side)
         .unwrap();

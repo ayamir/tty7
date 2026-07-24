@@ -35,12 +35,13 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use russh::Pty;
+use russh::{ChannelMsg, Pty};
 
 use crate::daemon::protocol::{
     LoopbackForward, LoopbackForwardId, LoopbackForwardInfo, ManagedForward, NativeSshSpec,
     SshForwardRule, SshPhase, WinSize,
 };
+use crate::daemon::shell_integration::remote;
 
 use forward::RemoteForwardTable;
 use handler::ClientHandler;
@@ -84,6 +85,11 @@ pub struct SshManager {
     /// The WS4 managed-forward registry (Local/Remote/Dynamic + native loopback),
     /// driven on this manager's runtime.
     forwards: SshForwardRegistry,
+    /// Memoized remote shell-integration probes, keyed like connections. A
+    /// present `None` means "probed, nothing to inject" — cached just as firmly
+    /// as a hit so an unintegrable host isn't re-probed on every new tab. See
+    /// [`SshManager::remote_bootstrap`].
+    probes: Mutex<HashMap<ConnectionKey, Option<(remote::RemoteShell, String)>>>,
 }
 
 impl SshManager {
@@ -101,6 +107,7 @@ impl SshManager {
                 runtime,
                 conns: Mutex::new(HashMap::new()),
                 forwards: SshForwardRegistry::default(),
+                probes: Mutex::new(HashMap::new()),
             }
         })
     }
@@ -316,10 +323,29 @@ impl SshManager {
             let _ = channel.agent_forward(false).await;
         }
 
-        channel
-            .request_shell(true)
-            .await
-            .map_err(|e| format!("shell request failed: {e}"))?;
+        // Shell integration (OSC 133 + cwd reporting) for the remote shell. When
+        // the remote is one we know how to bootstrap, the shell is started by an
+        // `exec` request carrying a setup script that ends in `exec <shell>`,
+        // rather than by a bare `shell` request; see `shell_integration::remote`.
+        // Anything unrecognized — or a probe that couldn't be run — falls through
+        // to the plain shell request, which is exactly what every session did
+        // before this existed.
+        // Opting out short-circuits the probe too, not just the bootstrap: a
+        // profile with the switch off should cost nothing and touch nothing.
+        let bootstrap = match spec.shell_integration {
+            true => self.remote_bootstrap(&conn).await,
+            false => None,
+        };
+        match bootstrap {
+            Some(script) => channel
+                .exec(true, script)
+                .await
+                .map_err(|e| format!("shell request failed: {e}"))?,
+            None => channel
+                .request_shell(true)
+                .await
+                .map_err(|e| format!("shell request failed: {e}"))?,
+        }
 
         // Login script: each line verbatim + newline, in order, no expect-logic.
         for line in &spec.login_script {
@@ -339,6 +365,41 @@ impl SshManager {
     /// by the self-healing reuse path when a reused connection turns out dead.
     fn evict_connection(&self, key: &ConnectionKey) {
         self.conns.lock().unwrap().remove(key);
+    }
+
+    /// The shell-integration bootstrap script for `conn`'s next shell, or `None`
+    /// to start that shell bare.
+    ///
+    /// Deciding costs one `exec` round-trip against the remote (see
+    /// [`probe_remote_shell`]), so the answer is memoized on the connection key —
+    /// the same identity connections are reused under. Opening a second tab to a
+    /// host therefore pays nothing, and a *reconnect* to a host probed earlier
+    /// pays nothing either: which shell a login lands in doesn't change between
+    /// connections, so the cache deliberately outlives them.
+    ///
+    /// Two panes racing to a not-yet-probed host may both probe. That is a
+    /// duplicated round-trip on a cold connection, not a correctness problem —
+    /// the probe has no side effects and both arrive at the same answer — so it
+    /// isn't worth serializing every spawn behind a per-key lock the way
+    /// connection establishment is.
+    async fn remote_bootstrap(&self, conn: &Arc<SshConnection>) -> Option<String> {
+        let key = conn.key().clone();
+        let cached = { self.probes.lock().unwrap().get(&key).cloned() };
+        let probed = match cached {
+            Some(hit) => hit,
+            None => {
+                let probed = probe_remote_shell(conn).await;
+                match &probed {
+                    Some((shell, path)) => {
+                        log::debug!("ssh {key:?}: remote shell {shell:?} at {path}")
+                    }
+                    None => log::debug!("ssh {key:?}: no remote shell integration"),
+                }
+                self.probes.lock().unwrap().insert(key, probed.clone());
+                probed
+            }
+        };
+        probed.map(|(shell, path)| remote::bootstrap_command(shell, &path))
     }
 
     /// Establish (or reuse) the connection for `spec`, recursing through the jump
@@ -443,6 +504,54 @@ impl SshManager {
     }
 }
 
+/// How long to wait for the shell probe before giving up on integrating a
+/// remote. Generous, because the probe runs under the remote's login shell and
+/// therefore behind whatever its `.zshenv` does; short enough that a host which
+/// never answers costs a pause, not a hang. Expiring is not an error — the
+/// session continues with a plain shell.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Cap on probe output, in case the remote's startup files are chatty. Far more
+/// than the two lines we asked for; a remote that exceeds it has already told us
+/// everything [`remote::parse_probe`] could use.
+const PROBE_OUTPUT_LIMIT: usize = 8 * 1024;
+
+/// Ask the remote which login shell it would start, on a throwaway channel.
+///
+/// This is a non-PTY `exec`, so it runs and exits without touching the session
+/// the user is about to get; nothing here can break that session, and every
+/// failure path returns `None`, meaning "start the shell bare".
+///
+/// stderr is folded in with stdout because the marker-based parse tolerates
+/// noise, and a remote whose startup files complain on stderr would otherwise
+/// have its (perfectly good) answer thrown away.
+async fn probe_remote_shell(conn: &SshConnection) -> Option<(remote::RemoteShell, String)> {
+    let mut channel = conn.open_session_channel().await.ok()?;
+    channel.exec(true, remote::PROBE_COMMAND).await.ok()?;
+
+    let mut out: Vec<u8> = Vec::new();
+    let collect = async {
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                    out.extend_from_slice(&data);
+                    if out.len() >= PROBE_OUTPUT_LIMIT {
+                        break;
+                    }
+                }
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+    };
+    // A timeout doesn't discard what did arrive: the answer is on the second
+    // line, so a remote that printed it and then stalled before closing the
+    // channel is still perfectly readable.
+    let _ = tokio::time::timeout(PROBE_TIMEOUT, collect).await;
+
+    remote::parse_probe(&String::from_utf8_lossy(&out))
+}
+
 /// A conservative set of PTY modes for the shell channel — an interactive TTY
 /// with canonical input, echo, and signal handling on, and standard baud codes.
 /// The remote line discipline uses these as its starting point.
@@ -487,6 +596,7 @@ mod tests {
             term: "xterm-256color".into(),
             verify_host_keys: true,
             skip_banner: false,
+            shell_integration: true,
             login_script: vec![],
             display_name: None,
             profile_id: None,
@@ -523,6 +633,7 @@ mod tests {
             runtime,
             conns: Mutex::new(HashMap::new()),
             forwards: SshForwardRegistry::default(),
+            probes: Mutex::new(HashMap::new()),
         };
         let key = ConnectionKey::from_spec(&base_spec());
         mgr.conns

@@ -5,19 +5,30 @@
 //! orchestration rather than chrome rendering.
 
 use gpui::{
-    AnyElement, App, Axis, Context, FontWeight, MouseButton, MouseDownEvent, SharedString, Window,
-    div, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, App, Axis, Bounds, Context, FontWeight, MouseButton,
+    MouseDownEvent, Pixels, SharedString, Window, canvas, deferred, div, ease_out_quint,
+    linear_color_stop, linear_gradient, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::input::Input;
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::{ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use crate::core::actions::{OpenSettings, TogglePalette};
 use crate::core::config::{Config, RightPanelTab};
 use crate::daemon::protocol::ShellSpec;
 use crate::ui::app::{Tab, Tty7App};
 use crate::ui::hints::tab_badge_label;
+use crate::ui::reorder::{self, Reorder, Surface};
+
+/// How long a slot takes to slide out of the way of a dragged tab, and the
+/// gap between chips it has to travel. Short and hard-decelerating: long
+/// enough to read as motion, short enough that a fast drag across the strip
+/// never queues up a backlog of sliding tabs.
+pub(crate) const REORDER_SLIDE_MS: u64 = 140;
+const CHIP_GAP: f32 = 6.;
 
 /// How many trailing path components a deep tab label keeps, mirroring
 /// ghostty's zsh integration title `%(4~|…/%3~|%~)`: a path deeper than this
@@ -121,28 +132,21 @@ fn short_title(raw: &str) -> String {
     label
 }
 
-/// Drag payload for reordering tabs. Carries the source index and a label so the
-/// drag preview can show the tab being moved. `pub(crate)` so the vertical
-/// [`tab_sidebar`](crate::ui::tab_sidebar) reuses the same payload (and could one
-/// day support strip ↔ sidebar cross-drops via the shared `move_tab`).
+/// Marks a live drag as a *tab* drag: its type is what the rail's and strip's
+/// drop handlers match on, and its presence is what keeps gpui redrawing while
+/// the pointer moves. It deliberately carries no state and renders nothing —
+/// the tab being dragged never leaves the list, so there is no card floating
+/// over the window; the reorder is drawn entirely by the list itself (see
+/// [`crate::ui::reorder`]). `pub(crate)` so the vertical
+/// [`tab_sidebar`](crate::ui::tab_sidebar) shares the same payload.
 #[derive(Clone)]
-pub(crate) struct DragTab {
-    pub(crate) index: usize,
-    pub(crate) label: SharedString,
-}
+pub(crate) struct DragTab;
 
 impl Render for DragTab {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // gpui always paints *something* at the cursor for an active drag;
+        // an empty, zero-sized element is how this drag paints nothing.
         div()
-            .px_3()
-            .py_1()
-            .rounded_lg()
-            .bg(cx.theme().secondary)
-            .border_1()
-            .border_color(cx.theme().border)
-            .text_sm()
-            .text_color(cx.theme().foreground)
-            .child(self.label.clone())
     }
 }
 
@@ -463,6 +467,9 @@ impl Tty7App {
                 let spec = ShellSpec {
                     program: shell.program.clone(),
                     args: shell.args.clone(),
+                    // Every arg on a dropdown row was written by
+                    // `core::shells::detect_shells`, not the user.
+                    args_are_tty7_defaults: true,
                 };
                 let open = app.clone();
                 let item = if shell.label == default_name {
@@ -539,6 +546,27 @@ impl Tty7App {
                 let _ = app.update(cx, |this, cx| this.start_rename(index, window, cx));
             }
         }));
+
+        // Mark as Unread — re-arm the avatar's green Done badge so a result
+        // you want to revisit nags again. Only agent tabs get the entry, and
+        // only a settled (`Done`) tab has a finished turn to mark; a busier
+        // status (working/waiting) owns the dot anyway, so the entry disables
+        // rather than promising a badge that can't show yet.
+        let tab = this.tabs.get(index);
+        if tab.is_some_and(|t| t.agent(cx).is_some()) {
+            let done = tab.and_then(|t| t.agent_status(cx))
+                == Some(crate::core::cli_agent::AgentStatus::Done);
+            menu = menu.item(
+                PopupMenuItem::new("Mark as Unread")
+                    .disabled(!done)
+                    .on_click({
+                        let app = app.clone();
+                        move |_, _window, cx| {
+                            let _ = app.update(cx, |this, cx| this.mark_tab_unread(index, cx));
+                        }
+                    }),
+            );
+        }
 
         // Worktree: an isolated checkout of this tab's repo on a fresh branch,
         // opened as a new tab — parallel-agent fuel. Only offered when the
@@ -675,17 +703,47 @@ impl Tty7App {
         // `min_w`) and truncates their labels rather than pushing the "+" away.
         let mut chips = h_flex()
             .items_center()
-            .gap_1p5()
+            .gap(px(CHIP_GAP))
             .min_w_0()
             .max_w(chips_avail)
             .overflow_hidden();
 
-        for (i, tab) in self.tabs.iter().enumerate() {
+        // ── Live drag-reorder ─────────────────────────────────────────────────
+        // While a chip is being dragged the strip renders in the order a drop
+        // would produce (see [`crate::ui::reorder`]): the dragged chip travels
+        // along the row itself — nothing floats over the window — and every
+        // chip it passes slides over to meet it. `slots` collects this frame's
+        // chip geometry: the reference a drag starting on a later frame freezes.
+        let slots: Rc<RefCell<Vec<Bounds<Pixels>>>> =
+            Rc::new(RefCell::new(vec![Bounds::default(); self.tabs.len()]));
+        let preview = reorder::preview(
+            &self.reorder,
+            &Surface::Strip,
+            self.tabs.len(),
+            window.mouse_position(),
+        );
+        // Display order: plain tab order, or the previewed one mid-drag. In the
+        // strip a slot *is* a tab index, so the previewed order doubles as the
+        // tab permutation a release would commit — recorded every frame so
+        // letting go applies exactly what's on screen (see `reorder`).
+        let display: Vec<usize> = match &preview {
+            Some(p) => {
+                reorder::set_pending(&self.reorder, &Surface::Strip, p.order.clone());
+                p.order.clone()
+            }
+            None => (0..self.tabs.len()).collect(),
+        };
+
+        for i in display {
             // In sidebar mode the vertical rail carries the tab list; the strip
             // keeps only its "+"/"⋯" chrome, so skip the chip row entirely.
             if !show_chips {
                 break;
             }
+            // The chip you're holding: still a chip in the row, just dimmed so
+            // it reads as picked up while it slides between slots.
+            let dragged = preview.as_ref().is_some_and(|p| p.from == i);
+            let tab = &self.tabs[i];
             let is_active = i == active;
             let label = self.tab_label(tab, i, Some(window), cx);
             // SSH status dot (PRD FR-E2): coloured by the pane's connection phase.
@@ -703,9 +761,6 @@ impl Tty7App {
                 .as_ref()
                 .filter(|r| r.index == i)
                 .map(|r| r.input.clone());
-            // Clean label (no pane-count suffix) for the rename prefill / drag preview.
-            let drag_label: SharedString = label.clone().into();
-
             // Either the editable input (while renaming) or the clickable,
             // draggable label.
             let label_region = match rename_input {
@@ -731,42 +786,38 @@ impl Tty7App {
                     // from the type, not from colour alone.
                     .when(is_active, |d| d.font_weight(FontWeight::MEDIUM))
                     .child(label)
-                    // Single click activates; double click zooms the window,
-                    // same as the rest of the titlebar. (Renaming lives in the
-                    // context menu.)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                            // Swallow the event — on Windows the chip's `occlude()`
-                            // means it would never reach the TitleBar anyway, so we
-                            // forward the double-click zoom explicitly instead.
-                            // Caveat: gpui only implements `titlebar_double_click`
-                            // on macOS; on Windows/Linux it's a no-op, so the chip
-                            // doesn't zoom there until upstream adds support.
-                            cx.stop_propagation();
-                            if ev.click_count >= 2 {
-                                window.titlebar_double_click();
-                            } else {
-                                this.activate(i, window, cx);
-                            }
-                        }),
-                    )
-                    // Drag the tab by its label to reorder it.
-                    .on_drag(
-                        DragTab {
-                            index: i,
-                            label: drag_label.clone(),
-                        },
-                        |drag, _, _, cx| {
-                            cx.stop_propagation();
-                            cx.new(|_| drag.clone())
-                        },
-                    )
+                    // No mouse handler of its own: click and drag both live on
+                    // the chip, and a child that swallowed the press would take
+                    // the label — most of the chip — out of both.
                     .into_any_element(),
             };
 
             let chip = h_flex()
                 .id(("tab-chip", i))
+                // Drag anywhere on the chip to reorder it. On the chip, not on
+                // its label: the drag's frame of reference is where the *chip*
+                // was grabbed, which is what the frozen geometry below
+                // measures — hang it off the label and the held chip rides
+                // offset from the cursor, skewing every crossing by that much.
+                // The builder runs once, when gpui promotes the press into a
+                // drag, freezing the strip's geometry as of the last painted
+                // frame.
+                .on_drag(DragTab, {
+                    let state = self.reorder.clone();
+                    let slots = slots.clone();
+                    move |_drag, grab, _window, cx| {
+                        cx.stop_propagation();
+                        *state.borrow_mut() = Some(Reorder::new(
+                            Surface::Strip,
+                            i,
+                            slots.borrow().clone(),
+                            Axis::Horizontal,
+                            px(CHIP_GAP),
+                            grab,
+                        ));
+                        cx.new(|_| DragTab)
+                    }
+                })
                 // The strip lives inside gpui-component's `TitleBar`, which marks
                 // its whole area as `WindowControlArea::Drag`. On Windows that maps
                 // to `HTCAPTION`, so unless an element on top registers a
@@ -779,6 +830,10 @@ impl Tty7App {
                 // A group so this chip's close affordance can reveal on hover
                 // (progressive disclosure) without affecting sibling tabs.
                 .group(SharedString::from(format!("tab-chip-{i}")))
+                // Same as the sidebar rows: a chip is a switch target first, so
+                // hover says "click me" and the drag swaps in the closed hand
+                // (see `Tty7App::render`).
+                .cursor_pointer()
                 .items_center()
                 .justify_between()
                 .gap_1p5()
@@ -809,20 +864,53 @@ impl Tty7App {
                     s.text_color(cx.theme().muted_foreground)
                         .hover(|s| s.bg(cx.theme().muted))
                 })
-                // Drop target: dropping a dragged tab here moves it to this slot.
-                .drag_over::<DragTab>(|s, _, _, cx| s.bg(cx.theme().drag_border.opacity(0.2)))
-                .on_drop(cx.listener(move |this, drag: &DragTab, _window, cx| {
-                    this.move_tab(drag.index, i, cx);
-                }))
-                // A click anywhere on the chip activates the tab. Clicks on the
-                // label or close button are handled by those children (which stop
-                // propagation), so this fires for the rest — icon, padding, the
-                // bare chip — making the whole tab a switch target, not just text.
+                // Held: a light dimming so the chip under your cursor reads as
+                // picked up. Not a lift — it stays in the row's own plane.
+                .when(dragged, |s| s.opacity(0.75))
+                // Measures this chip into the frame's slot table. Absolute and
+                // empty, so it costs the layout nothing.
+                .child(
+                    canvas(
+                        {
+                            let slots = slots.clone();
+                            move |bounds, _window, _cx| {
+                                if let Some(slot) = slots.borrow_mut().get_mut(i) {
+                                    *slot = bounds;
+                                }
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    // `inset_0`, not `size_full`: an absolutely-positioned
+                    // child with no insets is laid out at its parent's
+                    // *content* box, so a measuring canvas inside a padded
+                    // element would report an origin shifted right by the
+                    // left padding — and the held chip would ride that far
+                    // off the cursor. Pinning all four insets to 0 anchors it
+                    // to the padding box, which is the chip itself.
+                    .absolute()
+                    .inset_0(),
+                )
+                // A click anywhere on the chip activates the tab; a double click
+                // zooms the window, as the rest of the title bar does. Both live
+                // here rather than on the label so the whole chip — label, icon,
+                // padding — is one switch target and one drag handle. (The close
+                // button and the rename input stop the press for their own use.)
+                //
+                // The event is swallowed: on Windows the chip's `occlude()` means
+                // it would never reach the TitleBar anyway, so the zoom is
+                // forwarded explicitly. Caveat: gpui only implements
+                // `titlebar_double_click` on macOS; elsewhere it's a no-op until
+                // upstream adds support.
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
-                        this.activate(i, window, cx);
+                        if ev.click_count >= 2 {
+                            window.titlebar_double_click();
+                        } else {
+                            this.activate(i, window, cx);
+                        }
                     }),
                 )
                 // Leading SSH status dot when this tab hosts an SSH session.
@@ -851,58 +939,110 @@ impl Tty7App {
                 })
                 // Clickable / editable label region.
                 .child(label_region)
-                // Trailing slot: normally the close affordance — kept out of the
-                // way (opacity 0) on every chip, active or not, and fades in on
-                // chip hover, so a row of tabs reads clean instead of
-                // three-icons-per-chip busy. Space is reserved either way, so
-                // nothing shifts on hover. While the shortcut hints are armed,
-                // the same slot shows the tab's ⌘N badge instead.
-                .child(if show_badges && i < 9 {
+                // Trailing ⌘N badge: while the shortcut hints are armed the
+                // badge takes an in-flow 20px slot (the strip reflows once as
+                // the hints arm/disarm — a deliberate, all-chips-at-once modal
+                // moment). It can't float like the close button below: badges
+                // also show on unhovered inactive chips, which are transparent
+                // over the window background (possibly a gradient or image), so
+                // there's no solid colour to back an overlay with.
+                .when(show_badges && i < 9, |chip| {
                     // Bare digit, no keycap box — the hint blends into the chip
-                    // rather than reading as another button. Sized to the exact
-                    // 20px square of the close button it stands in for, so the
-                    // swap can never change the chip's width (an ellipsized
-                    // label would otherwise reflow and the strip would jitter).
-                    div()
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .size(px(20.))
-                        .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(if is_active {
-                            cx.theme().foreground
-                        } else {
-                            cx.theme().muted_foreground
-                        })
-                        .child(tab_badge_label(i))
-                        .into_any_element()
-                } else {
-                    div()
-                        .flex_shrink_0()
-                        .opacity(0.)
-                        .group_hover(SharedString::from(format!("tab-chip-{i}")), |s| {
-                            s.opacity(1.)
-                        })
-                        .child(
-                            Button::new(("tab-close", i))
-                                .icon(IconName::Close)
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.close_tab(i, window, cx);
-                                })),
-                        )
-                        .into_any_element()
+                    // rather than reading as another button.
+                    chip.child(
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(20.))
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(if is_active {
+                                cx.theme().foreground
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .child(tab_badge_label(i)),
+                    )
+                })
+                // Close affordance: out of flow, so the label runs the full
+                // chip width instead of always reserving a 20px slot for a
+                // button that's invisible until hover. On hover the ✕ floats
+                // over the label's right edge (Safari-style) on a solid backing
+                // in the chip's current fill — `secondary` on the active chip,
+                // `muted` on an inactive one, whose hover fill is exactly what
+                // the ✕'s visibility implies — with a short gradient run-in so
+                // covered text fades out instead of hard-cutting mid-glyph.
+                // Nothing reflows on hover.
+                .when(!(show_badges && i < 9), |chip| {
+                    let backing = if is_active {
+                        cx.theme().secondary
+                    } else {
+                        cx.theme().muted
+                    };
+                    let mut fade_from = backing;
+                    fade_from.a = 0.;
+                    chip.child(
+                        h_flex()
+                            .absolute()
+                            .top(px(5.))
+                            .right(px(6.))
+                            .opacity(0.)
+                            .group_hover(SharedString::from(format!("tab-chip-{i}")), |s| {
+                                s.opacity(1.)
+                            })
+                            .child(div().w(px(10.)).h(px(20.)).bg(linear_gradient(
+                                90.,
+                                linear_color_stop(fade_from, 0.),
+                                linear_color_stop(backing, 1.),
+                            )))
+                            .child(
+                                div().bg(backing).child(
+                                    Button::new(("tab-close", i))
+                                        .icon(IconName::Close)
+                                        .ghost()
+                                        .xsmall()
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.close_tab(i, window, cx);
+                                        })),
+                                ),
+                            ),
+                    )
                 });
 
             // Per-tab right-click menu (rename / worktree / split / copy cwd /
             // close group) — the same builder the sidebar rows use.
             let menu_app = cx.entity().downgrade();
-            chips = chips.child(chip.context_menu(move |menu, window, cx| {
+            let chip = chip.context_menu(move |menu, window, cx| {
                 Self::tab_context_menu(menu, i, false, &menu_app, window, cx)
-            }));
+            });
+            chips = chips.child(match &preview {
+                // The chip in hand: drawn wherever the cursor is holding it,
+                // pixel for pixel, with no animation in the way. `deferred`
+                // keeps its slot in the layout but paints it after its
+                // siblings, so it passes *over* the chips it's crossing
+                // instead of being clipped behind them.
+                Some(p) if p.from == i => deferred(chip.relative().left(p.held)).into_any_element(),
+                // A chip the drag just crossed starts the frame where it used
+                // to be and eases to its new slot. `offset` is zero for every
+                // chip the last crossing left alone, so this is one moving
+                // chip at a time, not the whole row re-animating every frame.
+                Some(p) => {
+                    let offset = p.offsets[i].as_f32();
+                    chip.with_animation(
+                        (
+                            SharedString::from(format!("chip-slide-{}", p.generation)),
+                            i,
+                        ),
+                        Animation::new(std::time::Duration::from_millis(REORDER_SLIDE_MS))
+                            .with_easing(ease_out_quint()),
+                        move |el, delta| el.left(px(offset * (1. - delta))),
+                    )
+                    .into_any_element()
+                }
+                None => chip.into_any_element(),
+            });
         }
 
         // "+" new-tab button — click opens the shell picker. The default shell
@@ -993,6 +1133,7 @@ impl Tty7App {
         // Only `chips` is width-capped and `overflow_hidden`, so neither button is
         // pushed off-screen no matter how many tabs are open.
         h_flex()
+            .id("tab-strip")
             .items_center()
             .gap_1p5()
             // Chip mode: viewport-derived width (see `strip_w`) so the right edge —

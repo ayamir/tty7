@@ -33,6 +33,14 @@ const MAX_STDIN: u64 = 64 * 1024;
 /// the controlling terminal. Always exits quietly — a hook that fails must
 /// never break the agent's own flow (agents surface nonzero exits).
 pub fn run_agent_hook(agent: &str, event: &str) {
+    // Shed our own console before doing anything else. Debug builds are
+    // console-subsystem (so `println!` logging works while developing the GUI),
+    // so every hook process Claude Code spawns gets its *own* console window —
+    // a rash of terminal windows that flash open and vanish as each end-of-turn
+    // hook fires. We never use this console for I/O (stdin is piped and we write
+    // to the *agent's* console via AttachConsole), so freeing it now tears the
+    // window down before it can paint. No-op in release (GUI subsystem) and Unix.
+    detach_console();
     // Not inside tty7 (or a remote shell): stay silent, so globally-installed
     // hooks don't leak escape sequences into other terminals.
     if std::env::var_os(TTY7_ENV_MARKER).is_none() {
@@ -53,6 +61,26 @@ pub fn run_agent_hook(agent: &str, event: &str) {
     };
     write_to_controlling_tty(&build_hook_sequence(agent, event, &input));
 }
+
+/// Detach from — and, when we're the only process attached, destroy — the
+/// calling process's console. On Windows debug builds each `tty7 agent-hook …`
+/// process owns a throwaway console whose window would otherwise flash on
+/// screen; freeing it before the window paints removes the flash. The emitter
+/// re-attaches to the agent's console via `AttachConsole` when it writes, so
+/// this doesn't cost us the output path. No-op where there's no console to free.
+#[cfg(not(unix))]
+fn detach_console() {
+    use windows_sys::Win32::System::Console::FreeConsole;
+    // SAFETY: FreeConsole takes no arguments; it simply returns 0 when the
+    // process has no attached console (release/GUI builds) and is otherwise a
+    // clean detach.
+    unsafe {
+        FreeConsole();
+    }
+}
+
+#[cfg(unix)]
+fn detach_console() {}
 
 /// The sentinel event one hook invocation maps onto, or `None` to stay silent.
 /// Most hooks pass their event through; the exception is Copilot's single
@@ -82,7 +110,7 @@ fn build_hook_sequence(agent: &str, event: &str, stdin_json: &str) -> Vec<u8> {
         "agent": agent,
         "event": event,
     });
-    for key in ["session_id", "message"] {
+    for key in ["session_id", "message", "cwd"] {
         if let Some(v) = payload
             .get(key)
             .and_then(|v| v.as_str())
@@ -404,7 +432,9 @@ pub fn hooks_state(agent: HookAgent) -> HooksState {
 
 /// Install (or rewrite in place) one agent's tty7 hooks. Idempotent: existing
 /// tty7 entries/files are replaced, never duplicated, and anything
-/// user-authored is left untouched. Returns a short human-readable summary.
+/// user-authored is left untouched. Returns a terse summary meant for the
+/// settings row's note line — the row already shows the agent and target
+/// path, so the summary never repeats them.
 pub fn install_hooks(agent: HookAgent) -> anyhow::Result<String> {
     let path = agent
         .target_path()
@@ -412,10 +442,7 @@ pub fn install_hooks(agent: HookAgent) -> anyhow::Result<String> {
     match agent {
         HookAgent::Claude => {
             hook_map_install(&path, agent, CLAUDE_HOOK_EVENTS)?;
-            Ok(format!(
-                "Claude Code hooks installed in {} — restart running claude sessions to pick them up",
-                path.display()
-            ))
+            Ok("Installed".to_string())
         }
         HookAgent::Codex => {
             hook_map_install(&path, agent, CODEX_HOOK_EVENTS)?;
@@ -423,11 +450,10 @@ pub fn install_hooks(agent: HookAgent) -> anyhow::Result<String> {
             // Best-effort: the file install above is complete and correct
             // either way, so a missing codex binary downgrades to advice
             // instead of failing the install.
-            let summary = format!("Codex hooks installed in {}", path.display());
             Ok(match enable_codex_hooks_feature() {
-                Ok(()) => summary,
+                Ok(()) => "Installed".to_string(),
                 Err(e) => format!(
-                    "{summary} — couldn't run `codex features enable hooks` ({e}); run it once manually"
+                    "Installed, but couldn't run `codex features enable hooks` ({e}) — run it once manually"
                 ),
             })
         }
@@ -435,11 +461,7 @@ pub fn install_hooks(agent: HookAgent) -> anyhow::Result<String> {
             let content = owned_file_content(agent)
                 .ok_or_else(|| anyhow::anyhow!("cannot resolve tty7's own executable path"))?;
             owned_file_install(&path, &content, &agent.marker())?;
-            Ok(format!(
-                "{} integration installed at {}",
-                agent.display_name(),
-                path.display()
-            ))
+            Ok("Installed".to_string())
         }
     }
 }
@@ -477,7 +499,11 @@ pub fn refresh_hooks_at_launch() -> usize {
         match install_hooks(agent) {
             Ok(summary) => {
                 refreshed += 1;
-                log::info!("refreshed stale agent hooks: {summary}");
+                log::info!(
+                    "refreshed stale {} hooks at {}: {summary}",
+                    agent.display_name(),
+                    agent.target_display()
+                );
             }
             Err(e) => log::warn!(
                 "could not refresh stale {} hooks: {e}",
@@ -705,11 +731,7 @@ fn hook_map_uninstall(path: &Path, agent: HookAgent) -> anyhow::Result<String> {
         return Ok("No tty7 hooks found; nothing to remove".to_string());
     }
     crate::core::config::write_atomic(path, serde_json::to_string_pretty(&root)?.as_bytes())?;
-    Ok(format!(
-        "{} hooks removed from {}",
-        agent.display_name(),
-        path.display()
-    ))
+    Ok("Removed".to_string())
 }
 
 /// The tty7 hook command inside one matcher entry
@@ -740,10 +762,9 @@ fn enable_codex_hooks_feature() -> Result<(), String> {
     .chain(home_dir().map(|h| h.join(".local/bin/codex")))
     .find(|p| p.exists());
     let program = candidates.unwrap_or_else(|| PathBuf::from("codex"));
-    match std::process::Command::new(&program)
-        .args(["features", "enable", "hooks"])
-        .output()
-    {
+    let mut cmd = std::process::Command::new(&program);
+    cmd.args(["features", "enable", "hooks"]);
+    match crate::core::proc::hide_console(&mut cmd).output() {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => Err(format!(
             "codex exited with {}: {}",
@@ -828,7 +849,7 @@ fn owned_file_uninstall(path: &Path, marker: &str) -> anyhow::Result<String> {
     {
         let _ = std::fs::remove_dir(parent);
     }
-    Ok(format!("Removed {}", path.display()))
+    Ok("Removed".to_string())
 }
 
 /// Copilot hook file (`~/.copilot/hooks/tty7.json`): Copilot auto-loads every
@@ -957,6 +978,7 @@ mod tests {
         assert_eq!(ev.kind, AgentEventKind::Notification);
         assert_eq!(ev.session_id.as_deref(), Some("abc-123"));
         assert!(ev.message.as_deref().unwrap().contains("permission"));
+        assert_eq!(ev.cwd.as_deref(), Some(std::path::Path::new("/w")));
 
         // Garbage stdin still yields a well-formed bare event.
         let seq = build_hook_sequence("claude", "stop", "not json at all");

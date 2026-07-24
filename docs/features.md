@@ -5,7 +5,7 @@
 ## Input
 
 - **Ghost suggestions** — your history completes the whole line as you type; <kbd>→</kbd> to accept
-- **Explained tab completion** — every flag and subcommand with its description, for ~100 common commands
+- **Explained tab completion** — every flag and subcommand with its description, for ~100 common commands; when tty7 has nothing to offer the Tab falls through to your shell's own completion, and the whole feature can be turned off (Settings → Terminal → Keyboard, or `tab_completion` in `config.json`)
 - **Syntax highlighting** — as you type, nothing to install
 - **Fuzzy history search** — <kbd>⌃ R</kbd> shows what you ran, where, and whether it failed
 - **History from day one** — your existing shell history works as-is and carries across sessions
@@ -18,7 +18,9 @@
 - **Repo-grouped sidebar** — the left tab sidebar groups rows under a header per git repository, non-repo tabs in a trailing *Scratch* section; branch switches and in-repo `cd`s never move a row (`sidebar_grouping` in `config.json`: `repo` default, `none` for a flat list)
 - **Command palette** <kbd>⌘ P</kbd> · scrollback search <kbd>⌘ F</kbd>
 - **⌘-click links** · desktop notifications · copy on select (opt-in, Settings → Terminal → Clipboard)
+- **Smart double-click selection** — double-click grabs the whole URL, file path, bracket/quote pair, or dictionary-segmented CJK word under the cursor; Shift-click extends a selection (toggle in Settings → Terminal → Mouse; word separators via `word_separators` in `config.json`)
 - **Eight themes, plus your own** — YAML seed themes with solid, gradient, or image backgrounds; iTerm2 `.itermcolors` import; in-app color editor with a background-image picker
+- **Sync with system** — Settings → Appearance; pick separate light and dark themes and tty7 follows the OS appearance live (`theme_follow_system`, `theme_preset_light` / `theme_preset_dark` in `config.json`)
 - **Window opacity & blur** — Settings → Appearance → Window; applies to every theme, *Follow theme* returns to the theme's own `opacity` / `blur`
 - **CJK / IME input**
 
@@ -32,7 +34,7 @@ it never wraps or replaces the agent.
 - **Status dot** — working (blue) / needs your input (amber) / done (green), driven by agent-reported events over an OSC channel; run *Agent: Install Claude Code Hooks* from the palette to wire Claude Code up
 - **Notifications** — "needs your permission…" the moment an agent blocks on you, and "finished after Ns" per turn, honoring your notification policy
 - **Branch at a glance** — each sidebar row shows its pane's git branch and working-tree diff (`+N −M`), refreshed on `cd` and when a command finishes
-- **Session resume** — panes lost to a reboot re-launch their agent conversation (`claude --resume …`) on restore (`restore_agent_sessions`, on by default)
+- **Session resume** — panes lost to a reboot re-launch their agent conversation on restore, carrying the original launch flags (`claude --dangerously-skip-permissions --resume …`) (`restore_agent_sessions`, on by default)
 - **Context feed** — palette commands send the current selection or the repo's `git diff` to the running agent as a ready-made prompt
 - **Tray icon** — a system tray / menu bar item that flips to an attention state the moment any agent needs your input; its menu lists every agent pane (brand avatar + status dot, click to reveal), switches the notification policy, and offers *Quit and Stop Daemon* alongside the plain session-keeping quit (`show_tray_icon`, on by default)
 

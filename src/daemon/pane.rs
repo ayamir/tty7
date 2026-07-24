@@ -102,6 +102,33 @@ fn default_shell_name(cmd: &CommandBuilder) -> String {
     cmd.get_shell()
 }
 
+/// The shell a spawn resolved to, plus who authored its args.
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+struct ChosenShell {
+    program: String,
+    args: Vec<String>,
+    /// True when `args` are tty7's own defaults from shell discovery rather
+    /// than the user's, so shell integration may replace them. See
+    /// [`ShellSpec::args_are_tty7_defaults`].
+    args_are_tty7_defaults: bool,
+}
+
+/// Whether the chosen shell carries args tty7 must not second-guess, which is
+/// what makes `shell_integration::setup` decline bash and PowerShell (their
+/// injections replace argv rather than extend it). Two things have to hold for
+/// the args to be off-limits:
+///
+///  - there are some — an empty `args: []` (just picking the program) leaves
+///    nothing for bash's `--rcfile … -i` to conflict with; and
+///  - the *user* wrote them. The new-tab dropdown's args are tty7's own
+///    (`core::shells::detect_shells`), so integration is free to express the
+///    same intent its own way: Git Bash's `-i -l` means "interactive login
+///    shell", exactly what `setup_bash` rebuilds out of `--rcfile … -i` plus a
+///    replayed login-file chain. See [`ShellSpec::args_are_tty7_defaults`].
+fn has_custom_args(chosen: Option<&ChosenShell>) -> bool {
+    chosen.is_some_and(|c| !c.args.is_empty() && !c.args_are_tty7_defaults)
+}
+
 /// Which shell a spawn launches, by precedence: the explicit per-spawn override
 /// (the new-tab dropdown) > the configured `shell` in `config.json` > `None`,
 /// meaning the platform default (`default_prog()`). Kept as a function so the
@@ -109,8 +136,21 @@ fn default_shell_name(cmd: &CommandBuilder) -> String {
 fn choose_shell(
     spawn_override: Option<ShellSpec>,
     configured: Option<(String, Vec<String>)>,
-) -> Option<(String, Vec<String>)> {
-    spawn_override.map(|s| (s.program, s.args)).or(configured)
+) -> Option<ChosenShell> {
+    spawn_override
+        .map(|s| ChosenShell {
+            program: s.program,
+            args: s.args,
+            args_are_tty7_defaults: s.args_are_tty7_defaults,
+        })
+        .or_else(|| {
+            // Straight from `config.json` — the user wrote these.
+            configured.map(|(program, args)| ChosenShell {
+                program,
+                args,
+                args_are_tty7_defaults: false,
+            })
+        })
 }
 
 fn apply_shell_integration(
@@ -123,7 +163,7 @@ fn apply_shell_integration(
     // sentinel builder. Integrations that need argv (fish `-C`, bash `--rcfile`,
     // PowerShell flags) must use an explicit command builder first. Env-only zsh
     // integration keeps the default login-shell path.
-    if integration.force_non_login || (cmd.is_default_prog() && !integration.args.is_empty()) {
+    if integration.replaces_argv || (cmd.is_default_prog() && !integration.args.is_empty()) {
         *cmd = CommandBuilder::new(resolved_program);
     }
     cmd.args(&integration.args);
@@ -144,26 +184,70 @@ fn build_spawn_config(
     shell: Option<ShellSpec>,
 ) -> anyhow::Result<SpawnConfig> {
     let initial_cwd = initial_working_directory(cwd);
-    let (cmd, integration_dir) = build_shell_command(shell, &initial_cwd)?;
+    // Resolved here rather than inside `build_shell_command` because the WSL tag
+    // must be read off the shell we *actually* launch. `shell` is only the
+    // per-spawn override; `config.json` supplies the program when it is `None`,
+    // and a `wsl.exe` configured there is just as much a WSL pane as one picked
+    // from the dropdown.
+    let configured = choose_shell(shell, crate::core::config::shell_command());
+    let remote = wsl_remote_context(configured.as_ref());
+    let (cmd, integration_dir) = build_shell_command(configured, &initial_cwd)?;
     Ok(SpawnConfig {
         cmd,
         initial_cwd,
         integration_dir,
-        remote: None,
+        remote,
     })
 }
 
+/// Tag a `wsl.exe` pane as living in another filesystem namespace, from the
+/// resolved shell rather than the process table — `wsl.exe` is exactly what tty7
+/// launched, so there is nothing to detect.
+///
+/// This is what makes `TerminalView::local_cwd` decline the distro's cwd, and
+/// so what keeps the local git probe, path completion, link resolution and cwd
+/// inheritance away from a path that means nothing on this side (and that
+/// Windows would read as drive-relative). It is set whether or not shell
+/// integration succeeded: an unintegrated WSL pane reports no cwd today, but if
+/// it ever does the gate must already be in place.
+///
+/// Takes the post-[`choose_shell`] program, not the per-spawn override: a
+/// `wsl.exe` written into `config.json` reaches the same integration and so must
+/// reach the same tag.
+fn wsl_remote_context(shell: Option<&ChosenShell>) -> Option<RemoteContext> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let chosen = shell?;
+    let base = std::path::Path::new(&chosen.program)
+        .file_name()?
+        .to_str()?
+        .to_ascii_lowercase();
+    if base.strip_suffix(".exe").unwrap_or(&base) != "wsl" {
+        return None;
+    }
+    Some(RemoteContext {
+        kind: RemoteKind::Wsl,
+        argv: Vec::new(),
+        // The distro, when the args name one; otherwise `wsl.exe` picks the
+        // default and we have no name for it without another probe. Shared with
+        // the integration so the two can't disagree about which distro an argv
+        // names — they are handed the very same args.
+        target: shell_integration::wsl_distro(&chosen.args).unwrap_or_default(),
+    })
+}
+
+/// Build the argv for a spawn from an already-resolved shell (see
+/// [`choose_shell`]); `None` means the platform default (the login shell on
+/// Unix, PowerShell on Windows).
 fn build_shell_command(
-    shell: Option<ShellSpec>,
+    configured: Option<ChosenShell>,
     initial_cwd: &Option<PathBuf>,
 ) -> anyhow::Result<(CommandBuilder, Option<PathBuf>)> {
-    // Build the shell command; `None` means the platform default (the login
-    // shell on Unix, PowerShell on Windows).
-    let configured = choose_shell(shell, crate::core::config::shell_command());
     let mut cmd = match &configured {
-        Some((program, args)) => {
-            let mut c = CommandBuilder::new(program);
-            c.args(args);
+        Some(chosen) => {
+            let mut c = CommandBuilder::new(&chosen.program);
+            c.args(&chosen.args);
             c
         }
         None => default_prog(),
@@ -174,20 +258,20 @@ fn build_shell_command(
     // it's whatever `default_prog()` resolved (passwd/`$SHELL` on Unix,
     // `powershell.exe` on Windows — see `default_shell_name`).
     let resolved_program = match &configured {
-        Some((program, _)) => program.clone(),
+        Some(chosen) => chosen.program.clone(),
         None => default_shell_name(&cmd),
     };
 
-    // Shell integration: inject OSC 7 / OSC 133 hooks (zsh/fish/bash/PowerShell
-    // — see `daemon::shell_integration`). Best effort — `None` (an unsupported
-    // shell, or a bash/PowerShell with unpreservable custom args) means we launch
-    // bare. A configured shell only counts as having "custom args" to preserve
-    // when it actually specifies any — an empty `args: []` (just picking the
-    // program) leaves nothing for bash's `--rcfile -i` to conflict with.
-    let has_custom_args = configured
-        .as_ref()
-        .is_some_and(|(_, args)| !args.is_empty());
-    let integration = shell_integration::setup(Some(&resolved_program), has_custom_args);
+    // Shell integration: inject OSC 7 / OSC 133 hooks (zsh/fish/bash/PowerShell,
+    // and through `wsl.exe` into a distro — see `daemon::shell_integration`).
+    // Best effort — `None` (an unsupported shell, or one with unpreservable
+    // custom args) means we launch bare. The args go in because the WSL path
+    // reads the distro out of them.
+    let integration = shell_integration::setup(
+        Some(&resolved_program),
+        configured.as_ref().map_or(&[][..], |c| c.args.as_slice()),
+        has_custom_args(configured.as_ref()),
+    );
     if let Some(integration) = &integration {
         apply_shell_integration(&mut cmd, &resolved_program, integration);
     }
@@ -212,7 +296,17 @@ fn initial_working_directory(cwd: Option<PathBuf>) -> Option<PathBuf> {
     // client didn't pass an explicit cwd (tab-inherit / session restore still
     // win). Inherit -> `forced` is `None`, so we keep the fallback as before.
     let forced = crate::core::config::working_directory_base();
-    cwd.or(forced).or(fallback)
+    // Whatever wins must actually be a directory *here*. A client cwd is only
+    // as good as the OSC 7 that produced it, and a shell that reports a path
+    // this machine cannot resolve — a remote namespace, or an msys path like
+    // `/c/Users/x` that Windows reads as drive-relative — would otherwise turn
+    // a new tab or split into a hard spawn failure ("The directory name is
+    // invalid") instead of quietly falling back. Cheap to check, and it bounds
+    // the whole class rather than one shell's spelling at a time.
+    [cwd, forced, fallback]
+        .into_iter()
+        .flatten()
+        .find(|d| d.is_dir())
 }
 
 fn apply_common_command_setup(cmd: &mut CommandBuilder, initial_cwd: &Option<PathBuf>) {
@@ -374,6 +468,11 @@ struct PaneState {
     /// the foreground `argv` (same process-table poll as `remote`). `None` when
     /// no known agent runs — see [`crate::core::cli_agent`].
     agent: Option<crate::core::cli_agent::CLIAgent>,
+    /// The argv the detected agent was launched with, held here until a rich
+    /// session exists to stamp it into (the sentinel events that create the
+    /// session can land before the first argv poll, and vice versa). Cleared
+    /// with the chip. See [`stamp_launch_argv`].
+    agent_argv: Option<Vec<String>>,
     /// The rich agent-session status (idle/working/waiting/done + native
     /// session id), folded from the sentinel OSC events the agent's hooks emit
     /// (with an opaque OSC 9/777 fallback). Cleared when the agent exits.
@@ -409,8 +508,9 @@ struct ForegroundProbes {
     /// process group) — "no opinion", never applied, so it can't wipe an agent
     /// identified another way (sentinel events, the Windows `133;C;<cmd>`
     /// mark). `Some(answer)` is a real poll result; its inner `None` ("polled,
-    /// no agent") clears the chip.
-    agent: Box<dyn Fn() -> Option<Option<crate::core::cli_agent::CLIAgent>> + Send>,
+    /// no agent") clears the chip. A detected agent travels with the `argv` it
+    /// was identified from, kept for flag carry-over on session resume.
+    agent: Box<dyn Fn() -> Option<Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>> + Send>,
 }
 
 /// The local-PTY backend: the same handles `DaemonPane` has always owned.
@@ -575,6 +675,7 @@ impl DaemonPane {
             remote: spawn.remote.clone(),
             agent: None,
             agent_session: None,
+            agent_argv: None,
             alive: true,
         }));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -683,6 +784,7 @@ impl DaemonPane {
             // agent detection never runs for it.
             agent: None,
             agent_session: None,
+            agent_argv: None,
             alive: true,
         }));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -890,15 +992,23 @@ impl DaemonPane {
                                     std::time::Instant::now() + REMOTE_CONTEXT_POLL_INTERVAL;
                             }
                             let remote = if poll_now {
-                                // A native-SSH pane already carries its own remote
-                                // context; process-table detection must not clobber
-                                // it (this pane *is* SSH). Only a plain PTY pane gets
-                                // foreground `ssh` detection.
+                                // A pane tty7 itself spawned as remote (native SSH,
+                                // or WSL) already carries its own context from the
+                                // spawn spec; process-table detection must not
+                                // clobber it. Only `Ssh` — the kind this very probe
+                                // produces — may be replaced, so a pane that has
+                                // since left a foreground `ssh` clears correctly.
+                                //
+                                // Testing `!= Ssh` rather than `== NativeSsh` is
+                                // load-bearing for WSL: `wsl.exe` is not `ssh`, so
+                                // the probe returns `None` and would blank the
+                                // context on the very next poll — twice a second,
+                                // each time also clearing the pane's cwd.
                                 let managed = {
                                     let st = state.lock().unwrap();
                                     st.remote
                                         .as_ref()
-                                        .is_some_and(|remote| remote.kind == RemoteKind::NativeSsh)
+                                        .is_some_and(|remote| remote.kind != RemoteKind::Ssh)
                                 };
                                 (!managed).then(&foreground_remote)
                             } else {
@@ -1648,7 +1758,8 @@ fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
         if shell_mark_capture_changed(&st.shell, &shell) {
             apply_agent(
                 st,
-                agent_from_shell_mark(&shell, crate::core::config::agent_commands_cached()),
+                agent_from_shell_mark(&shell, crate::core::config::agent_commands_cached())
+                    .map(|agent| (agent, Vec::new())),
             );
         }
         st.shell = shell.clone();
@@ -1686,6 +1797,12 @@ fn agent_from_shell_mark(
     shell: &ShellState,
     custom: &std::collections::HashMap<String, String>,
 ) -> Option<crate::core::cli_agent::CLIAgent> {
+    // Identity only — deliberately NOT a launch-argv source for resume flag
+    // carry-over. The `133;C` capture is terminal *output* (any program can
+    // print the OSC and forge it), and forged flags would ride an
+    // auto-executed resume command on the next restore; the Unix argv comes
+    // from the process table and has no such problem. Windows sessions
+    // therefore resume bare.
     shell
         .command
         .as_deref()
@@ -1739,6 +1856,16 @@ fn apply_agent_signals(
         sess.message = Some(body);
     }
 
+    // A session the events just created starts without the launch argv the
+    // identity poll captured — seed it so resume gets the flags no matter
+    // which side observed the pane first. Updates keep flowing through
+    // [`stamp_launch_argv`].
+    if let (Some(sess), Some(argv)) = (&mut st.agent_session, &st.agent_argv)
+        && sess.launch_argv.is_none()
+    {
+        sess.launch_argv = Some(argv.clone());
+    }
+
     if st.agent_session != before
         && let Some(sub) = &st.subscriber
     {
@@ -1750,14 +1877,35 @@ fn apply_remote_context(st: &mut PaneState, remote: Option<RemoteContext>) {
     if st.remote == remote {
         return;
     }
+    // The cwd belonged to whichever side we are leaving, and it does not
+    // survive the crossing: a remote path is meaningless locally, and a local
+    // one is meaningless on the remote. Drop it so the pane reports no cwd
+    // until the new shell's OSC 7 lands, rather than attributing the old
+    // namespace's directory to the new one — otherwise a local shell without
+    // shell integration keeps serving the remote's last path to the local
+    // `git` probe for the rest of its life.
+    // `DaemonMsg::Cwd` carries a bare path with no "cleared" form, so the
+    // client mirrors this on its own when it sees the `RemoteContext` below.
+    st.cwd = None;
     if let Some(sub) = &st.subscriber {
         let _ = sub.send(DaemonMsg::RemoteContext(remote.clone()));
     }
     st.remote = remote;
 }
 
-fn apply_agent(st: &mut PaneState, agent: Option<crate::core::cli_agent::CLIAgent>) {
+fn apply_agent(
+    st: &mut PaneState,
+    detected: Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>,
+) {
+    let (agent, argv) = match detected {
+        Some((agent, argv)) => (Some(agent), Some(argv)),
+        None => (None, None),
+    };
     if st.agent == agent {
+        // Same chip, but the observed argv can still be news: the sentinel
+        // events may have branded the pane before the first argv poll, or the
+        // user relaunched the agent with different flags.
+        stamp_launch_argv(st, argv);
         return;
     }
     // The agent leaving the foreground ends its session: clear the rich state
@@ -1770,10 +1918,38 @@ fn apply_agent(st: &mut PaneState, agent: Option<crate::core::cli_agent::CLIAgen
             let _ = sub.send(DaemonMsg::AgentStatus(None));
         }
     }
+    if agent.is_none() {
+        st.agent_argv = None;
+    }
     if let Some(sub) = &st.subscriber {
         let _ = sub.send(DaemonMsg::Agent(agent));
     }
     st.agent = agent;
+    stamp_launch_argv(st, argv);
+}
+
+/// Record the detected agent's launch argv and mirror it into the rich session
+/// state (pushing the change to the client) when one exists — resume-after-
+/// restart reads it from there. `None` (a poll that saw no argv) and an empty
+/// argv (Windows mark detection, identity without a trustworthy argv) never
+/// wipe a captured value; the chip clearing in [`apply_agent`] does that.
+fn stamp_launch_argv(st: &mut PaneState, argv: Option<Vec<String>>) {
+    let Some(argv) = argv else { return };
+    if argv.is_empty() {
+        return;
+    }
+    if st.agent_argv.as_ref() == Some(&argv) {
+        return;
+    }
+    st.agent_argv = Some(argv.clone());
+    if let Some(sess) = &mut st.agent_session
+        && sess.launch_argv.as_ref() != Some(&argv)
+    {
+        sess.launch_argv = Some(argv);
+        if let Some(sub) = &st.subscriber {
+            let _ = sub.send(DaemonMsg::AgentStatus(st.agent_session.clone()));
+        }
+    }
 }
 
 /// Whether a foreground command — not the shell itself — currently owns the
@@ -1840,14 +2016,16 @@ fn foreground_remote_context(_master: &Mutex<Box<dyn MasterPty + Send>>) -> Opti
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn foreground_agent(
     master: &Mutex<Box<dyn MasterPty + Send>>,
-) -> Option<Option<crate::core::cli_agent::CLIAgent>> {
+) -> Option<Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>> {
     let detect = || {
         let pid = master.lock().ok().and_then(|m| m.process_group_leader())?;
         let argv = crate::daemon::remote::foreground_argv(pid)?;
-        crate::core::cli_agent::CLIAgent::detect_from_argv_with(
+        let agent = crate::core::cli_agent::CLIAgent::detect_from_argv_with(
             &argv,
             crate::core::config::agent_commands_cached(),
-        )
+        )?;
+        // The argv rides along: resume-after-restart replays its flags.
+        Some((agent, argv))
     };
     Some(detect())
 }
@@ -1859,7 +2037,7 @@ fn foreground_agent(
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn foreground_agent(
     _master: &Mutex<Box<dyn MasterPty + Send>>,
-) -> Option<Option<crate::core::cli_agent::CLIAgent>> {
+) -> Option<Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>> {
     None
 }
 
@@ -2027,7 +2205,9 @@ fn strip_uri_drive_slash(path: &str) -> &str {
 }
 
 /// Parse an OSC 7 `file://HOST/PATH` (or bare absolute path) payload.
-fn parse_osc7(payload: &[u8]) -> Option<PathBuf> {
+/// `pub(crate)` so the shell-integration tests can round-trip what the snippets
+/// actually emit through the parser that consumes it.
+pub(crate) fn parse_osc7(payload: &[u8]) -> Option<PathBuf> {
     let rest = payload.strip_prefix(b"7;")?;
     let path_bytes: &[u8] = if let Some(after) = rest.strip_prefix(b"file://") {
         let idx = after.iter().position(|&c| c == b'/')?;
@@ -2116,6 +2296,48 @@ fn proc_name(pid: i32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    /// A cwd the client reports is only as trustworthy as the OSC 7 behind it.
+    /// Passing one this machine cannot resolve straight to `cmd.cwd()` turns a
+    /// new tab or split into a hard spawn failure, so anything that isn't a
+    /// real directory here must fall through to the next candidate instead.
+    #[test]
+    fn initial_working_directory_skips_paths_that_are_not_directories() {
+        let real = std::env::temp_dir();
+        assert!(real.is_dir(), "temp dir should exist");
+
+        // A usable client cwd still wins outright.
+        assert_eq!(
+            initial_working_directory(Some(real.clone())),
+            Some(real.clone())
+        );
+
+        // A remote-namespace path, and the msys shape Windows reads as
+        // drive-relative: neither resolves here, so neither may be used.
+        for bogus in [
+            "/home/someone/definitely-not-here",
+            "/c/Users/definitely-not-here",
+        ] {
+            let got = initial_working_directory(Some(PathBuf::from(bogus)));
+            assert_ne!(
+                got.as_deref(),
+                Some(Path::new(bogus)),
+                "{bogus} is not a directory here and must not be handed to spawn"
+            );
+            // Whatever we fall back to must itself be usable.
+            if let Some(d) = got {
+                assert!(d.is_dir(), "fallback {d:?} must be a real directory");
+            }
+        }
+
+        // A file is not a directory either.
+        let file = real.join("tty7-iwd-probe");
+        std::fs::write(&file, b"x").expect("write probe file");
+        let got = initial_working_directory(Some(file.clone()));
+        assert_ne!(got.as_deref(), Some(file.as_path()));
+        let _ = std::fs::remove_file(&file);
+    }
 
     /// End-to-end check of the *live* agent-detection chain this feature rides
     /// on macOS/Linux: spawn a real PTY child whose `argv[0]` names a coding
@@ -2163,10 +2385,16 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
 
+        let (agent, argv) = detected.expect("agent detected from live PTY child");
         assert_eq!(
-            detected,
-            Some(crate::core::cli_agent::CLIAgent::Codex),
+            agent,
+            crate::core::cli_agent::CLIAgent::Codex,
             "a live PTY child with argv[0]=codex must be detected as Codex"
+        );
+        assert_eq!(
+            argv.first().map(String::as_str),
+            Some("codex"),
+            "the observed argv rides along with the detection"
         );
     }
 
@@ -2177,18 +2405,129 @@ mod tests {
         let over = ShellSpec {
             program: "fish".into(),
             args: vec!["-l".into()],
+            args_are_tty7_defaults: true,
         };
         let cfg = ("zsh".to_string(), vec!["-i".to_string()]);
 
-        // Override wins even when a shell is configured.
+        // Override wins even when a shell is configured, carrying its
+        // arg-ownership flag through.
         assert_eq!(
             choose_shell(Some(over.clone()), Some(cfg.clone())),
-            Some(("fish".to_string(), vec!["-l".to_string()]))
+            Some(ChosenShell {
+                program: "fish".to_string(),
+                args: vec!["-l".to_string()],
+                args_are_tty7_defaults: true,
+            })
         );
-        // No override → the configured shell.
-        assert_eq!(choose_shell(None, Some(cfg.clone())), Some(cfg));
+        // No override → the configured shell, whose args are the user's and so
+        // are never tty7 defaults.
+        assert_eq!(
+            choose_shell(None, Some(cfg.clone())),
+            Some(ChosenShell {
+                program: "zsh".to_string(),
+                args: vec!["-i".to_string()],
+                args_are_tty7_defaults: false,
+            })
+        );
         // Neither → platform default.
         assert_eq!(choose_shell(None, None), None);
+    }
+
+    /// Only *user*-authored args block integration. Locks the contract stated
+    /// on [`has_custom_args`] — in particular that the Git Bash dropdown row's
+    /// `-i -l` does not, which is what lets it get shell integration at all.
+    #[test]
+    fn only_user_authored_args_block_shell_integration() {
+        let chosen = |args: Vec<&str>, tty7: bool| ChosenShell {
+            program: r"C:\Program Files\Git\bin\bash.exe".to_string(),
+            args: args.into_iter().map(str::to_string).collect(),
+            args_are_tty7_defaults: tty7,
+        };
+
+        // The Git Bash dropdown row: tty7 wrote `-i -l`, so `setup_bash` may
+        // replace them.
+        assert!(!has_custom_args(Some(&chosen(vec!["-i", "-l"], true))));
+        // The same args from the user's config.json are theirs to keep.
+        assert!(has_custom_args(Some(&chosen(vec!["-i", "-l"], false))));
+        // No args at all: nothing to preserve either way.
+        assert!(!has_custom_args(Some(&chosen(vec![], false))));
+        assert!(!has_custom_args(Some(&chosen(vec![], true))));
+        // Platform default — no configured shell at all.
+        assert!(!has_custom_args(None));
+    }
+
+    /// A WSL pane must be tagged as living in another filesystem namespace, so
+    /// `TerminalView::local_cwd` declines the distro's cwd and the local git
+    /// probe / completion / link resolution / cwd inheritance never see a path
+    /// that means nothing here — and that Windows would read as drive-relative
+    /// (`/home/me` -> `C:\home\me`) rather than reject.
+    #[cfg(windows)]
+    #[test]
+    fn wsl_panes_are_tagged_as_a_foreign_filesystem() {
+        let spec = |program: &str, args: Vec<&str>| ChosenShell {
+            program: program.to_string(),
+            args: args.into_iter().map(str::to_string).collect(),
+            args_are_tty7_defaults: true,
+        };
+
+        // The dropdown's WSL row.
+        let ctx = wsl_remote_context(Some(&spec(
+            "wsl.exe",
+            vec!["--distribution", "Ubuntu-24.04", "--cd", "~"],
+        )))
+        .expect("wsl.exe must be tagged");
+        assert_eq!(ctx.kind, RemoteKind::Wsl);
+        // The distro rides along as the target so the UI has a name for it.
+        assert_eq!(ctx.target, "Ubuntu-24.04");
+        // Nothing reads `argv` for this kind; it is not an ssh invocation.
+        assert!(ctx.argv.is_empty());
+
+        // Short flag, and no flag at all (wsl.exe then picks the default
+        // distro — still a WSL pane, just one we have no name for).
+        assert_eq!(
+            wsl_remote_context(Some(&spec("wsl.exe", vec!["-d", "Debian"])))
+                .expect("short flag")
+                .target,
+            "Debian"
+        );
+        assert_eq!(
+            wsl_remote_context(Some(&spec("wsl.exe", vec![])))
+                .expect("default distro is still WSL")
+                .target,
+            ""
+        );
+        // The `--distribution=NAME` spelling too — the tag reads the distro with
+        // the integration's own parser, so the two cannot disagree about an argv
+        // they are both handed.
+        assert_eq!(
+            wsl_remote_context(Some(&spec("wsl.exe", vec!["--distribution=Arch"])))
+                .expect("joined flag")
+                .target,
+            "Arch"
+        );
+        // Case- and suffix-insensitive, like every other Windows program name.
+        assert!(wsl_remote_context(Some(&spec(r"C:\Windows\System32\WSL.EXE", vec![]))).is_some());
+
+        // Regression: the tag is read off the *resolved* shell, not the
+        // per-spawn override. A `wsl.exe` written into `config.json` reaches
+        // `setup_wsl` with no override in play (empty args, so nothing custom to
+        // preserve), so the distro starts reporting its own cwd — and an
+        // untagged pane would hand `/home/me/proj` straight to the local git
+        // probe, which Windows resolves drive-relative to `C:\home\me\proj`.
+        let from_config = choose_shell(None, Some(("wsl.exe".to_string(), Vec::new())));
+        assert_eq!(
+            wsl_remote_context(from_config.as_ref()).map(|c| c.kind),
+            Some(RemoteKind::Wsl),
+            "a configured wsl.exe is as much a WSL pane as a dropdown one"
+        );
+
+        // Everything else is a local pane and must not be tagged — tagging it
+        // would silently disable its git status, completion and cwd inheritance.
+        assert!(wsl_remote_context(Some(&spec("powershell.exe", vec![]))).is_none());
+        assert!(
+            wsl_remote_context(Some(&spec(r"C:\Program Files\Git\bin\bash.exe", vec![]))).is_none()
+        );
+        assert!(wsl_remote_context(None).is_none());
     }
 
     #[test]
@@ -2197,7 +2536,7 @@ mod tests {
         let injection = shell_integration::Injection {
             env: std::collections::HashMap::new(),
             args: vec!["-C".to_string(), "echo ready".to_string()],
-            force_non_login: false,
+            replaces_argv: false,
             dir: None,
         };
 
@@ -2220,7 +2559,7 @@ mod tests {
         let injection = shell_integration::Injection {
             env,
             args: Vec::new(),
-            force_non_login: false,
+            replaces_argv: false,
             dir: None,
         };
 
@@ -2897,6 +3236,7 @@ mod tests {
             remote: None,
             agent: None,
             agent_session: None,
+            agent_argv: None,
             alive,
         }
     }
@@ -2993,7 +3333,10 @@ mod tests {
             status: AgentStatus::Working,
             message: None,
             session_id: Some("sid".into()),
+            launch_argv: None,
             rich: true,
+            cwd: None,
+            activity: 0,
         });
         apply_signals(&mut st, sniffer.feed(b"\x1b]9;noise\x07"));
         assert_eq!(

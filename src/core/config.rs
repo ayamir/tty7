@@ -42,6 +42,18 @@ pub struct Config {
     /// `~/.config/tty7/themes/*`); unknown ids fall back to the default theme. The
     /// native chrome is forced to match the theme's light/dark brightness.
     pub theme_preset: String,
+    /// Follow the OS light/dark appearance. When `true` the active theme is
+    /// resolved from `theme_preset_light` / `theme_preset_dark` by the current
+    /// system appearance (switching live when the OS mode flips) and
+    /// `theme_preset` is ignored; the native chrome follows the OS instead of
+    /// being pinned to the theme.
+    pub theme_follow_system: bool,
+    /// Theme id used while `theme_follow_system` is on and the OS is in light
+    /// mode. Same registry/fallback rules as `theme_preset`.
+    pub theme_preset_light: String,
+    /// Theme id used while `theme_follow_system` is on and the OS is in dark
+    /// mode. Same registry/fallback rules as `theme_preset`.
+    pub theme_preset_dark: String,
     /// Global window-opacity override, 0.2–1.0. `None` (the default) follows the
     /// active theme's own `opacity`; when set it applies to every theme, so a
     /// chosen translucency survives theme switches.
@@ -75,6 +87,14 @@ pub struct Config {
     /// Detect URLs (OSC 8 hyperlinks + bare URLs in the text), underline them on
     /// hover, and open them on ⌘/Ctrl-click. On by default.
     pub link_url: bool,
+    /// Optional command template run when ⌘/Ctrl-clicking a detected file-path
+    /// link, instead of tty7's built-in "open in the default app" behavior. The
+    /// template is tokenized on whitespace and the placeholders `{path}`,
+    /// `{line}`, and `{column}` are substituted per argument; an argument that
+    /// contains a placeholder with no value (e.g. `{line}` on a link that has no
+    /// line number) is dropped. `None` (the default) keeps the built-in open.
+    /// Example: `"herdr edit {path} --line {line}"`.
+    pub link_file_command: Option<String>,
     /// When a pane is in a detected SSH session, Command-clicking loopback URLs
     /// opens them through a temporary local SSH port-forward. Off by default
     /// because it starts background `ssh` processes.
@@ -152,6 +172,13 @@ pub struct Config {
     /// visual flash (the current behavior).
     #[serde(default, deserialize_with = "de_lenient")]
     pub bell: BellMode,
+    /// Tab at the prompt opens tty7's own completion menu (commands, paths,
+    /// per-command signatures). On by default. When off — or whenever the
+    /// engine has nothing to offer — the prompt line is handed to the shell
+    /// and Tab goes to the PTY, so the shell's native completion (compsys,
+    /// fzf-tab, …) answers instead.
+    #[serde(default = "default_true")]
+    pub tab_completion: bool,
 
     // ── Appearance ──────────────────────────────────────────────────────────
     /// The shape drawn for the terminal cursor.
@@ -189,6 +216,19 @@ pub struct Config {
     /// the clipboard is never overwritten by a stray selection unless opted
     /// into.
     pub copy_on_select: bool,
+    /// Double-click smart selection: expand the selection to the whole URL,
+    /// email address, file path, or matching bracket pair under the cursor
+    /// when the plain word sits inside one. On by default; off restores the
+    /// bare word-boundary double-click.
+    #[serde(default = "default_true")]
+    pub smart_select: bool,
+    /// Characters (besides whitespace) that end a double-click word
+    /// selection, in both the terminal grid and the prompt's command editor.
+    /// The default mirrors alacritty's semantic escape set — note `/ . - _`
+    /// are *not* separators, so paths select as one word. JSON-only (no GUI
+    /// widget yet).
+    #[serde(default = "default_word_separators")]
+    pub word_separators: String,
     /// Window state at launch: normal / maximized / fullscreen.
     #[serde(default, deserialize_with = "de_lenient")]
     pub startup_mode: StartupMode,
@@ -450,6 +490,11 @@ impl Default for Config {
             // The default theme id (mirrors `ui::presets::DEFAULT_ID`; core can't
             // depend on ui). Unknown ids fall back to it anyway.
             theme_preset: "light".to_string(),
+            theme_follow_system: false,
+            // The built-in light/dark pair; each side is user-swappable in
+            // Settings once "sync with system" is on.
+            theme_preset_light: "light".to_string(),
+            theme_preset_dark: "dark".to_string(),
             window_opacity: None,
             window_blur: None,
             keybindings: HashMap::new(),
@@ -464,6 +509,7 @@ impl Default for Config {
             // out: URL detection on, cursor blinking, 10k scrollback, new tabs
             // after the active one, notify only while unfocused.
             link_url: true,
+            link_file_command: None,
             ssh_loopback_forward: false,
             cursor_blink: true,
             scrollback_limit: 10_000,
@@ -487,6 +533,7 @@ impl Default for Config {
             // Visual flash preserves the pre-config behavior (the bell always
             // flashed); opting into None/Audible is a deliberate change.
             bell: BellMode::Visual,
+            tab_completion: true,
             cursor_style: CursorStyle::Block,
             // Input/mouse defaults preserve today's behavior: Option composes
             // characters as macOS ships it (opt into Option-as-Meta); GPUI
@@ -500,6 +547,8 @@ impl Default for Config {
             mouse_reporting: true,
             clipboard_trim_trailing_spaces: false,
             copy_on_select: false,
+            smart_select: true,
+            word_separators: default_word_separators(),
             startup_mode: StartupMode::Normal,
             remember_window_size: true,
             working_directory: WorkingDirectory::default(),
@@ -584,6 +633,14 @@ impl Config {
             self.right_panel_width = default_right_panel_width();
         }
         self.right_panel_width = self.right_panel_width.clamp(100.0, 2000.0);
+        // An empty or whitespace-only file-open command means "no override"; the
+        // settings text field yields `""` when cleared, so fold it back to `None`
+        // rather than trying to run an empty command.
+        if let Some(command) = &self.link_file_command
+            && command.trim().is_empty()
+        {
+            self.link_file_command = None;
+        }
     }
 
     /// Write the current config back to disk, creating the parent directory if
@@ -772,6 +829,13 @@ fn default_true() -> bool {
     true
 }
 
+/// Serde default for [`Config::word_separators`]: alacritty's stock semantic
+/// escape set, the boundary characters double-click word selection used
+/// before this was configurable.
+fn default_word_separators() -> String {
+    ",│`|:\"' ()[]{}<>\t".to_string()
+}
+
 /// Serde default for [`Config::notify_threshold_secs`]: the 10-second floor a
 /// command had to cross before this was configurable.
 fn default_notify_threshold_secs() -> u64 {
@@ -880,6 +944,27 @@ mod tests {
         let back: Config = serde_json::from_str(&json).unwrap();
         assert!(back.ssh_warn_on_close);
         assert_eq!(back.ssh_profile_frecency.get(&id).unwrap().count, 4);
+    }
+
+    #[test]
+    fn theme_follow_system_defaults_and_round_trips() {
+        // Old configs (no follow-system keys) must land on off + the built-in
+        // light/dark pair, so nothing changes until the user opts in.
+        let cfg: Config = serde_json::from_str(r#"{"theme_preset":"dracula"}"#).unwrap();
+        assert!(!cfg.theme_follow_system);
+        assert_eq!(cfg.theme_preset_light, "light");
+        assert_eq!(cfg.theme_preset_dark, "dark");
+        assert_eq!(cfg.theme_preset, "dracula");
+
+        let mut cfg = Config::default();
+        cfg.theme_follow_system = true;
+        cfg.theme_preset_light = "one_light".to_string();
+        cfg.theme_preset_dark = "dracula".to_string();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert!(back.theme_follow_system);
+        assert_eq!(back.theme_preset_light, "one_light");
+        assert_eq!(back.theme_preset_dark, "dracula");
     }
 
     #[test]
@@ -1080,6 +1165,7 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.restore_session);
         assert!(cfg.mouse_reporting);
+        assert!(cfg.tab_completion);
         assert_eq!(cfg.notify_threshold_secs, 10);
         assert_eq!(cfg.bell, BellMode::Visual);
 
@@ -1088,8 +1174,13 @@ mod tests {
         let cfg: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
         assert!(cfg.restore_session);
         assert!(cfg.mouse_reporting);
+        assert!(cfg.tab_completion);
         assert_eq!(cfg.notify_threshold_secs, 10);
         assert_eq!(cfg.bell, BellMode::Visual);
+
+        // The opt-out round-trips.
+        let cfg: Config = serde_json::from_str(r#"{"tab_completion": false}"#).unwrap();
+        assert!(!cfg.tab_completion);
 
         // Valid values round-trip; a bad bell string falls back without failing
         // the whole parse.

@@ -1209,7 +1209,7 @@ impl TerminalElement {
                     return;
                 }
                 if button == MouseButton::Left {
-                    v.on_select_start(col, row, left, clicks, cx);
+                    v.on_select_start(col, row, left, clicks, mods.shift, cx);
                 }
             });
         });

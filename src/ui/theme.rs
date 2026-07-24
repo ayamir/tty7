@@ -87,12 +87,37 @@ pub(crate) fn window_background(bg: &presets::ActiveBackground) -> Background {
     }
 }
 
+/// Whether the OS is currently in dark mode, as gpui reports it. Only
+/// meaningful while the native appearance isn't pinned (see
+/// [`sync_native_appearance`]) — a pinned appearance reports the pin, not the
+/// OS setting, which is why callers gate on `Config::theme_follow_system`.
+pub(crate) fn system_dark(cx: &App) -> bool {
+    matches!(
+        cx.window_appearance(),
+        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+    )
+}
+
+/// The id of the theme that should be on screen right now: the light/dark
+/// slot matching the OS appearance while `Config::theme_follow_system` is on,
+/// otherwise the manual `Config::theme_preset`.
+pub(crate) fn effective_preset_id(cx: &App) -> String {
+    let config = cx.global::<Config>();
+    if !config.theme_follow_system {
+        config.theme_preset.clone()
+    } else if system_dark(cx) {
+        config.theme_preset_dark.clone()
+    } else {
+        config.theme_preset_light.clone()
+    }
+}
+
 /// The background appearance the window should be *created* with: Blurred when
 /// the effective theme wants blur, otherwise Transparent — never Opaque, so the
 /// opacity slider works live (see the comment in [`apply_theme`]).
 pub(crate) fn background_appearance(cx: &App) -> WindowBackgroundAppearance {
     let config = cx.global::<Config>();
-    let theme = presets::by_id(cx, &config.theme_preset);
+    let theme = presets::by_id(cx, &effective_preset_id(cx));
     if config.window_blur.unwrap_or(theme.blur) {
         WindowBackgroundAppearance::Blurred
     } else {
@@ -100,15 +125,23 @@ pub(crate) fn background_appearance(cx: &App) -> WindowBackgroundAppearance {
     }
 }
 
-/// Paint gpui-component's `Theme` from the active color theme (selected by
-/// `Config::theme_preset`). The theme's inferred `dark` brightness picks the
+/// Paint gpui-component's `Theme` from the active color theme (resolved by
+/// [`effective_preset_id`]). The theme's inferred `dark` brightness picks the
 /// component `ThemeMode`; every shell surface is then derived from the theme's
 /// background/foreground (see `Theme::neutrals`). Also publishes the
 /// terminal-facing palette as the `ActivePalette` global so the renderer matches,
 /// and applies the theme's window opacity/blur.
 pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
+    let follow = cx.global::<Config>().theme_follow_system;
+    // While following the OS the native pin must be released *before* the
+    // theme is resolved: `effective_preset_id` reads the system appearance
+    // through `effectiveAppearance`, which keeps reporting the pinned value
+    // until the pin is cleared.
+    if follow {
+        sync_native_appearance(None);
+    }
+    let theme = presets::by_id(cx, &effective_preset_id(cx));
     let config = cx.global::<Config>();
-    let theme = presets::by_id(cx, &config.theme_preset.clone());
     let mode = if theme.dark {
         ThemeMode::Dark
     } else {
@@ -120,8 +153,12 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     let opacity = config.window_opacity.or(theme.opacity).filter(|o| *o < 1.0);
     let blur = config.window_blur.unwrap_or(theme.blur);
     // Force the native macOS chrome (traffic lights, system menus, scrollbars)
-    // into the theme's own light/dark mode regardless of the OS setting.
-    sync_native_appearance(theme.dark);
+    // into the theme's own light/dark mode regardless of the OS setting —
+    // only while *not* following the OS, where the chrome should track the
+    // system (and pinning would blind `system_dark` to OS flips).
+    if !follow {
+        sync_native_appearance(Some(theme.dark));
+    }
     let m = theme.neutrals();
     let active = theme.active_palette();
 
@@ -278,8 +315,9 @@ pub(crate) fn apply_cursor_hide_mode(cx: &mut App) {
     cx.set_cursor_hide_mode(mode);
 }
 
-/// Force the macOS app appearance to match the active theme's light/dark mode
-/// instead of following the OS `Appearance` setting.
+/// Pin the macOS app appearance to the active theme's light/dark mode
+/// (`Some(dark)`), or release the pin so it follows the OS `Appearance`
+/// setting again (`None`, used while `Config::theme_follow_system` is on).
 ///
 /// macOS draws the native traffic-light buttons according to the window's
 /// effective appearance. With a dark tty7 theme on a light-mode macOS, the
@@ -289,7 +327,7 @@ pub(crate) fn apply_cursor_hide_mode(cx: &mut App) {
 /// no setter, so we pin `NSApplication.appearance` ourselves via AppKit. This
 /// also keeps system menus, context menus and scrollbars in the right mode.
 #[cfg(target_os = "macos")]
-fn sync_native_appearance(dark: bool) {
+fn sync_native_appearance(dark: Option<bool>) {
     use objc2::MainThreadMarker;
     use objc2_app_kit::{
         NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
@@ -300,18 +338,20 @@ fn sync_native_appearance(dark: bool) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-    // SAFETY: reading the framework-provided appearance-name statics.
-    let name = unsafe {
-        if dark {
-            NSAppearanceNameDarkAqua
-        } else {
-            NSAppearanceNameAqua
-        }
-    };
-    if let Some(appearance) = NSAppearance::appearanceNamed(name) {
-        NSApplication::sharedApplication(mtm).setAppearance(Some(&appearance));
-    }
+    let appearance = dark.and_then(|dark| {
+        // SAFETY: reading the framework-provided appearance-name statics.
+        let name = unsafe {
+            if dark {
+                NSAppearanceNameDarkAqua
+            } else {
+                NSAppearanceNameAqua
+            }
+        };
+        NSAppearance::appearanceNamed(name)
+    });
+    // `None` here means "inherit from the system" — the AppKit way to unpin.
+    NSApplication::sharedApplication(mtm).setAppearance(appearance.as_deref());
 }
 
 #[cfg(not(target_os = "macos"))]
-fn sync_native_appearance(_dark: bool) {}
+fn sync_native_appearance(_dark: Option<bool>) {}

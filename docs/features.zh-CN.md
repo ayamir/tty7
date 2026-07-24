@@ -5,7 +5,7 @@
 ## 输入
 
 - **影子建议** —— 边打字边用你的历史补全整条命令，<kbd>→</kbd> 接受
-- **带说明的 Tab 补全** —— 每个 flag、每个子命令都带说明，覆盖约 100 个常用命令
+- **带说明的 Tab 补全** —— 每个 flag、每个子命令都带说明，覆盖约 100 个常用命令；tty7 没有候选时 Tab 自动交给 shell 自己的补全，整个功能也可关闭（设置 → 终端 → 键盘，或 `config.json` 里的 `tab_completion`）
 - **语法高亮** —— 边打边亮，什么都不用装
 - **模糊历史搜索** —— <kbd>⌃ R</kbd> 看到每条命令在哪跑的、什么时候、有没有失败
 - **历史开箱即用** —— 你已有的 shell 历史直接生效，并跨会话延续
@@ -18,7 +18,9 @@
 - **侧栏按仓库分组** —— 左侧标签栏按 git 仓库分组、每组一个标题行，不在仓库里的标签归入末尾的 *Scratch* 组；切分支、仓库内 `cd` 都不会挪动行（`config.json` 的 `sidebar_grouping`：默认 `repo`，`none` 恢复扁平列表）
 - **命令面板** <kbd>⌘ P</kbd> · 回滚搜索 <kbd>⌘ F</kbd>
 - **⌘ 点击打开链接** · 桌面通知 · 划选即复制（可选，设置 → 终端 → 剪贴板）
+- **智能双击选中** —— 双击直接选中整条 URL、文件路径、括号/引号对，中文按词典分词出词；Shift 点击扩展选区（设置 → 终端 → 鼠标可开关；分隔符用 `config.json` 的 `word_separators` 配置）
 - **8 套主题，也能自定义** — YAML 种子主题，背景支持纯色、渐变或图片；可导入 iTerm2 `.itermcolors`；应用内颜色编辑器带背景图选择
+- **跟随系统外观** — 设置 → Appearance；分别选好浅色和深色主题，tty7 随系统深浅模式实时切换（`config.json` 中的 `theme_follow_system`、`theme_preset_light` / `theme_preset_dark`）
 - **窗口透明与模糊** — 设置 → Appearance → Window；对所有主题生效，*Follow theme* 恢复主题自带的 `opacity` / `blur`
 - **CJK / 输入法输入**
 
@@ -31,7 +33,7 @@ Aider、Amp、OpenCode 等约 17 个）并在其外围加功能 —— 绝不包
 - **状态点** —— 工作中（蓝）/ 等你输入（琥珀）/ 完成（绿），由 agent 自己上报的 OSC 事件驱动；在命令面板运行 *Agent: Install Claude Code Hooks* 一键接通 Claude Code
 - **通知** —— agent 卡在等你批准的那一刻弹 "needs your permission…"，每轮结束弹 "finished after Ns"，遵循你的通知策略
 - **一眼看分支** —— 侧栏每行显示该 pane 的 git 分支和工作区改动（`+N −M`），`cd` 或命令跑完时自动刷新
-- **会话恢复** —— 重启后无法重连的 pane 会自动续上 agent 对话（`claude --resume …`；`restore_agent_sessions`，默认开启）
+- **会话恢复** —— 重启后无法重连的 pane 会自动续上 agent 对话，并带上原始启动 flags（`claude --dangerously-skip-permissions --resume …`；`restore_agent_sessions`，默认开启）
 - **上下文回填** —— 面板命令把当前选区或仓库 `git diff` 打包成 prompt 直接喂给正在跑的 agent
 - **托盘图标** —— 系统托盘 / 菜单栏常驻图标，任何 agent 等你输入时立即切换为提醒态；菜单列出所有 agent pane（品牌头像 + 状态点，点击直达）、可切换通知策略，并在保留会话的普通退出之外提供 *Quit and Stop Daemon*（`show_tray_icon`，默认开启）
 

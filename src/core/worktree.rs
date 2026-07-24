@@ -62,10 +62,9 @@ pub fn is_inside_repo(cwd: &Path) -> bool {
 /// Run `git -C <dir> <args>`, returning trimmed stdout on success and trimmed
 /// stderr as the error otherwise.
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    let out = crate::core::proc::hide_console(&mut cmd)
         .output()
         .map_err(|e| format!("failed to run git: {e}"))?;
     if out.status.success() {

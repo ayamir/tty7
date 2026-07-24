@@ -161,7 +161,18 @@ impl CLIAgent {
     /// native session id, or `None` for agents without a known resume flag.
     /// The id is what the agent reported in its `session-start` event (see
     /// [`AgentEvent`]); commands mirror cmux's per-agent resume table.
-    pub fn resume_command(self, session_id: &str) -> Option<String> {
+    ///
+    /// `launch_argv` is the argv the agent was originally launched with, when
+    /// the daemon observed one. Its flags (`--dangerously-skip-permissions`,
+    /// `--model …`) are carried onto the resume command so the restored
+    /// session runs in the same mode the user picked — verbatim only when the
+    /// whole tail passes the conservative shell-safety gate; otherwise the
+    /// bare table command still resumes, just without the flags.
+    pub fn resume_command(
+        self,
+        session_id: &str,
+        launch_argv: Option<&[String]>,
+    ) -> Option<String> {
         // Ids come from the agent's own events, but they still land on a shell
         // command line — refuse anything that isn't a plain token so a
         // malicious/corrupt id can't smuggle shell syntax.
@@ -172,25 +183,143 @@ impl CLIAgent {
         {
             return None;
         }
+        // The user's launch flags, pre-joined with a leading space so they
+        // splice into the format strings below; empty when none survive.
+        let flags = launch_argv
+            .and_then(|argv| self.replay_flags(argv))
+            .map(|flags| {
+                flags.iter().fold(String::new(), |mut s, f| {
+                    s.push(' ');
+                    s.push_str(f);
+                    s
+                })
+            })
+            .unwrap_or_default();
         match self {
-            CLIAgent::Claude => Some(format!("claude --resume {session_id}")),
-            CLIAgent::Codex => Some(format!("codex resume {session_id}")),
-            CLIAgent::Gemini => Some(format!("gemini --resume {session_id}")),
-            CLIAgent::OpenCode => Some(format!("opencode --session {session_id}")),
-            CLIAgent::Amp => Some(format!("amp threads continue {session_id}")),
-            CLIAgent::Cursor => Some(format!("cursor-agent --resume {session_id}")),
+            CLIAgent::Claude => Some(format!("claude{flags} --resume {session_id}")),
+            // Codex resumes via a subcommand that accepts the interactive
+            // options after the positional id (`codex resume [OPTIONS]
+            // [SESSION_ID]`).
+            CLIAgent::Codex => Some(format!("codex resume {session_id}{flags}")),
+            CLIAgent::Gemini => Some(format!("gemini{flags} --resume {session_id}")),
+            CLIAgent::OpenCode => Some(format!("opencode{flags} --session {session_id}")),
+            // Amp's global options (`--dangerously-allow-all`, …) are accepted
+            // by the `threads continue` subcommand (verified: unknown options
+            // are a parse error, globals pass).
+            CLIAgent::Amp => Some(format!("amp threads continue {session_id}{flags}")),
+            CLIAgent::Cursor => Some(format!("cursor-agent{flags} --resume {session_id}")),
+            // Copilot CLI: `copilot --resume <sessionId>` (`-r` shorthand) —
+            // the one hooks-covered agent that was missing from this table.
+            CLIAgent::Copilot => Some(format!("copilot{flags} --resume {session_id}")),
             _ => None,
         }
     }
 
+    /// The launch-flag tail of `argv` worth replaying on a resume command, or
+    /// `None` to resume bare. Deliberately conservative: anything ambiguous
+    /// falls back to no flags rather than a corrupted command line.
+    ///
+    /// - The tail is everything after the token that names this agent (the
+    ///   launcher itself, or the script path in an interpreter-wrapped argv);
+    ///   leading `VAR=value` env assignments are skipped first so they can't
+    ///   mis-anchor (`CLAUDE_CONFIG_DIR=/opt/claude claude …`). No naming
+    ///   token at all (custom wrapper rules) → no flags.
+    /// - Stale session-targeting flags (`--resume old-id`, `--continue`, a
+    ///   re-launched `codex resume <id>`) are stripped — the new id must win.
+    /// - Every surviving token must be a plain shell-safe word, the first must
+    ///   be a `-` flag, and no two bare words may run consecutively — a bare
+    ///   word is only acceptable as the value directly behind a flag; anything
+    ///   else is a positional prompt that must not re-submit itself into the
+    ///   resumed session. Any violation drops the whole tail.
+    fn replay_flags(self, argv: &[String]) -> Option<Vec<String>> {
+        let names_self = |token: &str| {
+            token.split(['/', '\\']).any(|seg| {
+                CLIAgent::match_token(&base_stem(seg).to_ascii_lowercase()) == Some(self)
+            })
+        };
+        let argv = &argv[argv.iter().take_while(|t| is_env_assignment(t)).count()..];
+        let named = argv.iter().position(|t| names_self(t))?;
+        let mut tail: Vec<&str> = argv[named + 1..].iter().map(String::as_str).collect();
+
+        // A relaunched `codex resume <old-id>`: drop the subcommand and its id
+        // so they don't replay as a positional prompt.
+        if self == CLIAgent::Codex && tail.first() == Some(&"resume") {
+            tail.remove(0);
+            if tail.first().is_some_and(|t| !t.starts_with('-')) {
+                tail.remove(0);
+            }
+        }
+
+        // Session-targeting flags whose old value must not survive; each is
+        // stripped together with one following non-flag value token (harmless
+        // for the value-less ones — anything trailing them is positional).
+        let stale: &[&str] = match self {
+            CLIAgent::Claude => &[
+                "--resume",
+                "-r",
+                "--continue",
+                "-c",
+                "--session-id",
+                "--from-pr",
+            ],
+            CLIAgent::Gemini | CLIAgent::Cursor => &["--resume", "-r"],
+            CLIAgent::Copilot => &["--resume", "-r", "--continue", "-c"],
+            CLIAgent::OpenCode => &["--session", "-s", "--continue", "-c"],
+            // `--last` targets "the most recent session" and would contradict
+            // the explicit id we inject.
+            CLIAgent::Codex => &["--last"],
+            _ => &[],
+        };
+        let mut i = 0;
+        while i < tail.len() {
+            let t = tail[i];
+            if stale.contains(&t)
+                || stale
+                    .iter()
+                    .any(|f| f.len() > 2 && t.starts_with(&format!("{f}=")))
+            {
+                tail.remove(i);
+                if i < tail.len() && !tail[i].starts_with('-') {
+                    tail.remove(i);
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        // The safety gate: plain tokens only, and a flag-shaped tail — every
+        // bare word must sit directly behind a `-` flag (its value slot); the
+        // first token being bare, or two bare words in a row, is a positional
+        // prompt and drops the whole tail. (A single bare word behind a
+        // boolean flag is indistinguishable from a flag value and slips
+        // through — the residual ambiguity of not knowing each flag's arity.)
+        let safe = |t: &str| {
+            !t.is_empty()
+                && t.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_=./,:@+~".contains(&b))
+        };
+        if !tail.iter().all(|t| safe(t)) {
+            return None;
+        }
+        let mut prev_was_flag = false;
+        for t in &tail {
+            let is_flag = t.starts_with('-');
+            if !is_flag && !prev_was_flag {
+                return None;
+            }
+            prev_was_flag = is_flag;
+        }
+        Some(tail.into_iter().map(String::from).collect())
+    }
+
     /// Brand accent (0xRRGGBB) for the tab chip's agent dot. Chosen for legibility
-    /// on both light and dark themes rather than exact brand black/white — a pure
-    /// black or white dot vanishes against one theme, so vendors whose mark is
-    /// monochrome (Codex/OpenAI, Cursor) get a recognizable mid-tone hue instead.
+    /// on both light and dark themes rather than exact brand black/white. A pure
+    /// black or white dot vanishes against one theme, so monochrome vendors get
+    /// a recognizable mid-tone hue instead; Codex keeps its black field.
     pub fn accent_rgb(self) -> u32 {
         match self {
             CLIAgent::Claude => 0xD97757,      // Claude terracotta
-            CLIAgent::Codex => 0x10A37F,       // OpenAI green (black mark reads as this)
+            CLIAgent::Codex => 0x000000,       // Codex black field
             CLIAgent::Gemini => 0x4285F4,      // Google blue
             CLIAgent::Aider => 0x14B8A6,       // teal
             CLIAgent::Amp => 0xF34E3F,         // Amp red
@@ -479,12 +608,39 @@ pub struct AgentSessionState {
     /// key its own `--resume` flag takes — persisted for restore.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// The argv the agent was launched with, as the daemon observed it (the
+    /// foreground process-table poll on Unix, the shell integration's typed
+    /// `133;C` capture on Windows). Persisted alongside the session id so
+    /// restore can carry the user's launch flags
+    /// (`--dangerously-skip-permissions`, `--model …`) onto the resume
+    /// command — see [`CLIAgent::resume_command`]. Not touched by
+    /// [`apply_event`](Self::apply_event); the daemon stamps it from the
+    /// identity-detection side.
+    #[serde(default)]
+    pub launch_argv: Option<Vec<String>>,
     /// Whether this state came from the rich sentinel channel (hooks
     /// installed) rather than the opaque OSC 9/777 fallback. Rich state drives
     /// turn-level notifications; fallback state only paints the dot (the
     /// agent's own notification text was already toasted by the client).
     #[serde(default)]
     pub rich: bool,
+    /// The agent's working directory as its hook payloads report it — the
+    /// agent's own claim, which tracks internal chdirs the PTY can't show
+    /// (Claude Code's EnterWorktree moves the session without any shell `cd`).
+    /// Cleared on `session-end` so a finished session can't pin consumers to
+    /// a stale path; while absent, consumers fall back to the pane's proc cwd.
+    #[serde(default)]
+    pub cwd: Option<std::path::PathBuf>,
+    /// Tool completions seen in this session, counted only so consumers can
+    /// spot *that* the agent did something — a turn's edits land tool by tool,
+    /// and the status alone can't say so (`ToolComplete` is a no-op transition
+    /// during normal work, by design). The sidebar's git probe watches this to
+    /// refresh mid-turn instead of waiting for `stop`; see
+    /// [`TerminalView::refresh_git_status`](crate::terminal::view::TerminalView).
+    /// Monotonic within a session and never reset — consumers compare against
+    /// the value they last saw, so only the *change* means anything.
+    #[serde(default)]
+    pub activity: u64,
 }
 
 impl AgentStatus {
@@ -511,6 +667,9 @@ impl AgentSessionState {
         self.rich = true;
         if let Some(id) = &ev.session_id {
             self.session_id = Some(id.clone());
+        }
+        if let Some(cwd) = &ev.cwd {
+            self.cwd = Some(cwd.clone());
         }
         match ev.kind {
             AgentEventKind::SessionStart => {
@@ -549,6 +708,10 @@ impl AgentSessionState {
             // stream of completions during normal work is a no-op and can
             // never overwrite Done between turns.
             AgentEventKind::ToolComplete => {
+                // The count moves even when the status doesn't: a tool call is
+                // the one signal that the working tree may have just changed
+                // under a turn that won't end for minutes.
+                self.activity = self.activity.wrapping_add(1);
                 if self.status == AgentStatus::Waiting {
                     self.status = AgentStatus::Working;
                     self.message = None;
@@ -560,9 +723,12 @@ impl AgentSessionState {
             }
             // The agent session ended but its id stays: Claude & friends can
             // resume an *ended* session, which is exactly what restore does.
+            // Its cwd claim does NOT stay: with no agent running, the pane's
+            // real (proc-observed) directory is the truth again.
             AgentEventKind::SessionEnd => {
                 self.status = AgentStatus::Idle;
                 self.message = None;
+                self.cwd = None;
             }
         }
     }
@@ -596,6 +762,9 @@ pub struct AgentEvent {
     pub kind: AgentEventKind,
     pub session_id: Option<String>,
     pub message: Option<String>,
+    /// The agent's working directory at the moment the hook fired, when the
+    /// payload carries one (Claude Code sends it on every hook event).
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 /// Parse a complete OSC payload (identifier included, e.g.
@@ -621,6 +790,8 @@ pub fn parse_agent_event(payload: &[u8]) -> Option<AgentEvent> {
         session_id: Option<String>,
         #[serde(default)]
         message: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     }
 
     let w: Wire = serde_json::from_slice(json).ok()?;
@@ -631,6 +802,7 @@ pub fn parse_agent_event(payload: &[u8]) -> Option<AgentEvent> {
         kind,
         session_id: nonempty(w.session_id),
         message: nonempty(w.message),
+        cwd: nonempty(w.cwd).map(std::path::PathBuf::from),
     })
 }
 
@@ -742,6 +914,11 @@ mod tests {
             assert!(a.accent_rgb() <= 0xFFFFFF);
             assert_eq!(CLIAgent::from_slug(a.slug()), Some(a));
         }
+    }
+
+    #[test]
+    fn codex_avatar_uses_its_black_brand_field() {
+        assert_eq!(CLIAgent::Codex.accent_rgb(), 0x000000);
     }
 
     #[test]
@@ -880,6 +1057,7 @@ mod tests {
             kind,
             session_id: id.map(String::from),
             message: msg.map(String::from),
+            cwd: None,
         };
 
         s.apply_event(&ev(AgentEventKind::SessionStart, None, Some("sid-1")));
@@ -939,22 +1117,260 @@ mod tests {
         assert_eq!(s.session_id.as_deref(), Some("sid-1"));
     }
 
+    /// Tool completions are deliberately a *status* no-op during normal work
+    /// (the assertions above), which leaves consumers watching the status with
+    /// no way to tell that an agent mid-turn just wrote a file. `activity` is
+    /// what makes them observable: it moves on every completion, in every
+    /// status, and never rewinds — the sidebar's git probe compares it against
+    /// the value it last saw.
+    #[test]
+    fn tool_completions_count_even_when_the_status_holds_still() {
+        let ev = |kind| AgentEvent {
+            agent: Some(CLIAgent::Claude),
+            kind,
+            session_id: None,
+            message: None,
+            cwd: None,
+        };
+
+        let mut s = AgentSessionState::default();
+        s.apply_event(&ev(AgentEventKind::PromptSubmit));
+        assert_eq!(s.activity, 0, "a turn starting is not tool activity");
+
+        for n in 1..=3 {
+            s.apply_event(&ev(AgentEventKind::ToolComplete));
+            assert_eq!(s.status, AgentStatus::Working, "the status holds still…");
+            assert_eq!(s.activity, n, "…while the counter is what moves");
+        }
+
+        // A straggler after the turn ended still counts: it may well have
+        // written a file, and it must not be mistaken for "nothing happened".
+        s.apply_event(&ev(AgentEventKind::Stop));
+        s.apply_event(&ev(AgentEventKind::ToolComplete));
+        assert_eq!(
+            s.status,
+            AgentStatus::Done,
+            "and still doesn't resurrect the turn"
+        );
+        assert_eq!(s.activity, 4);
+
+        // Session end resets plenty of state but not this — a rewind to 0 would
+        // read to a delta-comparing consumer as one more tool call.
+        s.apply_event(&ev(AgentEventKind::SessionEnd));
+        assert_eq!(s.activity, 4);
+    }
+
+    /// The agent's cwd claim: any event carrying one sets it, later events
+    /// without one leave it alone (mid-turn events keep the worktree path
+    /// alive), and session end drops it — an exited agent must not pin the
+    /// pane's git line to a directory nothing runs in anymore.
+    #[test]
+    fn session_state_tracks_and_releases_the_agent_cwd() {
+        use std::path::PathBuf;
+
+        let ev = |kind, cwd: Option<&str>| AgentEvent {
+            agent: Some(CLIAgent::Claude),
+            kind,
+            session_id: None,
+            message: None,
+            cwd: cwd.map(PathBuf::from),
+        };
+
+        let mut s = AgentSessionState::default();
+        s.apply_event(&ev(AgentEventKind::SessionStart, Some("/repo")));
+        assert_eq!(s.cwd.as_deref(), Some(std::path::Path::new("/repo")));
+
+        // EnterWorktree lands as a tool-complete carrying the new directory.
+        s.apply_event(&ev(
+            AgentEventKind::ToolComplete,
+            Some("/repo/.claude/worktrees/fix-x"),
+        ));
+        assert_eq!(
+            s.cwd.as_deref(),
+            Some(std::path::Path::new("/repo/.claude/worktrees/fix-x"))
+        );
+
+        // An event without a cwd (another agent's sparser payload) keeps it.
+        s.apply_event(&ev(AgentEventKind::Stop, None));
+        assert_eq!(
+            s.cwd.as_deref(),
+            Some(std::path::Path::new("/repo/.claude/worktrees/fix-x"))
+        );
+
+        s.apply_event(&ev(AgentEventKind::SessionEnd, None));
+        assert_eq!(s.cwd, None, "session end releases the cwd claim");
+    }
+
     #[test]
     fn resume_commands_are_shell_safe() {
         assert_eq!(
-            CLIAgent::Claude.resume_command("abc-123").as_deref(),
+            CLIAgent::Claude.resume_command("abc-123", None).as_deref(),
             Some("claude --resume abc-123")
         );
         assert_eq!(
-            CLIAgent::Codex.resume_command("th_read.9").as_deref(),
+            CLIAgent::Codex.resume_command("th_read.9", None).as_deref(),
             Some("codex resume th_read.9")
         );
         // No resume flag known → None.
-        assert_eq!(CLIAgent::Aider.resume_command("abc"), None);
+        assert_eq!(CLIAgent::Aider.resume_command("abc", None), None);
         // An id carrying shell syntax is refused outright.
-        assert_eq!(CLIAgent::Claude.resume_command("abc; rm -rf /"), None);
-        assert_eq!(CLIAgent::Claude.resume_command("$(boom)"), None);
-        assert_eq!(CLIAgent::Claude.resume_command(""), None);
+        assert_eq!(CLIAgent::Claude.resume_command("abc; rm -rf /", None), None);
+        assert_eq!(CLIAgent::Claude.resume_command("$(boom)", None), None);
+        assert_eq!(CLIAgent::Claude.resume_command("", None), None);
+    }
+
+    #[test]
+    fn resume_carries_launch_flags() {
+        let argv = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // The headline case: the user's mode flags survive the restart.
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command(
+                    "abc-123",
+                    Some(&argv(&["claude", "--dangerously-skip-permissions"]))
+                )
+                .as_deref(),
+            Some("claude --dangerously-skip-permissions --resume abc-123")
+        );
+        // Value-taking flags ride along whole.
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command("abc", Some(&argv(&["claude", "--model", "opus"])))
+                .as_deref(),
+            Some("claude --model opus --resume abc")
+        );
+        // Interpreter-wrapped launch: flags start after the token naming the
+        // agent, and the table's launcher name is what replays.
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command(
+                    "abc",
+                    Some(&argv(&[
+                        "node",
+                        "/x/node_modules/@anthropic-ai/claude-code/cli.js",
+                        "--dangerously-skip-permissions",
+                    ]))
+                )
+                .as_deref(),
+            Some("claude --dangerously-skip-permissions --resume abc")
+        );
+        // A stale session-targeting flag is stripped — the new id must win.
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command(
+                    "new-id",
+                    Some(&argv(&["claude", "--resume", "old-id", "--model", "opus"]))
+                )
+                .as_deref(),
+            Some("claude --model opus --resume new-id")
+        );
+        // Codex resumes via its subcommand, flags after the positional id; a
+        // relaunched `codex resume <old>` sheds the old subcommand + id.
+        assert_eq!(
+            CLIAgent::Codex
+                .resume_command("id-1", Some(&argv(&["codex", "--yolo"])))
+                .as_deref(),
+            Some("codex resume id-1 --yolo")
+        );
+        assert_eq!(
+            CLIAgent::Codex
+                .resume_command("id-2", Some(&argv(&["codex", "resume", "id-1", "--yolo"])))
+                .as_deref(),
+            Some("codex resume id-2 --yolo")
+        );
+        // Anything shell-unsafe or positional-shaped drops the WHOLE tail —
+        // resume still works, just bare.
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command(
+                    "abc",
+                    Some(&argv(&["claude", "--allowedTools", "Bash(git:*)"]))
+                )
+                .as_deref(),
+            Some("claude --resume abc")
+        );
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command("abc", Some(&argv(&["claude", "fix-the-bug"])))
+                .as_deref(),
+            Some("claude --resume abc")
+        );
+        // A leading env assignment doesn't mis-anchor the flag tail.
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command(
+                    "abc",
+                    Some(&argv(&[
+                        "CLAUDE_CONFIG_DIR=/opt/claude",
+                        "claude",
+                        "--dangerously-skip-permissions",
+                    ]))
+                )
+                .as_deref(),
+            Some("claude --dangerously-skip-permissions --resume abc")
+        );
+        // Two consecutive bare words = a positional prompt, not a flag value —
+        // it must not re-submit itself into the resumed session.
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command(
+                    "abc",
+                    Some(&argv(&["claude", "--model", "opus", "review", "this"]))
+                )
+                .as_deref(),
+            Some("claude --resume abc")
+        );
+        // Codex `--last` targets "most recent" and would contradict the
+        // explicit id → stripped.
+        assert_eq!(
+            CLIAgent::Codex
+                .resume_command(
+                    "id-3",
+                    Some(&argv(&["codex", "resume", "--last", "--yolo"]))
+                )
+                .as_deref(),
+            Some("codex resume id-3 --yolo")
+        );
+        // No token names the agent (custom wrapper rule) → bare.
+        assert_eq!(
+            CLIAgent::Claude
+                .resume_command(
+                    "abc",
+                    Some(&argv(&["cc", "--dangerously-skip-permissions"]))
+                )
+                .as_deref(),
+            Some("claude --resume abc")
+        );
+        // Amp: global mode flags ride after the `threads continue` positional.
+        assert_eq!(
+            CLIAgent::Amp
+                .resume_command("t-1", Some(&argv(&["amp", "--dangerously-allow-all"])))
+                .as_deref(),
+            Some("amp threads continue t-1 --dangerously-allow-all")
+        );
+        // A relaunch via `amp threads continue …` is subcommand-shaped, not
+        // flag-shaped → bare (the gate rejects the leading bare word).
+        assert_eq!(
+            CLIAgent::Amp
+                .resume_command("t-2", Some(&argv(&["amp", "threads", "continue", "t-1"])))
+                .as_deref(),
+            Some("amp threads continue t-2")
+        );
+        // Copilot resumes by flag, stale session targeting stripped.
+        assert_eq!(
+            CLIAgent::Copilot
+                .resume_command(
+                    "s-9",
+                    Some(&argv(&["copilot", "--resume", "s-1", "--allow-all-tools"]))
+                )
+                .as_deref(),
+            Some("copilot --allow-all-tools --resume s-9")
+        );
+        assert_eq!(
+            CLIAgent::Copilot.resume_command("s-9", None).as_deref(),
+            Some("copilot --resume s-9")
+        );
     }
 
     #[test]

@@ -7,6 +7,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [26.7.2] - 2026-07-21
+
+### Added
+
+- **WSL shell integration** — prompt marks, cwd tracking, and agent
+  detection now work inside WSL distros. The integration tags the shell
+  it actually launches, never blocks the spawn path while probing the
+  distro's shell, and declines untranslatable cwds rather than
+  misreporting them. (#134)
+- **Git Bash shell integration on Windows** — Git Bash panes get the
+  full integration, reporting proper Windows paths for cwd-dependent
+  features. (#130)
+- **Smart double-click selection** — double-click selects the word under
+  the cursor with language-aware boundaries, including CJK segmentation
+  (the OS tokenizer on macOS, jieba elsewhere); angle-bracket pairs must
+  hug their contents and contraction apostrophes stay out of quote
+  pairing. (#128)
+- **Configurable file-link command** — file links can open with a custom
+  command instead of the default editor. Contributed by @ayamir. (#143)
+- **Agent resume keeps launch flags** — resuming an agent session
+  carries the flags the agent was originally launched with onto the
+  resume command. (#144)
+- **Sidebar git line follows the agent's cwd** — the branch/status line
+  under an agent tab tracks the directory the agent is actually working
+  in, not just the pane's shell. (#127)
+
+### Changed
+
+- **Tab close button floats over the label** — the close affordance no
+  longer reserves a slot in every tab, so labels get the full width
+  until hovered. (#126)
+- **Dependency updates** — resvg 0.47, sha2 0.11, a cargo minor-patch
+  group bump, and newer CI artifact actions. (#137, #138, #139, #140,
+  #141)
+
+### Fixed
+
+- **Tab completion falls through to the shell** — a Tab tty7 has no
+  candidates for now hands the line to the shell's own completion
+  instead of being swallowed (remote panes included); `cd`/`pushd` stop
+  offering files; and the whole feature can be turned off with
+  `tab_completion` in config or Settings → Terminal → Keyboard. (#146)
+- **Remote panes never leak local filesystem operations** — a remote
+  pane's cwd is no longer used for local path lookups, and the agent-cwd
+  bypass validates inherited directories. (#133)
+- **macOS text input goes through the IME** — synthesized keystrokes
+  keep their text (remote/automated input no longer degrades), and Kitty
+  full mode stays off the IME path. (#132)
+- **No more console flashes on Windows git probes** — git status probes
+  and ssh ProxyCommand children no longer flash console windows. (#129)
+- **Windows titlebar menu spacing** — the titlebar "..." aligns with the
+  window-control rhythm. (#131)
+- **Codex avatar and macOS tray sizing** — the Codex tab avatar uses its
+  black brand field, and the tray icon renders at 22pt instead of the
+  hardcoded 18pt. (#142)
+- **Agents settings layout** — rows stay aligned and notes terse. (#125)
+
+## [26.7.1] - 2026-07-17
+
+### Added
+
+- **Follow the OS appearance** — a "Sync with system" mode with separate
+  light and dark theme slots: the theme flips live when the OS switches
+  appearance, native chrome follows along, and picking a theme while
+  syncing writes the slot matching the current mode. Old configs are
+  unchanged (sync defaults off). (#121)
+- **Mark as Unread on tabs** — the tab context menu can re-flag a finished
+  agent result you've already looked at, re-arming the unread badge on the
+  Done dot. Agent tabs only; disabled while the agent is still working.
+  (#120)
+
+### Changed
+
+- **"Duo" logo refresh** — a new brand mark (two offset session panes,
+  mint behind ink, with a prompt chevron) replaces the orange window
+  identity across every icon asset: app icon, logo, tray glyph, favicon,
+  and social preview. Bare macOS binaries (`cargo run`) now show the icon
+  in the Dock too. (#124)
+
+### Fixed
+
+- **Linked git worktrees group under their main repository** — the sidebar
+  keys groups on the repository home instead of each worktree's own root,
+  so a repo and its worktrees share one header while branch status stays
+  per-worktree. (#118)
+- **macOS tray icon stays a template image in every state** — the
+  attention state no longer swaps in a grey non-template glyph that was
+  illegible on many menu-bar appearances; agent status lives in the
+  tooltip and tray menu. (#122)
+- **No more console-window flashes from Windows agent hooks** — each hook
+  emitter frees its throwaway console before it can paint (debug builds
+  only; release builds were unaffected). (#119)
+
 ## [26.7.0] - 2026-07-16
 
 First CalVer release: versions are now `YY.M.PATCH`, so the number says when

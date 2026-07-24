@@ -62,9 +62,13 @@ jobs:
         with:
           workspaces: tty7
 
+      # `--locked` because a release must ship the dependency set the tag
+      # recorded, not whatever cargo would re-resolve at build time. Safe here
+      # (unlike nightly) precisely because nothing rewrites Cargo.toml: this is
+      # a plain checkout of the tagged commit.
       - name: Build
         working-directory: tty7
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       # ---- Packaging: one step per OS ----------------------------------------
       # macOS gets a signed + notarized drag-to-Applications DMG. Windows gets

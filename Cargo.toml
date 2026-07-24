@@ -1,6 +1,6 @@
 [package]
 name = "tty7"
-version = "26.7.0"
+version = "26.7.2"
 edition = "2024"
 description = "A terminal workbench: shells, persistent sessions, SSH, coding agents — GPU-rendered on Zed's gpui, pure Rust"
 repository = "https://github.com/l0ng-ai/tty7"
@@ -21,6 +21,9 @@ gpui-component-assets = { workspace = true }
 
 anyhow.workspace = true
 log.workspace = true
+# Smart double-click selection patterns (URL/email/path). Already in the tree
+# transitively, so pinning it here adds no new native code.
+regex = "1"
 smol.workspace = true
 smallvec.workspace = true
 serde = { workspace = true }
@@ -183,8 +186,25 @@ winresource = "0.1"
 # app appearance to match the active theme (see `ui::theme::sync_native_appearance`)
 # so the native traffic-light buttons render in the right light/dark style.
 [target.'cfg(target_os = "macos")'.dependencies]
+# CFStringTokenizer FFI for dictionary-based CJK word segmentation on
+# double-click (`terminal::smart_select`). Already in the tree transitively,
+# and it makes jieba unnecessary here — see the non-macos section below.
+core-foundation = "0.10"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder", "NSAppearance", "NSGraphics"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder", "NSAppearance", "NSGraphics", "NSImage"] }
+# NSData feeds the runtime Dock icon for bare (non-bundled) binaries — see
+# `set_dock_icon_for_bare_binary` in main.rs.
+objc2-foundation = { version = "0.3", features = ["NSData"] }
+
+# Dictionary-based Chinese word segmentation for double-click selection
+# (`terminal::smart_select`), as a *fallback* where the OS has no tokenizer of
+# its own. macOS is excluded on purpose: CFStringTokenizer segments Chinese
+# about as well (and Japanese/Korean far better) at zero cost, while jieba's
+# table costs ~55 MB resident once built and ~2 MB of binary for the embedded
+# dictionary. Keeping the dep off macOS means that dictionary isn't even
+# linked into the build that can't use it.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+jieba-rs = "0.10"
 
 # x11/wayland are the Linux windowing backends; only pull them on Linux. The
 # Windows backend (`gpui_windows`) and macOS backend are selected by gpui_platform

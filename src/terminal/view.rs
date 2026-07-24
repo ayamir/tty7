@@ -247,6 +247,13 @@ pub struct TerminalView {
     /// while this is true, so a result you've already seen stops nagging. Blue
     /// (working) / amber (waiting) are unaffected — they track live state.
     agent_result_unread: bool,
+    /// One-shot guard for a manual "Mark as Unread" on the pane the dismissed
+    /// context menu is about to refocus: closing the menu returns window focus
+    /// to that pane, and the resulting focus-in would instantly clear the mark
+    /// the user just made. Armed by [`mark_agent_result_unread`]
+    /// (Self::mark_agent_result_unread); the next focus-in consumes it instead
+    /// of clearing, so the mark survives until the user genuinely comes back.
+    keep_unread_on_focus: bool,
     /// The cwd this pane's git line reads from (and last scheduled a probe
     /// for), so the poll loop only reprobes when the working directory
     /// actually changes. The snapshot itself lives in the process-wide
@@ -254,6 +261,11 @@ pub struct TerminalView {
     /// by work-tree root — panes in one repo share one entry instead of each
     /// computing (and staling) its own.
     git_status_cwd: Option<std::path::PathBuf>,
+    /// The agent session's tool-completion count as of the last poll, so a
+    /// change means "the agent ran a tool since we looked" — the cue to refresh
+    /// the git line mid-turn rather than at the end of one. Reset to 0 when no
+    /// session is present, so a new session's first tool call reads as activity.
+    last_agent_activity: u64,
     /// The inline command line editor. Live only while the shell sits idle
     /// at its prompt (`input_active`): there the terminal keeps keyboard focus and
     /// we run our own line editor (so we own Tab / ↑ / ↓ for completion and
@@ -321,6 +333,18 @@ pub struct TerminalView {
     /// its result is dropped unless it still matches — so output from a session
     /// the user has since closed (or replaced) can never leak into a later menu.
     completion_generation: u64,
+    /// While equal to the terminal's current `prompt_cycle`, the local line
+    /// editor has handed this prompt's line over to the shell (Tab fell
+    /// through to shell-native completion — see
+    /// [`Self::handoff_tab_to_shell`]): the shell's own editor now holds the
+    /// text, so keys go raw to the PTY exactly as on a shell-vi-mode prompt.
+    /// Keyed to the entered-prompt *cycle*, not the raw report seq — a
+    /// same-prompt redraw (completion list, `reset-prompt`) re-emits the
+    /// PS1-embedded `133;B` and would bump the seq while zle still holds the
+    /// handed-off text; re-engaging there would fork the two line buffers.
+    /// Only a command actually running starts a new cycle and re-engages the
+    /// editor.
+    editor_handoff: Option<u64>,
     /// Active Ctrl+R history search, if any. While set, the editor shows a
     /// `(reverse-i-search)` prompt instead of the line and a menu of the ranked
     /// matches floats beside it: typing edits the query (fuzzy, blended with
@@ -440,6 +464,27 @@ const INTEGRATION_GRACE: std::time::Duration = std::time::Duration::from_secs(8)
 
 /// How long the integration notice stays up when no keystroke dismisses it.
 const INTEGRATION_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Floor on how often an *opportunistic* git probe may run for one cwd (see
+/// [`GitRefresh::Opportunistic`]). Short enough that the sidebar's counts feel
+/// live while an agent works, long enough that a burst of tool calls — or an
+/// alt-tab into a window holding a dozen panes — collapses into one `git`
+/// shell-out per repo instead of a dozen.
+const OPPORTUNISTIC_GIT_GAP: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Why a git-status probe is being asked for — the two classes get opposite
+/// treatment when one is already in flight.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GitRefresh {
+    /// A rare state change that must not be missed: the pane changed
+    /// directory, a command finished, an agent turn ended. Queues behind an
+    /// in-flight probe (which then reruns) rather than being dropped.
+    Edge,
+    /// A cheap signal that repeats on its own: the window regained focus, the
+    /// agent finished a tool call. Dropped outright when a probe is in flight
+    /// or one ran within [`OPPORTUNISTIC_GIT_GAP`] — the next one will come.
+    Opportunistic,
+}
 
 /// Fig-descended PTY shims known to exec over the shell we spawned and re-host
 /// it on a nested PTY without forwarding OSC 133 — which starves shell
@@ -875,8 +920,14 @@ impl TerminalView {
                 view.focused = true;
                 view.cursor_visible = true;
                 // Looking at the pane marks its finished turn read, so the tab
-                // avatar's green Done dot clears.
-                view.agent_result_unread = false;
+                // avatar's green Done dot clears — unless this focus-in is
+                // just the context menu handing focus back after a manual
+                // "Mark as Unread" (the one-shot guard eats it).
+                if view.keep_unread_on_focus {
+                    view.keep_unread_on_focus = false;
+                } else {
+                    view.agent_result_unread = false;
+                }
                 view.report_focus_change(true);
                 cx.notify();
             }),
@@ -995,7 +1046,9 @@ impl TerminalView {
             agent_turn_started: None,
             agent_was_rich: false,
             agent_result_unread: false,
+            keep_unread_on_focus: false,
             git_status_cwd: None,
+            last_agent_activity: 0,
             cmd: CmdEditor::new(),
             typeahead: Typeahead::new(),
             hold: GapHold::new(),
@@ -1011,6 +1064,7 @@ impl TerminalView {
             pending_history: None,
             completion: None,
             completion_generation: 0,
+            editor_handoff: None,
             reverse_search: None,
             integration_notice: None,
             integration_notice_shown: false,
@@ -1051,6 +1105,26 @@ impl TerminalView {
         self.terminal.remote_context()
     }
 
+    /// The pane's cwd *only when it names a directory on this machine* — the
+    /// accessor every local filesystem or `Command` use must go through.
+    ///
+    /// A remote pane's OSC 7 reports a path in the remote's namespace
+    /// (`/home/me/proj` from an SSH host). Feeding that to a local `git` or
+    /// `read_dir` is meaningless, and on Windows it is worse than meaningless:
+    /// `/home/me/proj` is not an absolute path there but a *drive-relative*
+    /// one, so it silently resolves to `C:\home\me\proj`. That usually just
+    /// fails an `exists()` check — but if such a directory happens to exist,
+    /// the pane reports an unrelated local repo's branch and diff as its own.
+    /// Correctness must not rest on that collision never happening.
+    ///
+    /// Note this gates on the pane being remote, not on the shape of the path:
+    /// a local shell may legitimately sit in a directory whose name looks
+    /// remote, and Git Bash reports genuinely local paths (via `pwd -W`) that
+    /// merely originate from a POSIX-looking shell.
+    pub fn local_cwd(&self) -> Option<std::path::PathBuf> {
+        self.remote_context().is_none().then(|| self.cwd())?
+    }
+
     /// The coding agent running in this pane's foreground, or `None` when none
     /// is. Identity comes from the daemon's foreground-`argv` detection (plus
     /// the sentinel event channel, which can brand wrappers argv can't see
@@ -1079,6 +1153,16 @@ impl TerminalView {
         self.agent_result_unread
     }
 
+    /// Re-flag this pane's finished turn as unread — the tab context menu's
+    /// "Mark as Unread". `refocus_incoming` is true for the pane the dismissed
+    /// menu is about to hand window focus back to (the active tab's focused
+    /// leaf): that focus-in is the menu closing, not the user reading the
+    /// result, so it must not clear the mark it just made.
+    pub fn mark_agent_result_unread(&mut self, refocus_incoming: bool) {
+        self.agent_result_unread = true;
+        self.keep_unread_on_focus = refocus_incoming;
+    }
+
     /// The git snapshot for this pane's cwd (branch + working-tree diff), for
     /// the sidebar row's branch line — read from the shared per-repo
     /// [`GitStatusCache`](crate::terminal::git_status::GitStatusCache), so
@@ -1098,6 +1182,24 @@ impl TerminalView {
     /// [`git_status`]: Self::git_status
     pub fn git_status_cwd(&self) -> Option<&std::path::Path> {
         self.git_status_cwd.as_deref()
+    }
+
+    /// Re-probe this pane's git status opportunistically — for callers holding
+    /// a reason to suspect the tree moved without the pane seeing it. The one
+    /// that matters is the window regaining focus: edits made in an editor, or
+    /// by a `git` command run in another app entirely, produce no event here at
+    /// all, so without this the counts would sit stale until the user happened
+    /// to run something in the pane.
+    ///
+    /// Throttled and in-flight-deduped (see [`GitRefresh::Opportunistic`]), so
+    /// calling it for every pane on every activation is cheap. A pane with no
+    /// resolved cwd yet is skipped rather than being pinned to `None` — its
+    /// first real probe is the poll loop's job.
+    pub fn refresh_git_status_now(&mut self, cx: &mut Context<Self>) {
+        let cwd = self.git_status_cwd.clone();
+        if cwd.is_some() {
+            self.refresh_git_status(cwd, GitRefresh::Opportunistic, cx);
+        }
     }
 
     /// The current grid selection as text, if any non-blank one exists — the
@@ -1343,6 +1445,26 @@ impl TerminalView {
             return;
         }
 
+        // On macOS all ordinary text goes out through the IME, never through
+        // `key_char` — see `input::defer_to_ime` for why (gpui reconstructs
+        // `key_char` from the virtual keycode, which is a lie for synthesized
+        // events). Decline the key without consuming it and gpui hands the
+        // native event to the input context, which delivers the real text via
+        // `commit_text`.
+        //
+        // Kitty's REPORT_ALL_KEYS_AS_ESC is the exception — `defer_to_ime`
+        // declines under it so the key reaches the encoder below.
+        //
+        // A pending multi-key chord is already handled before this point: a key
+        // that completes a sequence is dispatched as an action and never
+        // reaches `on_key_down`. The check below is belt-and-braces (gpui takes
+        // `pending_input` earlier in `dispatch_key_event`, so it never fires
+        // here) and mirrors `prefers_ime_for_printable_keys`, which *is* live.
+        #[cfg(target_os = "macos")]
+        if !window.has_pending_keystrokes() && super::input::defer_to_ime(ks, self.kitty_flags()) {
+            return;
+        }
+
         // While idle at the prompt, our local command editor owns the keyboard:
         // editing keys act on the in-memory line and Enter ships it to the PTY.
         // Printable text is delivered through the IME path (`commit_text`), so we
@@ -1367,7 +1489,7 @@ impl TerminalView {
         let kitty = self.kitty_flags();
         if let Some(bytes) = super::input::keystroke_to_bytes(ks, kitty) {
             let plain = !m.control && !m.alt && !m.platform;
-            let shell_vi_prompt = self.shell_vi_prompt();
+            let shell_owns_prompt = self.shell_owns_prompt();
             // A plain Backspace is reconstructable gap input: offer it to the
             // hold, so a fast command's typeahead never touches the PTY (see
             // `hold`). Anything else releases the hold first — FIFO order on
@@ -1375,7 +1497,7 @@ impl TerminalView {
             // for the deferred wipe.
             let held = plain
                 && ks.key == "backspace"
-                && !shell_vi_prompt
+                && !shell_owns_prompt
                 && self.gap_holdable()
                 && match self.hold.hold_backspace(&bytes) {
                     Verdict::Held(arm) => {
@@ -1389,7 +1511,7 @@ impl TerminalView {
             if !held {
                 self.release_hold();
                 self.terminal.write(bytes);
-                if !shell_vi_prompt {
+                if !shell_owns_prompt {
                     self.typeahead.observe(
                         RawInput::Key {
                             key: ks.key.as_str(),
@@ -2034,7 +2156,7 @@ impl TerminalView {
     /// local `Term`'s mode bits (the reader thread keeps them current by advancing
     /// the emulator over all child output). Consulted by the key encoder so TUIs
     /// that opt into the protocol get `CSI u` reports.
-    fn kitty_flags(&self) -> super::input::KittyFlags {
+    pub(super) fn kitty_flags(&self) -> super::input::KittyFlags {
         super::input::KittyFlags::from_mode(self.terminal.term.lock().mode())
     }
 
@@ -2553,9 +2675,51 @@ impl TerminalView {
         // an agent's session is one long foreground command, so its edits would
         // otherwise stay invisible until it exits. All rare edges, so the
         // off-thread `git` shell-out runs seldom, not every 300ms tick.
-        let cwd_now = self.cwd();
+        //
+        // Those edges alone left the counts badly stale during the case they
+        // matter most: a long agent turn writes file after file for minutes
+        // with nothing to show for it. A tool completion is the one signal that
+        // the tree may have just moved mid-turn, so it refreshes too — through
+        // the throttled path, since a busy agent emits them several a second
+        // and each one would otherwise cost a `git diff` across the repo.
+        //
+        // An agent that reports its own cwd through the hook channel wins over
+        // the proc probe: it tracks internal chdirs the PTY can't observe
+        // (Claude Code's EnterWorktree) and works where the proc fallback
+        // doesn't (Windows). The claim dies with the session (`session-end`
+        // clears it, and the agent leaving the foreground drops the whole
+        // state), so an exited agent falls back to the pane's real directory.
+        // The agent's report goes through the same remote gate as the pane's own
+        // cwd. A native-SSH pane keeps sentinel-sourced agent state on purpose
+        // (`spawn_native_ssh`), so an agent running *on the remote host* reports
+        // a remote path — and being first in the chain it would win over
+        // `local_cwd` unconditionally and hand that path straight to the local
+        // `git`, which is the collision `local_cwd` exists to prevent.
+        let session = self.terminal.agent_session();
+        // A count that moved means at least one tool finished since the last
+        // tick. With no session the counter resets, so a fresh agent's very
+        // first tool call still reads as activity.
+        let tool_activity = match session.as_ref().map(|s| s.activity) {
+            Some(n) => std::mem::replace(&mut self.last_agent_activity, n) != n,
+            None => {
+                self.last_agent_activity = 0;
+                false
+            }
+        };
+        let cwd_now = self
+            .remote_context()
+            .is_none()
+            .then(|| {
+                session
+                    .as_ref()
+                    .and_then(|s| s.cwd.clone())
+                    .or_else(|| self.cwd())
+            })
+            .flatten();
         if cwd_now.as_ref() != self.git_status_cwd.as_ref() || cmd_finished || turn_finished {
-            self.refresh_git_status(cwd_now, cx);
+            self.refresh_git_status(cwd_now, GitRefresh::Edge, cx);
+        } else if tool_activity {
+            self.refresh_git_status(cwd_now, GitRefresh::Opportunistic, cx);
         }
     }
 
@@ -2564,11 +2728,19 @@ impl TerminalView {
     /// brackets the flight (`begin_probe`/`finish_probe`): a probe already in
     /// flight for the same cwd absorbs this trigger instead of spawning a
     /// duplicate `git` shell-out, and reruns once when it lands. With no cwd
-    /// (e.g. a native-SSH pane pre-OSC-7, where a local `git` would be
-    /// meaningless) the pane simply stops reading a status.
+    /// (e.g. a remote pane, where a local `git` would be meaningless) the pane
+    /// simply stops reading a status. Callers must source the cwd from
+    /// [`local_cwd`](Self::local_cwd): a remote pane *does* get a cwd once its
+    /// OSC 7 lands, so "remote panes have no cwd" holds only before that and
+    /// cannot be what keeps the local probe away from a remote path.
     ///
     /// [`GitStatusCache`]: crate::terminal::git_status::GitStatusCache
-    fn refresh_git_status(&mut self, cwd: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
+    fn refresh_git_status(
+        &mut self,
+        cwd: Option<std::path::PathBuf>,
+        trigger: GitRefresh,
+        cx: &mut Context<Self>,
+    ) {
         use crate::terminal::git_status::GitStatusCache;
 
         let changed = self.git_status_cwd != cwd;
@@ -2580,7 +2752,11 @@ impl TerminalView {
             return;
         };
         cx.default_global::<GitStatusCache>(); // first probe of the process creates it
-        if !cx.update_global::<GitStatusCache, _>(|cache, _| cache.begin_probe(&cwd)) {
+        let claimed = cx.update_global::<GitStatusCache, _>(|cache, _| match trigger {
+            GitRefresh::Edge => cache.begin_probe(&cwd),
+            GitRefresh::Opportunistic => cache.begin_probe_throttled(&cwd, OPPORTUNISTIC_GIT_GAP),
+        });
+        if !claimed {
             return;
         }
         cx.spawn(async move |this, cx| {
@@ -2591,19 +2767,27 @@ impl TerminalView {
                     async move { crate::terminal::git_status::probe(&cwd) }
                 })
                 .await;
-            let _ = this.update(cx, |view, cx| {
-                // Landing through `update_global` wakes the sidebar's
-                // `observe_global`, so every pane in the repo repaints — not
-                // just this one.
-                let rerun = cx.update_global::<GitStatusCache, _>(|cache, _| {
-                    cache.finish_probe(&cwd, result)
+            // Land the result in the shared cache before touching the pane,
+            // and whether or not the pane still exists: the in-flight claim is
+            // keyed by *cwd*, so a pane closed mid-probe that never released
+            // its claim would wedge the git line of every other pane in that
+            // directory — permanently, since nothing else ever clears it.
+            //
+            // Landing through `update_global` wakes the sidebar's
+            // `observe_global`, so every pane in the repo repaints — not just
+            // this one.
+            let rerun =
+                cx.update_global::<GitStatusCache, _>(|cache, _| cache.finish_probe(&cwd, result));
+            // A trigger arrived while we flew; go once more so its state is
+            // observed — unless this pane has since left that cwd. Only edge
+            // triggers set that flag, so the rerun is an edge too.
+            if rerun {
+                let _ = this.update(cx, |view, cx| {
+                    if view.git_status_cwd.as_deref() == Some(&cwd) {
+                        view.refresh_git_status(Some(cwd), GitRefresh::Edge, cx);
+                    }
                 });
-                // A trigger arrived while we flew; go once more so its state
-                // is observed — unless this pane has since left that cwd.
-                if rerun && view.git_status_cwd.as_deref() == Some(&cwd) {
-                    view.refresh_git_status(Some(cwd), cx);
-                }
-            });
+            }
         })
         .detach();
     }
@@ -2647,9 +2831,13 @@ impl TerminalView {
         match status {
             Some(AgentStatus::Done) if prev != Some(AgentStatus::Done) => {
                 self.agent_result_unread = !self.focused;
+                self.keep_unread_on_focus = false;
             }
             Some(AgentStatus::Done) => {}
-            _ => self.agent_result_unread = false,
+            _ => {
+                self.agent_result_unread = false;
+                self.keep_unread_on_focus = false;
+            }
         }
 
         let rich = session.as_ref().is_some_and(|s| s.rich);
@@ -2814,7 +3002,9 @@ impl TerminalView {
                 self.editor_drag_word = None;
             }
             2 => {
-                self.cmd.select_word_at(idx);
+                let cfg = cx.global::<Config>();
+                let (seps, smart) = (cfg.word_separators.clone(), cfg.smart_select);
+                self.cmd.select_word_at(idx, &seps, smart);
                 // Drag now grows the selection by whole words around this one.
                 self.editor_selecting = true;
                 self.editor_drag_word = self.cmd.selection();
@@ -2845,7 +3035,9 @@ impl TerminalView {
         };
         // A drag begun on a double-click extends by whole words; otherwise by char.
         if let Some((s, e)) = self.editor_drag_word {
-            self.cmd.extend_word_to(s, e, idx);
+            let cfg = cx.global::<Config>();
+            let (seps, smart) = (cfg.word_separators.clone(), cfg.smart_select);
+            self.cmd.extend_word_to(s, e, idx, &seps, smart);
         } else {
             self.cmd.extend_to(idx);
         }
@@ -2872,11 +3064,36 @@ impl TerminalView {
         if self.shell_vi_prompt() {
             return false;
         }
+        // A Tab handoff gave this prompt's line to the shell; until a command
+        // runs and a fresh prompt cycle starts, the shell's editor owns it,
+        // and re-engaging ours would fork the two line buffers.
+        if self.editor_handoff == Some(self.terminal.prompt_cycle()) {
+            return false;
+        }
         self.at_shell_prompt()
     }
 
     fn shell_vi_prompt(&self) -> bool {
         self.terminal.shell_vi_mode() && self.terminal.at_prompt() && !self.on_alt_screen()
+    }
+
+    /// True while a Tab handoff has given the current prompt's line to the
+    /// shell (see [`Self::handoff_tab_to_shell`]) and the shell is still in
+    /// that prompt cycle. Over once a command runs and the next prompt
+    /// arrives (a false→true `at_prompt` edge bumps the cycle).
+    fn handoff_active(&self) -> bool {
+        self.editor_handoff == Some(self.terminal.prompt_cycle())
+            && self.terminal.at_prompt()
+            && !self.on_alt_screen()
+    }
+
+    /// True while the shell's own line editor owns the prompt line — a
+    /// vi-mode prompt, or one whose line a Tab handoff shipped over. Raw
+    /// input then goes to the PTY with no hold and no typeahead record:
+    /// those bytes land on zle's line and are the shell's to keep, so a
+    /// deferred `^U` wipe would erase text the user can see.
+    fn shell_owns_prompt(&self) -> bool {
+        self.shell_vi_prompt() || self.handoff_active()
     }
 
     /// True while the emulator is on the alternate screen — a full-screen TUI
@@ -2928,7 +3145,7 @@ impl TerminalView {
     /// pane. Only consulted on the raw path, so "the editor is disengaged" is
     /// already implied.
     fn gap_holdable(&self) -> bool {
-        self.terminal.shell_active() && !self.on_alt_screen() && !self.shell_vi_prompt()
+        self.terminal.shell_active() && !self.on_alt_screen() && !self.shell_owns_prompt()
     }
 
     /// Write printable gap text (IME commit, paste) toward the shell: offered
@@ -2936,7 +3153,7 @@ impl TerminalView {
     /// written raw and recorded for the deferred wipe. `bytes` is the exact
     /// PTY encoding (paste may be bracketed-wrapped).
     fn write_gap_text(&mut self, text: &str, bytes: Vec<u8>, cx: &mut Context<Self>) {
-        if self.shell_vi_prompt() {
+        if self.shell_owns_prompt() {
             self.release_hold();
             self.terminal.write(bytes);
             return;
@@ -3271,6 +3488,47 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Hand the prompt line over to the shell so its native completion
+    /// (compsys, fzf-tab, …) answers the Tab tty7 has nothing for: ship the
+    /// locally edited text to the PTY (no newline), clear the editor, send
+    /// the Tab / Shift-Tab bytes, and suspend the local editor until the
+    /// shell's next report. From here the shell's own editor holds the text —
+    /// re-engaging ours mid-line would fork the two buffers (its Enter would
+    /// submit an empty local line on top of zle's populated one).
+    fn handoff_tab_to_shell(&mut self, shift: bool, cx: &mut Context<Self>) {
+        // Fold in any gap input still held, so the shipped line is what the
+        // user actually typed.
+        if let Some(net) = self.hold.engage() {
+            self.cmd.prepend_str(&net);
+        }
+        let line = self.cmd.text();
+        // An embedded newline would submit on the shell side (zle runs the
+        // line on `\r`), so a multi-line draft can't be handed over losslessly
+        // — keep it local and swallow the Tab as before.
+        if line.contains('\n') {
+            cx.notify();
+            return;
+        }
+        self.close_completion();
+        // A pending typeahead wipe's deferred `^U` would erase the very text
+        // we're about to ship; flush it first (FIFO keeps it ahead).
+        self.wipe_pending_typeahead();
+        // Chars right of the caret: after the shipped text lands, walk zle's
+        // cursor back over them so the shell completes the word the caret was
+        // on, not the line's tail.
+        let tail = line.chars().count().saturating_sub(self.cmd.cursor());
+        if !line.is_empty() {
+            self.terminal.write(line.into_bytes());
+            if tail > 0 {
+                self.terminal.write(b"\x1b[D".repeat(tail));
+            }
+        }
+        self.cmd.clear();
+        self.editor_handoff = Some(self.terminal.prompt_cycle());
+        let bytes = self.tab_bytes(shift);
+        self.send_to_pty(&bytes, cx);
+    }
+
     /// Tab completion over our own engine (command names in command
     /// position, filesystem paths elsewhere — history is deliberately absent:
     /// whole-line recall is ghost text's and Ctrl+R's job). A fresh Tab applies a
@@ -3280,18 +3538,37 @@ impl TerminalView {
     /// With the menu open, Tab fills any further common prefix, else moves the
     /// highlight (`forward` reverses for Shift-Tab).
     fn complete_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
+        // Ctrl+R search owns the keyboard: `self.cmd` still holds the stale
+        // pre-search line, so neither completing it nor shipping it to the
+        // shell makes sense here.
+        if self.reverse_search.is_some() {
+            return;
+        }
+        // tty7 completion switched off: every Tab goes to the shell.
+        if !cx.global::<Config>().tab_completion {
+            self.handoff_tab_to_shell(!forward, cx);
+            return;
+        }
         if self.completion.is_some() {
             self.completion_tab_step(forward, cx);
             return;
         }
 
-        // Fresh completion.
-        let Some(cwd) = self.cwd().or_else(|| std::env::current_dir().ok()) else {
-            return;
+        // Fresh completion. Path candidates come off the local filesystem, so
+        // they need a local cwd — a remote pane passes `None` and gets command
+        // completion only. Falling back to tty7's own directory there would
+        // offer *this* machine's filenames for insertion into a remote command
+        // line, where they don't exist.
+        let cwd = match self.remote_context() {
+            Some(_) => None,
+            None => self.local_cwd().or_else(|| std::env::current_dir().ok()),
         };
         let line = self.cmd.text();
         let cursor = self.cmd.cursor();
-        let Some(comp) = super::completion::complete(&line, cursor, &cwd) else {
+        let Some(comp) = super::completion::complete(&line, cursor, cwd.as_deref()) else {
+            // Nothing to offer. Don't swallow the keypress (#136) — hand the
+            // line to the shell and let its completion have the Tab.
+            self.handoff_tab_to_shell(!forward, cx);
             return;
         };
 
@@ -3341,6 +3618,9 @@ impl TerminalView {
 
         // Kick off each generator on the background executor and merge results
         // back on the main thread, tagged with this session's generation.
+        // Generators are local shell-outs and only ever come from `complete`'s
+        // `Some(cwd)` branch, so a remote pane has none to run.
+        let Some(cwd) = cwd else { return };
         for pending in comp.pending {
             let script = pending.script;
             let cwd = cwd.clone();
@@ -3602,18 +3882,51 @@ impl TerminalView {
         row: usize,
         left: bool,
         clicks: usize,
+        shift: bool,
         cx: &mut Context<Self>,
     ) {
+        let smart = cx.global::<Config>().smart_select;
         let mut term = self.terminal.term.lock();
         let display_offset = term.grid().display_offset() as i32;
         let point = Point::new(Line(row as i32 - display_offset), Column(col));
         let side = if left { Side::Left } else { Side::Right };
+        // Shift+click extends the existing selection to the click instead of
+        // starting over (à la iTerm2). A plain click always leaves a
+        // collapsed Simple selection behind, so the anchor is wherever the
+        // last gesture ended.
+        if shift && clicks == 1 && term.selection.is_some() {
+            if let Some(sel) = term.selection.as_mut() {
+                sel.update(point, side);
+            }
+            drop(term);
+            self.selecting = true;
+            cx.notify();
+            return;
+        }
         let ty = match clicks {
             2 => SelectionType::Semantic, // word
             n if n >= 3 => SelectionType::Lines,
             _ => SelectionType::Simple,
         };
-        term.selection = Some(Selection::new(ty, point, side));
+        let mut selection = Selection::new(ty, point, side);
+        // Double-click smart selection: a URL / path / email / bracket pair /
+        // CJK word containing the clicked word replaces the plain word span.
+        // Boundary-flanked candidates anchor a Semantic selection (keeping
+        // the drag gesture word-wise); exact ones use Simple so alacritty
+        // can't re-expand the endpoints past the smart boundary.
+        if clicks == 2
+            && smart
+            && let Some(r) = super::smart_select::grid_smart_range(&term, point)
+        {
+            let ty = if r.exact {
+                SelectionType::Simple
+            } else {
+                SelectionType::Semantic
+            };
+            selection = Selection::new(ty, r.start, Side::Left);
+            selection.update(r.end, Side::Right);
+        }
+        term.selection = Some(selection);
         drop(term);
         self.selecting = true;
         cx.notify();
@@ -3867,11 +4180,22 @@ impl TerminalView {
             text.push(term.grid()[line][Column(c)].c);
         }
         drop(term);
-        let cwd = self.cwd();
+        // A relative path in the output is resolved against the cwd and
+        // stat-checked, then handed to the local file opener — so a remote
+        // pane's cwd must not be used. There, only absolute-looking local hits
+        // and URLs remain clickable.
+        let cwd = self.local_cwd();
         if let Some(link) = super::search::link_at(&text, col, cwd.as_deref(), true) {
             match link.target {
                 LinkTarget::Url(url) => self.open_url(&url, cx),
-                LinkTarget::File { path, .. } => open_file_path(&path),
+                LinkTarget::File { path, line, column } => {
+                    // A configured template (e.g. opening the file in an editor)
+                    // takes precedence; otherwise fall back to the OS opener.
+                    match cx.global::<Config>().link_file_command.as_deref() {
+                        Some(template) => run_file_command(template, &path, line, column),
+                        None => open_file_path(&path),
+                    }
+                }
             }
             true
         } else if self.can_forward_loopback(cx)
@@ -4019,7 +4343,9 @@ impl TerminalView {
             text.push(term.grid()[line][Column(c)].c);
         }
         drop(term);
-        let cwd = self.cwd();
+        // Same gate as the click path above — hover must not underline a link
+        // the click cannot open.
+        let cwd = self.local_cwd();
         let link =
             super::search::link_at(&text, col, cwd.as_deref(), include_files).or_else(|| {
                 include_loopback.then(|| {
@@ -4675,14 +5001,14 @@ impl Render for TerminalView {
         // that arms the flag arrives as pane output, so a render always
         // follows it (Output → Wakeup → notify). Both prepend: they were
         // typed before any post-engage keys already sitting in the editor.
-        if self.shell_vi_prompt() {
-            // A vi prompt never engages the editor: release held gap input to
-            // the shell's own line editor (raw, no typeahead record — there is
-            // no local adoption to reconcile against) and drop any pending
-            // record without its `^U`. Those bytes land on zle's line and are
-            // the shell's to keep; a record surviving the vi prompt would
-            // flush at the next emacs-mode prompt and resurrect long-consumed
-            // text into the editor.
+        if self.shell_owns_prompt() {
+            // A vi-mode (or handed-off) prompt never engages the editor:
+            // release held gap input to the shell's own line editor (raw, no
+            // typeahead record — there is no local adoption to reconcile
+            // against) and drop any pending record without its `^U`. Those
+            // bytes land on zle's line and are the shell's to keep; a record
+            // surviving this prompt would flush at the next editor-engaged
+            // prompt and resurrect long-consumed text into the editor.
             if let Some((_net, bytes)) = self.hold.release() {
                 self.terminal.write(bytes);
             }
@@ -5004,6 +5330,81 @@ fn open_file_path(path: &std::path::Path) {
     if let Err(e) = std::process::Command::new(opener).arg(path).spawn() {
         log::warn!("failed to open {}: {e}", path.display());
     }
+}
+
+/// Run a user-configured file-open command for a clicked file link. The template
+/// is expanded by [`expand_file_command_template`] and the first token is the
+/// program; the rest are its arguments. Spawned detached — tty7 doesn't wait for
+/// or read from the editor it launches.
+fn run_file_command(
+    template: &str,
+    path: &std::path::Path,
+    line: Option<u32>,
+    column: Option<u32>,
+) {
+    let argv = expand_file_command_template(template, path, line, column);
+    let Some((program, args)) = argv.split_first() else {
+        log::warn!("link_file_command is empty; ignoring file link");
+        return;
+    };
+    if let Err(e) = std::process::Command::new(program).args(args).spawn() {
+        log::warn!("failed to run link_file_command {template:?}: {e}");
+    }
+}
+
+/// Expand a file-open command template into an argv vector.
+///
+/// The template is split on whitespace into tokens. Within a token the
+/// placeholders `{path}`, `{line}`, and `{column}` are replaced with their
+/// values. If a token references a placeholder whose value is absent (e.g.
+/// `{line}` for a link with no line number), the whole token is dropped — this
+/// lets a combined token like `--line={line}` disappear cleanly rather than
+/// leaving a dangling flag. `{path}` is always present, so a token that only
+/// references `{path}` is never dropped.
+fn expand_file_command_template(
+    template: &str,
+    path: &std::path::Path,
+    line: Option<u32>,
+    column: Option<u32>,
+) -> Vec<String> {
+    let path = path.to_string_lossy();
+    template
+        .split_whitespace()
+        .filter_map(|token| expand_file_command_token(token, &path, line, column))
+        .collect()
+}
+
+/// Substitute placeholders in a single template token, or return `None` if the
+/// token references a placeholder with no value (so the caller drops it).
+fn expand_file_command_token(
+    token: &str,
+    path: &str,
+    line: Option<u32>,
+    column: Option<u32>,
+) -> Option<String> {
+    let mut out = String::with_capacity(token.len());
+    let mut rest = token;
+    while let Some(open) = rest.find('{') {
+        let Some(close_rel) = rest[open..].find('}') else {
+            // No closing brace: the remainder is literal text.
+            break;
+        };
+        let close = open + close_rel;
+        out.push_str(&rest[..open]);
+        let value = match &rest[open + 1..close] {
+            "path" => Some(path.to_string()),
+            "line" => line.map(|l| l.to_string()),
+            "column" => column.map(|c| c.to_string()),
+            // An unknown placeholder is left verbatim rather than dropping the
+            // token, so a stray brace doesn't silently swallow an argument.
+            other => Some(format!("{{{other}}}")),
+        };
+        // A recognized-but-absent placeholder drops the entire token.
+        out.push_str(&value?);
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 /// One mouse report, encoded for the protocol the app negotiated. SGR (1006)
@@ -5360,15 +5761,65 @@ fn drag_scroll_step(overshoot: f32) -> i32 {
 mod tests {
     use super::{
         SelectEndCopy, WheelRoute, clipboard_paste_text, display_width, drag_scroll_step,
-        encode_mouse, fallback_chain, fig_icon_emoji, fig_icon_glyph, focus_report_bytes,
-        input_overflow_shift, input_overlay_rows, menu_layout, paste_bytes, select_end_copy,
-        shell_escape_path, smooth_scroll_step, trim_trailing_spaces, wheel_route,
+        encode_mouse, expand_file_command_template, fallback_chain, fig_icon_emoji, fig_icon_glyph,
+        focus_report_bytes, input_overflow_shift, input_overlay_rows, menu_layout, paste_bytes,
+        select_end_copy, shell_escape_path, smooth_scroll_step, trim_trailing_spaces, wheel_route,
         wrapped_click_index,
     };
     use alacritty_terminal::term::TermMode;
     use gpui::{ClipboardEntry, ClipboardItem, ExternalPaths, Modifiers};
     use gpui_component::IconName;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn file_command_template_substitutes_path_line_and_column() {
+        let argv = expand_file_command_template(
+            "herdr edit {path} --line={line} --column={column}",
+            Path::new("/tmp/foo.rs"),
+            Some(42),
+            Some(7),
+        );
+        assert_eq!(
+            argv,
+            vec!["herdr", "edit", "/tmp/foo.rs", "--line=42", "--column=7",]
+        );
+    }
+
+    #[test]
+    fn file_command_template_drops_tokens_for_absent_values() {
+        // No line/column: the combined flag tokens vanish entirely, leaving no
+        // dangling `--line` for the downstream parser.
+        let argv = expand_file_command_template(
+            "herdr edit {path} --line={line} --column={column}",
+            Path::new("/tmp/foo.rs"),
+            None,
+            None,
+        );
+        assert_eq!(argv, vec!["herdr", "edit", "/tmp/foo.rs"]);
+
+        // Column absent but line present: only the column flag drops.
+        let argv = expand_file_command_template(
+            "herdr edit {path} --line={line} --column={column}",
+            Path::new("/tmp/foo.rs"),
+            Some(42),
+            None,
+        );
+        assert_eq!(argv, vec!["herdr", "edit", "/tmp/foo.rs", "--line=42"]);
+    }
+
+    #[test]
+    fn file_command_template_keeps_path_only_token_and_unknown_placeholder() {
+        // A path-only program still runs; an unknown placeholder is left verbatim
+        // rather than dropping its token.
+        let argv = expand_file_command_template(
+            "code --goto {path}:{line} {other}",
+            Path::new("/tmp/foo.rs"),
+            None,
+            None,
+        );
+        // `{path}:{line}` drops (line absent); `{other}` stays literal.
+        assert_eq!(argv, vec!["code", "--goto", "{other}"]);
+    }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
@@ -6059,6 +6510,34 @@ mod gpui_tests {
         }
     }
 
+    /// Deliver one printable character the way the running platform actually
+    /// does. macOS hands all text to the input context, which arrives as
+    /// `commit_text` (see `input::defer_to_ime`); elsewhere it travels the
+    /// `on_key_down` / `key_char` path. Tests that assert on *text* input must
+    /// go through here, or they exercise a path the platform never takes.
+    fn type_char(
+        view: &mut TerminalView,
+        ch: &str,
+        window: &mut Window,
+        cx: &mut Context<TerminalView>,
+    ) {
+        if cfg!(target_os = "macos") {
+            let _ = window;
+            view.commit_text(ch, cx);
+        } else {
+            let ev = KeyDownEvent {
+                keystroke: gpui::Keystroke {
+                    modifiers: gpui::Modifiers::default(),
+                    key: ch.to_string(),
+                    key_char: Some(ch.to_string()),
+                },
+                is_held: false,
+                prefer_character_input: false,
+            };
+            view.on_key_down(&ev, window, cx);
+        }
+    }
+
     fn next_input_until_timeout(daemon: &mut UnixStream) -> Option<Vec<u8>> {
         use std::io::ErrorKind;
 
@@ -6130,16 +6609,7 @@ mod gpui_tests {
                     !view.input_active(),
                     "shell vi-mode lets the shell line editor own prompt input"
                 );
-                let a = KeyDownEvent {
-                    keystroke: gpui::Keystroke {
-                        modifiers: gpui::Modifiers::default(),
-                        key: "a".to_string(),
-                        key_char: Some("a".to_string()),
-                    },
-                    is_held: false,
-                    prefer_character_input: false,
-                };
-                view.on_key_down(&a, window, cx);
+                type_char(view, "a", window, cx);
                 assert_eq!(
                     view.cmd.text(),
                     "",
@@ -6174,6 +6644,146 @@ mod gpui_tests {
         panic!("an emacs-mode prompt should re-enable tty7's local editor");
     }
 
+    /// Wait until the daemon-fed prompt state makes the local editor live.
+    fn wait_for_input_active(window: &gpui::WindowHandle<TerminalView>, cx: &mut TestAppContext) {
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let active = window.update(cx, |view, _, _| view.input_active()).unwrap();
+            if active {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the local editor never engaged at the prompt");
+    }
+
+    /// Tab the engine has nothing for must not be swallowed (#136): the
+    /// locally edited line is shipped to the shell followed by the Tab
+    /// itself, and the local editor stays out of the way until the shell
+    /// reports its next prompt — from there the shell's own completion owns
+    /// the line.
+    #[gpui::test]
+    fn tab_with_no_candidates_hands_the_line_to_the_shell(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: None,
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        wait_for_input_active(&window, cx);
+
+        window
+            .update(cx, |view, window, cx| {
+                // A command-position word matching no builtin or $PATH entry,
+                // so the completion engine returns `None`.
+                for ch in ["z", "z", "q", "q", "x"] {
+                    type_char(view, ch, window, cx);
+                }
+                assert_eq!(view.cmd.text(), "zzqqx");
+                view.complete_tab(true, cx);
+                assert_eq!(view.cmd.text(), "", "the line moved to the shell");
+                assert!(
+                    !view.input_active(),
+                    "the shell owns the prompt after the handoff"
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            next_input_until_timeout(&mut daemon),
+            Some(b"zzqqx".to_vec()),
+            "the edited line ships ahead of the Tab"
+        );
+        assert_eq!(
+            next_input_until_timeout(&mut daemon),
+            Some(b"\t".to_vec()),
+            "the Tab reaches the PTY instead of being swallowed"
+        );
+
+        // A same-prompt redraw (a prompt framework re-emitting the
+        // PS1-embedded `133;B` on reset-prompt / a completion list reprint)
+        // must NOT re-engage the editor — zle still holds the handed-off
+        // text, and an engaged-empty editor would fork the two buffers.
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: None,
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let applied = window
+                .update(cx, |view, _, _| view.terminal.prompt_seq() >= 2)
+                .unwrap();
+            if applied {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        window
+            .update(cx, |view, _, _| {
+                assert!(
+                    !view.input_active(),
+                    "a same-prompt redraw must not re-engage the editor"
+                );
+            })
+            .unwrap();
+
+        // A real command cycle — the shell leaves the prompt and comes back —
+        // re-engages the local editor.
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: false,
+            last_exit: None,
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: Some(0),
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        wait_for_input_active(&window, cx);
+    }
+
+    /// With `tab_completion` off, Tab never opens tty7's menu — even when the
+    /// engine would have candidates, the line and the Tab go to the shell.
+    #[gpui::test]
+    fn tab_completion_off_sends_every_tab_to_the_shell(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        cx.update(|cx| {
+            let mut cfg = cx.global::<Config>().clone();
+            cfg.tab_completion = false;
+            cx.set_global(cfg);
+        });
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: None,
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        wait_for_input_active(&window, cx);
+
+        window
+            .update(cx, |view, window, cx| {
+                // "cd " would offer path candidates were the engine consulted.
+                for ch in ["c", "d", " "] {
+                    type_char(view, ch, window, cx);
+                }
+                view.complete_tab(true, cx);
+                assert!(view.completion.is_none(), "no tty7 menu while opted out");
+                assert_eq!(view.cmd.text(), "");
+            })
+            .unwrap();
+        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"cd ".to_vec()));
+        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"\t".to_vec()));
+    }
+
     #[gpui::test]
     fn shell_vi_mode_prompt_input_is_not_typeahead(cx: &mut TestAppContext) {
         let (window, mut daemon) = harness(cx);
@@ -6205,16 +6815,7 @@ mod gpui_tests {
 
         window
             .update(cx, |view, window, cx| {
-                let i = KeyDownEvent {
-                    keystroke: gpui::Keystroke {
-                        modifiers: gpui::Modifiers::default(),
-                        key: "i".to_string(),
-                        key_char: Some("i".to_string()),
-                    },
-                    is_held: false,
-                    prefer_character_input: false,
-                };
-                view.on_key_down(&i, window, cx);
+                type_char(view, "i", window, cx);
             })
             .unwrap();
         assert_eq!(
@@ -6907,7 +7508,7 @@ mod gpui_tests {
         let drag_hello = |cx: &mut TestAppContext| {
             window
                 .update(cx, |view, _, cx| {
-                    view.on_select_start(0, 0, true, 1, cx);
+                    view.on_select_start(0, 0, true, 1, false, cx);
                     view.on_select_update(4, 0, false, cx);
                     view.on_select_end(cx);
                 })
@@ -6972,7 +7573,7 @@ mod gpui_tests {
             .update(cx, |view, window, cx| {
                 // Mouse-select "hello" (copy-on-select is off by default, so
                 // the selection survives mouse-up).
-                view.on_select_start(0, 0, true, 1, cx);
+                view.on_select_start(0, 0, true, 1, false, cx);
                 view.on_select_update(4, 0, false, cx);
                 view.on_select_end(cx);
                 assert!(view.has_selection(), "the drag must leave a selection");
