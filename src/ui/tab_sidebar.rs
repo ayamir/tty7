@@ -5,30 +5,32 @@
 //!
 //! Split out of `app.rs` as an `impl Tty7App` block, exactly like `tab_strip`.
 //! It shares the model wholesale: the same `self.tabs`/`self.active` state, the
-//! same `tab_label`, the same `activate`/`close_tab`/`move_tab`/`start_rename`
-//! operations, the same `DragTab` payload, and the same theme tokens the chips
-//! use — so the vertical list stays pixel-consistent with the strip and adds no
-//! new state or business logic, only a new set of click targets in a new shape.
+//! same `tab_label`, the same `activate`/`close_tab`/`start_rename` operations,
+//! the same `DragTab` payload and reorder machinery, and the same theme tokens
+//! the chips use — so the vertical list stays pixel-consistent with the strip
+//! and adds no new state or business logic, only a new set of click targets in
+//! a new shape.
 
 use gpui::{
-    AnyElement, Bounds, Context, FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, SharedString, Window, canvas, div, linear_color_stop, linear_gradient,
-    prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, Axis, Bounds, Context, Div, FontWeight, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, SharedString, Stateful, Window, canvas,
+    deferred, div, ease_out_quint, linear_color_stop, linear_gradient, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
-use gpui_component::menu::ContextMenuExt as _;
+use gpui_component::menu::{ContextMenu, ContextMenuExt as _};
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::core::config::{Config, SidebarGrouping};
 use crate::terminal::git_status::GitStatusCache;
 use crate::ui::app::{TITLE_BAR_HEIGHT, Tty7App};
 use crate::ui::hints::tab_badge_label;
-use crate::ui::tab_strip::DragTab;
+use crate::ui::reorder::{self, Reorder, Surface};
+use crate::ui::tab_strip::{DragTab, REORDER_SLIDE_MS};
 
 /// Minimum sidebar width, and the maximum as a fraction of the window width, so
 /// a resize drag can't collapse the rail or let it swallow the terminal.
@@ -39,6 +41,27 @@ const MAX_SIDEBAR_WIDTH_RATIO: f32 = 0.5;
 /// the rail's right border; it holds a 1px hairline that brightens on hover /
 /// drag. Centered (half overhangs the body) so it clears the row close buttons.
 const RESIZE_HANDLE_WIDTH: f32 = 8.;
+
+/// Gap between rows in the rail, and between the group blocks — the distance a
+/// row or block travels on top of its own height when a drag passes it.
+const ROW_GAP: f32 = 2.;
+
+/// Marks a live drag as a *group* drag — the sidebar counterpart to
+/// [`DragTab`], and like it a stateless marker that renders nothing: the block
+/// being dragged never leaves the rail, so there is no card floating over the
+/// window. Its type is what tells the rail's drop handlers "this is a group,
+/// not a tab". Scratch never starts one: it's pinned last by
+/// [`sidebar_sections`], so it has no slot to move to.
+#[derive(Clone)]
+pub(crate) struct DragGroup;
+
+impl Render for DragGroup {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // gpui always paints *something* at the cursor for an active drag;
+        // an empty, zero-sized element is how this drag paints nothing.
+        div()
+    }
+}
 
 impl Tty7App {
     /// The vertical tab sidebar rendered down the left edge of the body in
@@ -88,24 +111,105 @@ impl Tty7App {
         let keys: Rc<Vec<Option<PathBuf>>> = Rc::new(self.sidebar_group_keys(cx));
         let sections = sidebar_sections(&keys);
 
-        // Each row's position in display order — the digit its ⌘N badge
-        // shows. Advanced for every tab, filtered-out ones included, so the
-        // digits (and what ⌘N targets) don't shift while the search box
-        // narrows the list.
-        let mut visual_pos = 0usize;
-        for (group_name, idxs) in sections {
-            // Rows first: the search filter may empty a group, in which case
-            // its header is skipped too (and the header's count reflects the
-            // *visible* rows while a filter narrows the list).
-            let mut rows: Vec<AnyElement> = Vec::new();
-            for i in idxs {
-                // This row's display-order digit; claimed before the search
-                // filter can skip the row (see `visual_pos` above).
-                let badge_pos = visual_pos;
-                visual_pos += 1;
+        // Each row's position in display order — the digit its ⌘N badge shows.
+        // Claimed for every tab, filtered-out ones included, and read off this
+        // map rather than counted as rows are emitted, so neither the search
+        // box nor a drag's live reflow can renumber the shortcuts under you.
+        let badge_pos: Vec<usize> = {
+            let mut pos = vec![0usize; self.tabs.len()];
+            for (n, i) in sections.iter().flat_map(|s| s.tabs.iter()).enumerate() {
+                pos[*i] = n;
+            }
+            pos
+        };
+
+        // Which tabs each section actually lists, and their labels. Settled
+        // before anything is laid out, because both drag surfaces are keyed to
+        // what is *visible*: a group the search box has emptied isn't rendered,
+        // so it must not claim a slot in the group geometry either — a phantom
+        // zero-sized slot would sit at the origin and swallow every crossing.
+        // (Matching is on the visible label; a row keeps its real tab index, so
+        // activate/close/reorder still hit the right tab when the list is
+        // narrowed.)
+        let visible_by_section: Vec<Vec<(usize, String)>> = sections
+            .iter()
+            .map(|s| {
+                s.tabs
+                    .iter()
+                    .map(|&i| (i, self.tab_label(&self.tabs[i], i, Some(window), cx)))
+                    .filter(|(_, label)| query.is_empty() || label.to_lowercase().contains(&query))
+                    .collect()
+            })
+            .collect();
+
+        // ── Live drag-reorder, part 1: the group blocks ───────────────────────
+        // Repo groups can be dragged by their header to reorder the whole
+        // block; Scratch can't (it's pinned last, so it has neither a slot to
+        // move to nor one to give up), so the draggable slots are exactly the
+        // rendered repo groups. See [`crate::ui::reorder`] for the machinery.
+        let pointer = window.mouse_position();
+        let rendered = |ix: &usize| !visible_by_section[*ix].is_empty();
+        let repo_slots: Vec<usize> = (0..sections.len())
+            .filter(|&ix| sections[ix].key.is_some())
+            .filter(rendered)
+            .collect();
+        let repo_groups = repo_slots.len();
+        let group_slots: Rc<RefCell<Vec<Bounds<Pixels>>>> =
+            Rc::new(RefCell::new(vec![Bounds::default(); repo_groups]));
+        let group_preview =
+            reorder::preview(&self.reorder, &Surface::SidebarGroups, repo_groups, pointer);
+        let repo_roots: Vec<PathBuf> = repo_slots
+            .iter()
+            .filter_map(|&ix| sections[ix].key.clone())
+            .collect();
+        let slot_display: Vec<usize> = match &group_preview {
+            Some(p) => {
+                // Same as the rows below: record what releasing right now would
+                // produce, so the commit doesn't depend on where the cursor is.
+                if let (Some(from), Some(to)) = (repo_roots.get(p.from), repo_roots.get(p.target))
+                    && let Some(order) = regrouped_order(&keys, from, to)
+                {
+                    reorder::set_pending(&self.reorder, &Surface::SidebarGroups, order);
+                }
+                p.order.clone()
+            }
+            None => (0..repo_groups).collect(),
+        };
+        // The blocks to lay out, as `(drag slot, section)`. Repo groups lead in
+        // the previewed slot order; Scratch trails them with no slot of its own.
+        let mut blocks: Vec<(Option<usize>, usize)> = slot_display
+            .into_iter()
+            .map(|slot| (Some(slot), repo_slots[slot]))
+            .collect();
+        blocks.extend(
+            (0..sections.len())
+                .filter(|&ix| sections[ix].key.is_none())
+                .filter(rendered)
+                .map(|ix| (None, ix)),
+        );
+
+        for (group_slot, group_ix) in blocks {
+            let section = &sections[group_ix];
+            let group_key = section.key.clone();
+            // Kept as concrete elements, not `AnyElement`s: a live drag
+            // restyles them (the slide-in offset), which can only be applied
+            // once every row of the group has been built.
+            let mut rows: Vec<ContextMenu<Stateful<Div>>> = Vec::new();
+            let visible = visible_by_section[group_ix].clone();
+            let visible_tabs: Vec<usize> = visible.iter().map(|(i, _)| *i).collect();
+            let row_slots: Rc<RefCell<Vec<Bounds<Pixels>>>> =
+                Rc::new(RefCell::new(vec![Bounds::default(); visible.len()]));
+            // ── Live drag-reorder, part 2: the rows of this group ─────────────
+            let row_preview = reorder::preview(
+                &self.reorder,
+                &Surface::SidebarRows(group_key.clone()),
+                visible.len(),
+                pointer,
+            );
+            for (slot, (i, label)) in visible.into_iter().enumerate() {
+                let badge_pos = badge_pos[i];
                 let tab = &self.tabs[i];
                 let is_active = i == active;
-                let label = self.tab_label(tab, i, Some(window), cx);
                 // No status/cwd text under the title: the avatar's status dot
                 // already carries working/waiting/done, and the group header + the
                 // trailing branch tag carry the location — a "Working…" or cwd
@@ -188,14 +292,6 @@ impl Tty7App {
                     }
                     line
                 });
-                // Filter by the search box; matching is on the visible label. The row
-                // keeps its real index `i`, so activate/close/move still hit the right
-                // tab even when the list is narrowed.
-                if !query.is_empty() && !label.to_lowercase().contains(&query) {
-                    continue;
-                }
-                let drag_label: SharedString = label.clone().into();
-
                 // Inline rename input for this tab, if it's the one being renamed —
                 // the same `self.renaming` branch the strip uses, so a context-menu
                 // rename works identically in either layout.
@@ -234,26 +330,12 @@ impl Tty7App {
                         )
                         // Branch + diff line, when the pane sits in a git repo.
                         .children(git_line)
-                        // Click activates. (Renaming lives in the context menu,
-                        // matching the strip — no double-click rename.)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                this.activate(i, window, cx);
-                            }),
-                        )
-                        // Drag the row by its label to reorder it (shared `DragTab`).
-                        .on_drag(
-                            DragTab {
-                                index: i,
-                                label: drag_label.clone(),
-                            },
-                            |drag, _, _, cx| {
-                                cx.stop_propagation();
-                                cx.new(|_| drag.clone())
-                            },
-                        )
+                        // No mouse handler of its own: activation *and* the
+                        // reorder drag both live on the row, and a child that
+                        // swallowed the press would take the label — the
+                        // largest part of the row — out of both. (Only the
+                        // diff counts inside the branch line stop the press,
+                        // deliberately: they're their own click target.)
                         .into_any_element(),
                 };
 
@@ -262,6 +344,38 @@ impl Tty7App {
                     // A per-row group so this row's close affordance reveals on its own
                     // hover without touching siblings (same trick as the chip).
                     .group(SharedString::from(format!("tab-row-{i}")))
+                    // A row is first of all a switch target, so the hover
+                    // cursor says "click me"; picking it up swaps in the
+                    // closed hand (see `Tty7App::render`).
+                    .cursor_pointer()
+                    // Drag anywhere on the row to reorder it (shared `DragTab`).
+                    // On the row, not on its label: the drag's frame of
+                    // reference is where the *row* was grabbed, which is what
+                    // the frozen geometry below measures — hang it off the
+                    // label and the held row rides a few pixels off the cursor,
+                    // skewing every crossing by that much. `slot` is the row's
+                    // position among the *visible* rows of its group; a drag
+                    // never leaves the group, so that's the whole world it
+                    // needs. The builder runs once, when gpui promotes the
+                    // press into a drag, freezing the geometry as of the last
+                    // painted frame.
+                    .on_drag(DragTab, {
+                        let state = self.reorder.clone();
+                        let slots = row_slots.clone();
+                        let group_key = group_key.clone();
+                        move |_drag, grab, _window, cx| {
+                            cx.stop_propagation();
+                            *state.borrow_mut() = Some(Reorder::new(
+                                Surface::SidebarRows(group_key.clone()),
+                                slot,
+                                slots.borrow().clone(),
+                                Axis::Vertical,
+                                px(ROW_GAP),
+                                grab,
+                            ));
+                            cx.new(|_| DragTab)
+                        }
+                    })
                     .w_full()
                     // Size to content with a small, uniform vertical padding: a
                     // one-line shell tab is a short row, a two-line git tab
@@ -288,20 +402,31 @@ impl Tty7App {
                         s.text_color(cx.theme().sidebar_foreground)
                             .hover(|s| s.bg(cx.theme().sidebar_accent.opacity(0.5)))
                     })
-                    // Drop target: dropping a dragged row here moves it to this
-                    // slot — but only within the same group; a cross-group drop is
-                    // a no-op, since a tab's group comes from its cwd's repo, not
-                    // from where it sits in the list. (With grouping off all keys
-                    // are `None`, so the check never blocks anything.)
-                    .drag_over::<DragTab>(|s, _, _, cx| s.bg(cx.theme().drag_border.opacity(0.2)))
-                    .on_drop(cx.listener({
-                        let keys = keys.clone();
-                        move |this, drag: &DragTab, _window, cx| {
-                            if keys.get(drag.index) == keys.get(i) {
-                                this.move_tab(drag.index, i, cx);
-                            }
-                        }
-                    }))
+                    // Held: a light dimming so the row under your cursor reads
+                    // as picked up. Not a lift — it stays in the rail's plane.
+                    .when(row_preview.as_ref().is_some_and(|p| p.from == slot), |s| {
+                        s.opacity(0.75)
+                    })
+                    // Measures this row into its group's slot table — the
+                    // geometry a drag starting on a later frame freezes.
+                    // Absolute and empty, so it costs the layout nothing.
+                    .child(
+                        canvas(
+                            {
+                                let slots = row_slots.clone();
+                                move |bounds, _window, _cx| {
+                                    if let Some(s) = slots.borrow_mut().get_mut(slot) {
+                                        *s = bounds;
+                                    }
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        // `inset_0`, not `size_full` — see the strip's copy of
+                        // this canvas for why the distinction matters.
+                        .absolute()
+                        .inset_0(),
+                    )
                     // A click anywhere on the row (padding, gaps) activates it; the
                     // label and close children stop propagation for their own actions.
                     .on_mouse_down(
@@ -398,54 +523,203 @@ impl Tty7App {
                 // `below_wording` flips the trailing close to "Close Tabs Below"
                 // to match the vertical layout.
                 let menu_app = cx.entity().downgrade();
-                rows.push(
-                    row.context_menu(move |menu, window, cx| {
-                        Tty7App::tab_context_menu(menu, i, true, &menu_app, window, cx)
-                    })
-                    .into_any_element(),
-                );
+                rows.push(row.context_menu(move |menu, window, cx| {
+                    Tty7App::tab_context_menu(menu, i, true, &menu_app, window, cx)
+                }));
             }
 
             if rows.is_empty() {
                 continue;
             }
+
+            let row_display: Vec<usize> = match &row_preview {
+                Some(p) => {
+                    // Record the tab order releasing right now would produce, so
+                    // letting go applies exactly what's on screen no matter where
+                    // the cursor ended up (see `reorder::set_pending`).
+                    if let Some(order) =
+                        reordered_rows(&keys, &group_key, &visible_tabs, p.from, p.target)
+                    {
+                        reorder::set_pending(
+                            &self.reorder,
+                            &Surface::SidebarRows(group_key.clone()),
+                            order,
+                        );
+                    }
+                    p.order.clone()
+                }
+                None => (0..rows.len()).collect(),
+            };
+            let row_count = rows.len();
+            let mut rows: Vec<Option<ContextMenu<Stateful<Div>>>> =
+                rows.into_iter().map(Some).collect();
+            let rows: Vec<AnyElement> = row_display
+                .into_iter()
+                .map(|slot| match &row_preview {
+                    // The row in hand: drawn wherever the cursor is holding it,
+                    // pixel for pixel, with no animation in the way. `deferred`
+                    // keeps its slot in the layout but paints it after its
+                    // siblings, so it passes *over* the rows it's crossing
+                    // instead of being clipped behind them.
+                    Some(p) if p.from == slot => deferred(
+                        rows[slot]
+                            .take()
+                            .expect("each slot emitted once")
+                            .relative()
+                            .top(p.held),
+                    )
+                    .into_any_element(),
+                    // Slide into place rather than teleporting. `offset` is
+                    // zero for every row the last crossing left alone, so one
+                    // row moves at a time instead of the group re-animating.
+                    Some(p) => {
+                        let offset = p.offsets[slot].as_f32();
+                        rows[slot]
+                            .take()
+                            .expect("each slot emitted once")
+                            .with_animation(
+                                (
+                                    SharedString::from(format!("row-slide-{}", p.generation)),
+                                    slot,
+                                ),
+                                Animation::new(std::time::Duration::from_millis(REORDER_SLIDE_MS))
+                                    .with_easing(ease_out_quint()),
+                                move |el, delta| el.top(px(offset * (1. - delta))),
+                            )
+                            .into_any_element()
+                    }
+                    None => rows[slot]
+                        .take()
+                        .expect("each slot emitted once")
+                        .into_any_element(),
+                })
+                .collect();
             // Group header: the repo's directory name (or "Scratch"), small
             // and muted so it labels without competing with the rows, plus the
-            // visible-row count. Not a click target — rows do the activating.
-            if let Some(name) = group_name {
-                list = list.child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .gap_1p5()
-                        .pl_2()
-                        .pr_1p5()
-                        .pt_1p5()
-                        .pb_0p5()
-                        .text_size(px(11.))
-                        .text_color(cx.theme().muted_foreground)
-                        // Count sits right next to the name (not pushed to the
-                        // rail's right edge): the name shrinks and truncates if
-                        // long, the count trails it as a quiet tally.
-                        .child(
-                            div()
-                                .flex_shrink(1.)
-                                .min_w_0()
-                                .truncate()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(name.to_uppercase()),
+            // visible-row count. Not a click target — rows do the activating —
+            // but it *is* the whole group's drag handle: drag one project name
+            // and the block moves, tabs and all, with the other groups sliding
+            // around it exactly as rows do inside one. Scratch (`group_key ==
+            // None`) sits out: it's pinned last, so it has nowhere to go.
+            let header = section.name.clone().map(|name| {
+                let label: SharedString = name.to_uppercase().into();
+                h_flex()
+                    .id(("sidebar-group", group_ix))
+                    .w_full()
+                    .items_center()
+                    .gap_1p5()
+                    .pl_2()
+                    .pr_1p5()
+                    .pt_1p5()
+                    .pb_0p5()
+                    .text_size(px(11.))
+                    .text_color(cx.theme().muted_foreground)
+                    .when_some(group_slot, |header, slot| {
+                        // Unlike a row, a header does nothing on click — its
+                        // only affordance is the drag, so the open hand is the
+                        // honest hover cursor (it closes once you pick it up).
+                        header.cursor_grab().on_drag(DragGroup, {
+                            let state = self.reorder.clone();
+                            let slots = group_slots.clone();
+                            move |_drag, grab, _window, cx| {
+                                cx.stop_propagation();
+                                *state.borrow_mut() = Some(Reorder::new(
+                                    Surface::SidebarGroups,
+                                    slot,
+                                    slots.borrow().clone(),
+                                    Axis::Vertical,
+                                    px(ROW_GAP),
+                                    // The header is the handle, but the *block*
+                                    // is what moves. The header leads the block,
+                                    // so the grab point inside the header is
+                                    // also the grab point inside the block —
+                                    // it passes through unchanged.
+                                    grab,
+                                ));
+                                cx.new(|_| DragGroup)
+                            }
+                        })
+                    })
+                    // Count sits right next to the name (not pushed to the
+                    // rail's right edge): the name shrinks and truncates if
+                    // long, the count trails it as a quiet tally.
+                    .child(
+                        div()
+                            .flex_shrink(1.)
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(cx.theme().muted_foreground.opacity(0.7))
+                            .child(row_count.to_string()),
+                    )
+            });
+
+            // One block per group — header plus its rows — so a header drag can
+            // move the whole thing as a unit and measure it as one slot.
+            let block = v_flex()
+                .w_full()
+                .gap(px(ROW_GAP))
+                // Held: the block you're dragging dims, exactly as a held row
+                // does — nothing lifts off the rail.
+                .when(
+                    group_preview
+                        .as_ref()
+                        .is_some_and(|p| Some(p.from) == group_slot),
+                    |b| b.opacity(0.75),
+                )
+                .children(header)
+                .children(rows)
+                // Measures the block for the group-drag geometry. Only the
+                // rendered repo groups hold a slot — Scratch is pinned last and
+                // never moves, and a group the search box emptied isn't here at
+                // all — so `group_slot` indexes that list, not `sections`.
+                .when_some(group_slot, |block, slot| {
+                    block.child(
+                        canvas(
+                            {
+                                let slots = group_slots.clone();
+                                move |bounds, _window, _cx| {
+                                    if let Some(s) = slots.borrow_mut().get_mut(slot) {
+                                        *s = bounds;
+                                    }
+                                }
+                            },
+                            |_, _, _, _| {},
                         )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_color(cx.theme().muted_foreground.opacity(0.7))
-                                .child(rows.len().to_string()),
-                        ),
-                );
-            }
-            for row in rows {
-                list = list.child(row);
-            }
+                        .absolute()
+                        .inset_0(),
+                    )
+                });
+
+            list = list.child(match (&group_preview, group_slot) {
+                // The block in hand tracks the cursor, painted over the ones it
+                // crosses (same treatment a held row gets inside a group).
+                (Some(p), Some(slot)) if p.from == slot => {
+                    deferred(block.relative().top(p.held)).into_any_element()
+                }
+                // Everything else slides; a slotless block (Scratch) never
+                // moves, so it falls through to the plain block below.
+                (Some(p), Some(slot)) => {
+                    let offset = p.offsets[slot].as_f32();
+                    block
+                        .with_animation(
+                            (
+                                SharedString::from(format!("group-slide-{}", p.generation)),
+                                slot,
+                            ),
+                            Animation::new(std::time::Duration::from_millis(REORDER_SLIDE_MS))
+                                .with_easing(ease_out_quint()),
+                            move |el, delta| el.top(px(offset * (1. - delta))),
+                        )
+                        .into_any_element()
+                }
+                _ => block.into_any_element(),
+            });
         }
 
         // Top control bar: a right-aligned "+" new-tab button (the same shell
@@ -648,7 +922,7 @@ impl Tty7App {
         let keys = self.sidebar_group_keys(cx);
         sidebar_sections(&keys)
             .into_iter()
-            .flat_map(|(_, idxs)| idxs)
+            .flat_map(|s| s.tabs)
             .collect()
     }
 
@@ -667,12 +941,25 @@ impl Tty7App {
     }
 }
 
-/// Partition per-tab group keys into the sidebar's sections: `(header,
-/// indices)` with groups in first-appearance order (a new repo appends, the
-/// existing ones never reshuffle) and the Scratch group pinned last. A `None`
-/// header means "render flat, no headers" — used when no tab is in any repo,
-/// where a lone Scratch header over everything would be noise.
-fn sidebar_sections(keys: &[Option<PathBuf>]) -> Vec<(Option<String>, Vec<usize>)> {
+/// One block of the sidebar: a header and the tabs under it.
+#[derive(Debug, PartialEq)]
+struct Section {
+    /// The repo root this group is keyed on, `None` for Scratch. Sections with
+    /// a key are the draggable ones (Scratch is pinned last), and it doubles as
+    /// the group's identity in a drag.
+    key: Option<PathBuf>,
+    /// The header text, or `None` for "render flat, no header".
+    name: Option<String>,
+    /// The group's tabs, in tab order.
+    tabs: Vec<usize>,
+}
+
+/// Partition per-tab group keys into the sidebar's sections: groups in
+/// first-appearance order (a new repo appends, the existing ones never
+/// reshuffle) with the Scratch group pinned last. A nameless single section
+/// means "render flat, no headers" — used when no tab is in any repo, where a
+/// lone Scratch header over everything would be noise.
+fn sidebar_sections(keys: &[Option<PathBuf>]) -> Vec<Section> {
     let mut group_order: Vec<&PathBuf> = Vec::new();
     for k in keys.iter().flatten() {
         if !group_order.iter().any(|g| *g == k) {
@@ -680,24 +967,107 @@ fn sidebar_sections(keys: &[Option<PathBuf>]) -> Vec<(Option<String>, Vec<usize>
         }
     }
     if group_order.is_empty() {
-        return vec![(None, (0..keys.len()).collect())];
+        return vec![Section {
+            key: None,
+            name: None,
+            tabs: (0..keys.len()).collect(),
+        }];
     }
     let names = group_names(&group_order);
-    let mut sections: Vec<(Option<String>, Vec<usize>)> = group_order
+    let mut sections: Vec<Section> = group_order
         .iter()
         .zip(names)
-        .map(|(root, name)| {
-            let idxs = (0..keys.len())
+        .map(|(root, name)| Section {
+            key: Some((*root).clone()),
+            name: Some(name),
+            tabs: (0..keys.len())
                 .filter(|&i| keys[i].as_ref() == Some(*root))
-                .collect();
-            (Some(name), idxs)
+                .collect(),
         })
         .collect();
     let scratch: Vec<usize> = (0..keys.len()).filter(|&i| keys[i].is_none()).collect();
     if !scratch.is_empty() {
-        sections.push((Some("Scratch".into()), scratch));
+        sections.push(Section {
+            key: None,
+            name: Some("Scratch".into()),
+            tabs: scratch,
+        });
     }
     sections
+}
+
+/// The tab permutation for a row dropped at a new place inside its own group:
+/// `visible` are the group's rows as the rail currently lists them (the search
+/// box may be hiding others), and the row at `from` lands where the row at `to`
+/// is now.
+///
+/// Like [`regrouped_order`] this returns a whole-vector permutation rather than
+/// a single move, because "third row in this group" only means something once
+/// the vector is laid out the way the rail draws it: groups in their existing
+/// order, each one contiguous, Scratch last. Rows the filter is hiding keep
+/// their place in the group, and no other group is disturbed.
+fn reordered_rows(
+    keys: &[Option<PathBuf>],
+    group: &Option<PathBuf>,
+    visible: &[usize],
+    from: usize,
+    to: usize,
+) -> Option<Vec<usize>> {
+    let (&moved, &anchor) = (visible.get(from)?, visible.get(to)?);
+    if moved == anchor {
+        return None;
+    }
+    let mut members: Vec<usize> = (0..keys.len()).filter(|&i| keys[i] == *group).collect();
+    members.retain(|&i| i != moved);
+    // Land it on the far side of the row it was dropped onto, so dragging down
+    // ends up below that row and dragging up above it.
+    let at = members.iter().position(|&i| i == anchor)? + usize::from(to > from);
+    members.insert(at, moved);
+
+    let mut out: Vec<usize> = Vec::with_capacity(keys.len());
+    for g in sidebar_sections(keys).iter().map(|s| &s.key) {
+        if g == group {
+            out.extend_from_slice(&members);
+        } else {
+            out.extend((0..keys.len()).filter(|&i| keys[i] == *g));
+        }
+    }
+    Some(out)
+}
+
+/// The tab permutation that moves the group rooted at `from` into `to`'s slot,
+/// as old indices in their new order — or `None` when the move is a no-op (same
+/// group, or either root no longer has any tab).
+///
+/// Groups are ordered by first appearance in the tab vector, so the move is
+/// "reorder the group list, then lay the tabs back out group by group". Each
+/// group therefore comes out *contiguous*, with Scratch last, matching exactly
+/// what the sidebar renders — which also settles the old caveat that a tab drag
+/// inside an interleaved group could shuffle other groups' headers: after any
+/// header drag the vector is compacted and interleaving is gone. Relative order
+/// within a group is preserved.
+fn regrouped_order(keys: &[Option<PathBuf>], from: &Path, to: &Path) -> Option<Vec<usize>> {
+    if from == to {
+        return None;
+    }
+    let mut order: Vec<&PathBuf> = Vec::new();
+    for k in keys.iter().flatten() {
+        if !order.iter().any(|g| *g == k) {
+            order.push(k);
+        }
+    }
+    let fi = order.iter().position(|g| g.as_path() == from)?;
+    let ti = order.iter().position(|g| g.as_path() == to)?;
+    let moved = order.remove(fi);
+    order.insert(ti, moved);
+
+    let mut out: Vec<usize> = Vec::with_capacity(keys.len());
+    for g in &order {
+        out.extend((0..keys.len()).filter(|&i| keys[i].as_ref() == Some(*g)));
+    }
+    // Scratch tabs trail the repo groups, which is where the sidebar draws them.
+    out.extend((0..keys.len()).filter(|&i| keys[i].is_none()));
+    Some(out)
 }
 
 /// Display names for the group roots: each root's directory name, extended
@@ -769,17 +1139,100 @@ mod tests {
             Some(p("/w/beta")),
         ];
         let sections = sidebar_sections(&keys);
+        let shape: Vec<(Option<PathBuf>, Option<String>, Vec<usize>)> = sections
+            .into_iter()
+            .map(|s| (s.key, s.name, s.tabs))
+            .collect();
         assert_eq!(
-            sections,
+            shape,
             vec![
-                (Some("beta".into()), vec![0, 3]),
-                (Some("alpha".into()), vec![2]),
-                (Some("Scratch".into()), vec![1]),
+                (Some(p("/w/beta")), Some("beta".into()), vec![0, 3]),
+                (Some(p("/w/alpha")), Some("alpha".into()), vec![2]),
+                (None, Some("Scratch".into()), vec![1]),
             ]
         );
 
+        // No tab in any repo: one headerless section over everything.
         let flat = sidebar_sections(&[None, None]);
-        assert_eq!(flat, vec![(None, vec![0, 1])]);
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].name, None);
+        assert_eq!(flat[0].tabs, vec![0, 1]);
+    }
+
+    /// A row dropped inside its group lands on the far side of the row it was
+    /// dropped onto, leaves every other group alone, and comes out with the
+    /// groups laid out contiguously the way the rail draws them.
+    #[test]
+    fn reordered_rows_moves_within_the_group_only() {
+        // alpha owns 0 and 2, interleaved with beta's 1; scratch is 3.
+        let keys = vec![
+            Some(p("/w/alpha")),
+            Some(p("/w/beta")),
+            Some(p("/w/alpha")),
+            None,
+        ];
+        let alpha = Some(p("/w/alpha"));
+        // alpha's first row dragged onto its second: alpha reads [2, 0], and
+        // the vector comes out grouped — alpha, beta, scratch.
+        assert_eq!(
+            reordered_rows(&keys, &alpha, &[0, 2], 0, 1),
+            Some(vec![2, 0, 1, 3])
+        );
+        // Back the other way.
+        assert_eq!(
+            reordered_rows(&keys, &alpha, &[0, 2], 1, 0),
+            Some(vec![2, 0, 1, 3])
+        );
+        // Dropping a row on itself changes nothing.
+        assert_eq!(reordered_rows(&keys, &alpha, &[0, 2], 1, 1), None);
+    }
+
+    /// Rows the search box is hiding aren't dragged along: the visible rows
+    /// reorder among themselves and the hidden one keeps its place in the group.
+    #[test]
+    fn reordered_rows_leaves_filtered_out_rows_alone() {
+        let keys = vec![Some(p("/w/a")), Some(p("/w/a")), Some(p("/w/a"))];
+        let a = Some(p("/w/a"));
+        // Only rows 0 and 2 are listed; dragging 0 past 2 puts it after row 2,
+        // and row 1 stays between… where it was relative to the others.
+        assert_eq!(
+            reordered_rows(&keys, &a, &[0, 2], 0, 1),
+            Some(vec![1, 2, 0])
+        );
+    }
+
+    /// A header drag moves the whole group into the target's slot and lays
+    /// every group out contiguously, Scratch last, keeping intra-group order.
+    #[test]
+    fn regrouped_order_moves_the_group_into_the_target_slot() {
+        // Groups by first appearance: alpha (0, 3), beta (2), gamma (4).
+        let keys = vec![
+            Some(p("/w/alpha")),
+            None,
+            Some(p("/w/beta")),
+            Some(p("/w/alpha")),
+            Some(p("/w/gamma")),
+        ];
+        // gamma dropped on alpha → gamma, alpha, beta, then Scratch.
+        assert_eq!(
+            regrouped_order(&keys, &p("/w/gamma"), &p("/w/alpha")),
+            Some(vec![4, 0, 3, 2, 1])
+        );
+        // alpha dropped on gamma (a move down) → beta, gamma, alpha.
+        assert_eq!(
+            regrouped_order(&keys, &p("/w/alpha"), &p("/w/gamma")),
+            Some(vec![2, 4, 0, 3, 1])
+        );
+    }
+
+    /// Dropping a group on itself, or naming a root no tab lives in, is a
+    /// no-op rather than a re-shuffle.
+    #[test]
+    fn regrouped_order_ignores_self_and_unknown_roots() {
+        let keys = vec![Some(p("/w/alpha")), Some(p("/w/beta"))];
+        assert_eq!(regrouped_order(&keys, &p("/w/alpha"), &p("/w/alpha")), None);
+        assert_eq!(regrouped_order(&keys, &p("/w/gone"), &p("/w/beta")), None);
+        assert_eq!(regrouped_order(&keys, &p("/w/alpha"), &p("/w/gone")), None);
     }
 
     /// Same-named roots grow a parent prefix until distinct; unrelated names
