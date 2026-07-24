@@ -212,7 +212,8 @@ fn process_table() -> HashMap<u32, Row> {
             (
                 p.pid,
                 Row {
-                    ppid: p.ppid,
+                    // `winproc::Proc` names the parent link `parent`.
+                    ppid: p.parent,
                     pgid: 0,
                     name: p.name,
                 },
