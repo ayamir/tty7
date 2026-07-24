@@ -902,11 +902,19 @@ impl Tty7App {
             // and carries its own ✕, so keeping this one would stack two ✕ there.
             .when(!show_theme_panel, |r| {
                 r.child(
-                    div().absolute().top(px(6.)).right(px(10.)).occlude().child(
+                    // Sized like the title bar's "⋯" (30px, 15px glyph,
+                    // `rounded_lg`), because it stands in the same corner: a
+                    // `small` icon button is 24px, which reads undersized next
+                    // to the 34px window-control tiles this spot belongs to.
+                    // `top` centres it in the title bar's band — (40 − 30) / 2.
+                    div().absolute().top(px(5.)).right(px(10.)).occlude().child(
                         Button::new("settings-close")
-                            .icon(IconName::Close)
+                            .icon(Icon::new(IconName::Close).size(px(15.)))
                             .ghost()
-                            .small()
+                            .xsmall()
+                            .w(px(30.))
+                            .h(px(30.))
+                            .rounded_lg()
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.close_settings(window, cx)),
                             ),
