@@ -781,32 +781,39 @@ impl Tty7App {
         cx.spawn_in(window, async move |app, cx| {
             let Ok(v) = rx.recv().await else { return };
             let locations: Vec<lsp_types::Location> = serde_json::from_value(v).unwrap_or_default();
-            // Read each referenced line once per file for the row previews;
-            // off the UI thread, since this touches the filesystem.
-            let mut items: Vec<ReferenceItem> = Vec::new();
-            let mut file_lines: std::collections::HashMap<PathBuf, Vec<String>> =
-                std::collections::HashMap::new();
-            for loc in locations.into_iter().take(200) {
-                let Some(path) = crate::ui::lsp::path_for_uri(loc.uri.as_str()) else {
-                    continue;
-                };
-                let lines = file_lines.entry(path.clone()).or_insert_with(|| {
-                    std::fs::read_to_string(&path)
-                        .map(|t| t.lines().map(|l| l.to_string()).collect())
-                        .unwrap_or_default()
-                });
-                let line = loc.range.start.line;
-                let preview = lines
-                    .get(line as usize)
-                    .map(|l| l.trim().to_string())
-                    .unwrap_or_default();
-                items.push(ReferenceItem {
-                    path,
-                    line,
-                    character: loc.range.start.character,
-                    preview: preview.into(),
-                });
-            }
+            // Read each referenced line once per file for the row previews. On
+            // the background executor: `spawn_in` runs on the *main* thread, and
+            // a couple of hundred `read_to_string`s there would stall a frame.
+            let items: Vec<ReferenceItem> = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut items: Vec<ReferenceItem> = Vec::new();
+                    let mut file_lines: std::collections::HashMap<PathBuf, Vec<String>> =
+                        std::collections::HashMap::new();
+                    for loc in locations.into_iter().take(200) {
+                        let Some(path) = crate::ui::lsp::path_for_uri(loc.uri.as_str()) else {
+                            continue;
+                        };
+                        let lines = file_lines.entry(path.clone()).or_insert_with(|| {
+                            std::fs::read_to_string(&path)
+                                .map(|t| t.lines().map(|l| l.to_string()).collect())
+                                .unwrap_or_default()
+                        });
+                        let line = loc.range.start.line;
+                        let preview = lines
+                            .get(line as usize)
+                            .map(|l| l.trim().to_string())
+                            .unwrap_or_default();
+                        items.push(ReferenceItem {
+                            path,
+                            line,
+                            character: loc.range.start.character,
+                            preview: preview.into(),
+                        });
+                    }
+                    items
+                })
+                .await;
             let _ = app.update(cx, |app, cx| {
                 if let Some(code) = app.tab_code_mut() {
                     code.references = Some(items);

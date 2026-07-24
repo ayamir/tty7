@@ -1120,9 +1120,6 @@ impl DaemonPane {
         }
     }
 
-    /// The local-PTY backend, or `None` for a native-SSH pane. PTY-only
-    /// operations (resize via master, signal groups, foreground proc queries)
-    /// short-circuit when this is `None`.
     /// The pane's process tree and listening ports, for the GUI's details panel
     /// (`QueryProcs`). A native-SSH pane has no local process tree at all — its
     /// commands run on the far side — so it answers empty rather than reporting
@@ -1137,6 +1134,9 @@ impl DaemonPane {
         crate::daemon::procinfo::snapshot(shell_pid, pty_foreground_pgid(&pty.master))
     }
 
+    /// The local-PTY backend, or `None` for a native-SSH pane. PTY-only
+    /// operations (resize via master, signal groups, foreground proc queries)
+    /// short-circuit when this is `None`.
     fn pty(&self) -> Option<&PtyBackend> {
         match &self.backend {
             PaneBackend::Pty(p) => Some(p),

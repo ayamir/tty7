@@ -92,20 +92,34 @@ impl Inner {
     }
 
     /// Send a frame now, or park it until the server finished initializing.
+    ///
+    /// The `ready` check happens under the `queued` lock, and `flush_queued`
+    /// takes the same lock — otherwise a frame could read `ready == false`,
+    /// lose the race to the reader thread flipping it and draining the queue,
+    /// and then park itself behind a handshake that already finished, where
+    /// nothing would ever send it (a `didOpen` lost that way costs the file its
+    /// diagnostics for the whole session).
     fn send(&self, body: String) {
+        let mut queued = self.queued.lock().unwrap();
         if self.ready.load(Ordering::SeqCst) {
+            drop(queued);
             let mut stdin = self.stdin.lock().unwrap();
             Self::write_frame(&mut stdin, &body);
         } else {
-            self.queued.lock().unwrap().push(body);
+            queued.push(body);
         }
     }
 
-    /// Initialize finished: flush everything parked behind the handshake.
-    fn flush_queued(&self) {
-        let queued: Vec<String> = std::mem::take(&mut self.queued.lock().unwrap());
+    /// Initialize finished: mark ready and flush everything parked behind the
+    /// handshake. `ready` flips under the `queued` lock, so no sender can slip a
+    /// frame out ahead of the ones already parked (a `didChange` overtaking its
+    /// `didOpen` desynchronizes the server for the rest of the session).
+    fn mark_ready_and_flush(&self) {
+        let mut queued = self.queued.lock().unwrap();
+        self.ready.store(true, Ordering::SeqCst);
+        let parked: Vec<String> = std::mem::take(&mut *queued);
         let mut stdin = self.stdin.lock().unwrap();
-        for body in queued {
+        for body in parked {
             Self::write_frame(&mut stdin, &body);
         }
     }
@@ -361,8 +375,7 @@ fn reader_loop(
                         let mut stdin = inner.stdin.lock().unwrap();
                         Inner::write_frame(&mut stdin, &initialized);
                     }
-                    inner.ready.store(true, Ordering::SeqCst);
-                    inner.flush_queued();
+                    inner.mark_ready_and_flush();
                     log::info!("lsp: {} initialized", inner.name);
                     continue;
                 }

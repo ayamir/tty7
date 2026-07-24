@@ -240,9 +240,17 @@ impl MarkScanner {
                         }
                         self.state = ScanState::Text;
                     } else {
-                        // Not an ST after all — the ESC was payload.
-                        self.payload.push(0x1b);
-                        self.state = ScanState::Osc;
+                        // Not an ST after all — the ESC was payload. Bounded like
+                        // the ordinary payload byte below it: a stream of bare
+                        // ESCs inside an unterminated OSC would otherwise grow the
+                        // buffer a byte at a time, never reaching the check there.
+                        if self.payload.len() < MAX_PAYLOAD {
+                            self.payload.push(0x1b);
+                            self.state = ScanState::Osc;
+                        } else {
+                            self.state = ScanState::Text;
+                            self.payload.clear();
+                        }
                     }
                 }
             }

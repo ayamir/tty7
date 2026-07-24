@@ -520,8 +520,8 @@ impl Tty7App {
             .when_some(cwd_for_actions, |this, cwd| {
                 this.child(self.cwd_actions(cwd, cx))
             })
-            .children(self.procs_section(cx))
-            .children(self.ports_section(cx))
+            .children(self.procs_section(pane_id, cx))
+            .children(self.ports_section(pane_id, cx))
             .into_any_element();
         self.panel_scroll(inner, title)
     }
@@ -600,8 +600,8 @@ impl Tty7App {
     /// The pane's process tree, indented by depth. Returns nothing at all when
     /// the pane is just a shell sitting at its prompt: a one-row "processes"
     /// section that always says `zsh` is a header earning its keep zero times.
-    fn procs_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let procs = &self.procs()?.procs;
+    fn procs_section(&self, pane_id: Option<u64>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let procs = &self.procs(pane_id)?.procs;
         if procs.len() < 2 {
             return None;
         }
@@ -647,8 +647,8 @@ impl Tty7App {
 
     /// TCP ports the pane's processes are listening on — the answer to "what
     /// port did that dev server pick?", next to the pane that started it.
-    fn ports_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let ports = &self.procs()?.ports;
+    fn ports_section(&self, pane_id: Option<u64>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let ports = &self.procs(pane_id)?.ports;
         if ports.is_empty() {
             return None;
         }
@@ -685,9 +685,13 @@ impl Tty7App {
         )
     }
 
-    /// The cached query, but only when it describes the pane currently on screen.
-    fn procs(&self) -> Option<&PaneProcs> {
-        self.right_panel.procs.as_ref()
+    /// The cached query, but only when it describes `pane_id` — the pane the
+    /// Info tab is currently rendering. `sync_procs` already drops the answer on
+    /// a pane switch, so this is belt-and-braces; without the argument the doc
+    /// claimed a guarantee the body didn't actually make.
+    fn procs(&self, pane_id: Option<u64>) -> Option<&PaneProcs> {
+        (pane_id.is_some() && self.right_panel.procs_pane == pane_id)
+            .then(|| self.right_panel.procs.as_ref())?
     }
 
     /// Point the process query at `pane_id` and make sure the poll is running.
@@ -891,10 +895,17 @@ impl Tty7App {
         };
         // Probe on first paint for this cwd, and whenever the pane moves to a
         // different repository. Refreshes ride the same git-status observer the
-        // sidebar counts do, which clears the cache (see `right_panel_invalidate`).
+        // sidebar counts do (see `right_panel_refresh_changes`), which re-probes
+        // *in place* — the list only blanks when the repository itself changes.
         if self.right_panel.diff_cwd.as_ref() != Some(&cwd) {
             self.right_panel.diff_cwd = Some(cwd.clone());
             self.right_panel.diff = None;
+            self.spawn_right_panel_diff(cwd.clone(), cx);
+        } else if self.right_panel.diff.is_none() && !self.right_panel.diff_loading {
+            // Nothing cached and nothing in flight: a probe for a previous cwd
+            // landed after we had already moved on and dropped its result, so
+            // no one is left to answer for this one. Without this the tab would
+            // sit on "Loading…" until some unrelated event nudged it.
             self.spawn_right_panel_diff(cwd.clone(), cx);
         }
 
@@ -1047,10 +1058,39 @@ impl Tty7App {
         .detach();
     }
 
-    /// Drop the cached diff so the next paint re-probes. Called from the same
-    /// git-status observer that refreshes the sidebar's `+N −M`.
-    pub(crate) fn right_panel_invalidate(&mut self) {
-        self.right_panel.diff_cwd = None;
+    /// Re-probe the Changes list when the shared status cache learned something
+    /// newer than what's shown — called from the app's
+    /// `observe_global::<GitStatusCache>` hook, the same trigger that refreshes
+    /// the sidebar's `+N −M` and the diff overlay.
+    ///
+    /// Deliberately *not* "drop the cache and let the next paint re-probe":
+    /// that observer fires on every landed probe, including unrelated repos', so
+    /// dropping the cache blanked the list to "Loading…" and spawned a fresh
+    /// `git diff` several times a second while a pane was producing output.
+    /// Comparing branch + totals first keeps the quiet case free, and re-probing
+    /// in place leaves the rows on screen until the new snapshot lands.
+    pub(crate) fn right_panel_refresh_changes(&mut self, cx: &mut Context<Self>) {
+        if self.right_panel.diff_loading {
+            return;
+        }
+        let Some(cwd) = self.right_panel.diff_cwd.clone() else {
+            return; // never probed — the render path owns the first one
+        };
+        // `Some(None)` (probed, not a work tree) stays put: a status entry for a
+        // non-repo can't appear, so there's nothing to disagree with.
+        let Some(Some(snap)) = &self.right_panel.diff else {
+            return;
+        };
+        let Some(status) = cx
+            .try_global::<crate::terminal::git_status::GitStatusCache>()
+            .and_then(|cache| cache.status_for(&cwd))
+        else {
+            return;
+        };
+        let stale = status.branch != snap.branch || (status.added, status.removed) != snap.totals();
+        if stale {
+            self.spawn_right_panel_diff(cwd, cx);
+        }
     }
 
     // ── Files ───────────────────────────────────────────────────────────────

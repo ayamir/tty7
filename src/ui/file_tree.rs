@@ -270,9 +270,11 @@ impl FileTreeState {
         let mut out: Vec<TreeRow> = Vec::new();
         let mut visited = 0usize;
         for root in roots {
-            let mut queue: Vec<PathBuf> = vec![root.clone()];
-            while let Some(dir) = queue.first().cloned() {
-                queue.remove(0);
+            // A deque, not a `Vec` + `remove(0)`: the breadth-first frontier of a
+            // wide tree gets long, and shifting it down per pop is quadratic.
+            let mut queue: std::collections::VecDeque<PathBuf> =
+                std::collections::VecDeque::from([root.clone()]);
+            while let Some(dir) = queue.pop_front() {
                 if out.len() >= LIMIT || visited >= MAX_DIRS {
                     break;
                 }
@@ -290,7 +292,7 @@ impl FileTreeState {
                         continue;
                     }
                     if e.is_dir {
-                        queue.push(e.path.clone());
+                        queue.push_back(e.path.clone());
                     }
                     if e.name.to_lowercase().contains(&needle) {
                         out.push(TreeRow {

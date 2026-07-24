@@ -750,8 +750,6 @@ impl Tty7App {
     }
 }
 
-/// Whether a file's body shows: small text diffs default open, big ones (and
-/// anything the user explicitly flipped) invert via the `toggled` set.
 /// Resolve the overlay's focused path to an index into `snap.files`. `None`
 /// means "show everything" — either nothing is focused, or the focused path is
 /// no longer in the diff (the user reverted it while the overlay was open), in
@@ -771,6 +769,8 @@ fn focused_name(overlay: &DiffOverlayState) -> Option<String> {
     Some(snap.files[idx].path.clone())
 }
 
+/// Whether a file's body shows: small text diffs default open, big ones (and
+/// anything the user explicitly flipped) invert via the `toggled` set.
 fn file_expanded(file: &FileDiff, toggled: &HashSet<String>) -> bool {
     let default_open = file.added + file.removed <= AUTO_COLLAPSE_LINES;
     default_open != toggled.contains(&file.path)

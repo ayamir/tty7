@@ -4098,10 +4098,6 @@ impl TerminalView {
         self.smooth_scroll(delta, cx);
     }
 
-    /// Scroll the local scrollback by a possibly-fractional number of lines,
-    /// pixel-smooth: whole lines go to the emulator's `display_offset`, the
-    /// remainder stays in `scroll_frac` and shifts the paint. The position may
-    /// come to rest between line boundaries, like a native scroll view.
     /// The pane's OSC 133 command marks, newest last — the Outline's rows.
     pub fn command_marks(&self) -> Vec<crate::terminal::marks::CommandMark> {
         self.terminal.marks().list()
@@ -4136,6 +4132,10 @@ impl TerminalView {
         true
     }
 
+    /// Scroll the local scrollback by a possibly-fractional number of lines,
+    /// pixel-smooth: whole lines go to the emulator's `display_offset`, the
+    /// remainder stays in `scroll_frac` and shifts the paint. The position may
+    /// come to rest between line boundaries, like a native scroll view.
     fn smooth_scroll(&mut self, delta: f32, cx: &mut Context<Self>) {
         let mut term = self.terminal.term.lock();
         let offset = term.grid().display_offset();

@@ -982,14 +982,14 @@ impl RemoteTerminal {
     /// The third-party CLI coding agent (Claude Code, Codex, …) running in the
     /// pane's foreground, as last reported by the daemon, or `None`. Cheap cache
     /// read — detection runs daemon-side. See [`crate::core::cli_agent`].
+    pub fn foreground_agent(&self) -> Option<CLIAgent> {
+        self.agent.lock().ok().and_then(|g| *g)
+    }
+
     /// Command marks recorded from OSC 133, oldest first — the Outline's source.
     /// Cheap clone of a shared handle; the caller snapshots via `Marks::list`.
     pub fn marks(&self) -> crate::terminal::marks::Marks {
         self.marks.clone()
-    }
-
-    pub fn foreground_agent(&self) -> Option<CLIAgent> {
-        self.agent.lock().ok().and_then(|g| *g)
     }
 
     /// The rich agent-session status (idle/working/waiting/done + native

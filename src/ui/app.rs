@@ -622,7 +622,7 @@ impl Tty7App {
                 // Same trigger, same freshness: the right panel's Changes list is
                 // the sidebar's `+N −M` expanded, so it re-probes whenever those
                 // numbers do rather than going stale behind them.
-                this.right_panel_invalidate();
+                this.right_panel_refresh_changes(cx);
                 cx.notify();
             });
         // Any real keypress means "chord, not a bare hold": cancel the held-⌘
