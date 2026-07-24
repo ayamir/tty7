@@ -757,13 +757,18 @@ impl Tty7App {
             .pr(px(crate::ui::app::CONTENT_INSET - crate::ui::app::TILE_PAD))
             .child(
                 self.attach_new_tab_menu(
-                    Button::new("sidebar-add")
-                        .icon(Icon::new(IconName::Plus).size(px(18.)))
-                        .ghost()
-                        .xsmall()
-                        .w(px(32.))
-                        .h(px(32.))
-                        .rounded_lg(),
+                    // `chrome_tile`, not `ghost()`: this "+" sits beside the
+                    // collapse tile and the title bar's own "+", and ghost's
+                    // hover is a heavier, differently-derived grey.
+                    crate::ui::tab_strip::chrome_tile(
+                        Button::new("sidebar-add").icon(Icon::new(IconName::Plus).size(px(18.))),
+                        false,
+                        cx,
+                    )
+                    .xsmall()
+                    .w(px(32.))
+                    .h(px(32.))
+                    .rounded_lg(),
                     cx,
                 ),
             )

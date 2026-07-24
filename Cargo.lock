@@ -2022,7 +2022,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading 0.8.9",
+ "libloading 0.7.4",
 ]
 
 [[package]]
@@ -3180,7 +3180,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.2"
-source = "git+https://github.com/l0ng-ai/gpui-component?branch=tty7#3826fafacd3c854bbcddb596116a1768e24031b9"
+source = "git+https://github.com/l0ng-ai/gpui-component?branch=tty7#469ab7a44f721723a4c404db984dc8223b55979e"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3263,7 +3263,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-assets"
 version = "0.5.1"
-source = "git+https://github.com/l0ng-ai/gpui-component?branch=tty7#3826fafacd3c854bbcddb596116a1768e24031b9"
+source = "git+https://github.com/l0ng-ai/gpui-component?branch=tty7#469ab7a44f721723a4c404db984dc8223b55979e"
 dependencies = [
  "anyhow",
  "gpui",
@@ -3277,7 +3277,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.5.1"
-source = "git+https://github.com/l0ng-ai/gpui-component?branch=tty7#3826fafacd3c854bbcddb596116a1768e24031b9"
+source = "git+https://github.com/l0ng-ai/gpui-component?branch=tty7#469ab7a44f721723a4c404db984dc8223b55979e"
 dependencies = [
  "proc-macro2",
  "quote",

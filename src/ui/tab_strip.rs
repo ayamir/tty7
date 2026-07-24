@@ -156,20 +156,26 @@ impl Render for DragTab {
 /// `ghost()` can't be used: its hover is `secondary_hover` and its selected state
 /// `secondary_active`, both solid mid-greys that read far heavier than anything
 /// else here. So this spells out all four states in the tab rail's language —
-/// nothing at rest, a soft grey capsule on hover, the same grey opaque when
-/// selected — which is the same "inset soft-grey capsule" the sidebar rows and
-/// the popups use. (Overriding just the hover from outside doesn't work: `Button`
-/// applies its own `.hover()` during render, after any the caller set.)
+/// nothing at rest, a soft grey capsule on hover, a step darker when selected —
+/// which is the same "inset soft-grey capsule" the sidebar rows and the popups
+/// use. (Overriding just the hover from outside doesn't work: `Button` applies
+/// its own `.hover()` during render, after any the caller set.)
 pub(crate) fn chrome_tile_variant(cx: &gpui::App) -> ButtonCustomVariant {
-    let accent = cx.theme().sidebar_accent;
     ButtonCustomVariant::new(cx)
         .color(cx.theme().transparent)
         // Full `foreground`, not the softer `secondary_foreground`: the chrome
         // glyphs read as deliberate controls rather than faint hints — the
         // "commercial-app" weight, paired with the filled dock icons below.
         .foreground(cx.theme().foreground)
-        .hover(accent.opacity(0.55))
-        .active(accent)
+        // The sidebar's own selected-row fill (a 12% mix, ≈#E2E2E2 on white) at
+        // full strength: every icon tile in the chrome answers the pointer with
+        // the exact grey the rows do. It used to be that grey at 55% opacity,
+        // which on a light background is a ≈#EE tint nobody can see — and until
+        // the fork learned to read `hover` at all, nothing was painted anyway.
+        .hover(cx.theme().sidebar_accent)
+        // Selected (a lit toggle) and pressed sit one step darker than hover, so
+        // an open panel still reads as on while the pointer is over its button.
+        .active(cx.theme().list_active)
 }
 
 pub(crate) fn chrome_tile(button: Button, selected: bool, cx: &gpui::App) -> Button {
