@@ -13,13 +13,16 @@
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Axis, Bounds, Context, Div, FontWeight, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, SharedString, Stateful, Window, canvas,
-    deferred, div, ease_out_quint, linear_color_stop, linear_gradient, prelude::*, px,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, SharedString, Stateful, Window,
+    WindowControlArea, canvas, deferred, div, ease_out_quint, linear_color_stop, linear_gradient,
+    prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
 use gpui_component::menu::{ContextMenu, ContextMenuExt as _};
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_component::{
+    ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Sizable as _, h_flex, v_flex,
+};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -871,7 +874,37 @@ impl Tty7App {
                     // sit on the rail's surface here, and it aligns the search box
                     // with the terminal's top (which starts below the title bar),
                     // so the rail reads as one panel from the very top edge.
-                    .child(div().h(px(TITLE_BAR_HEIGHT)).flex_shrink_0())
+                    //
+                    // The real `TitleBar` — which carries the window's drag region
+                    // — only spans the *right* column in this layout, so this strip
+                    // would be dead space you can't grab the window by. Make it act
+                    // like the title bar it sits level with: drag to move,
+                    // double-click to zoom. Driven exactly like `TitleBar` does it
+                    // (and the settings overlay's stand-in strip): a press arms a
+                    // flag and the first *move* starts the window move, so a plain
+                    // click — and a double-click — still lands intact.
+                    .child({
+                        let should_move = Rc::new(Cell::new(false));
+                        div()
+                            .id("sidebar-titlebar-drag")
+                            .h(px(TITLE_BAR_HEIGHT))
+                            .flex_shrink_0()
+                            .window_control_area(WindowControlArea::Drag)
+                            .on_mouse_down(MouseButton::Left, {
+                                let should_move = should_move.clone();
+                                move |_, _, _| should_move.set(true)
+                            })
+                            .on_mouse_up(MouseButton::Left, {
+                                let should_move = should_move.clone();
+                                move |_, _, _| should_move.set(false)
+                            })
+                            .on_mouse_move(move |_, window, _| {
+                                if should_move.replace(false) {
+                                    window.start_window_move();
+                                }
+                            })
+                            .on_double_click(|_, window, _| window.titlebar_double_click())
+                    })
                     .child(top_bar)
                     .child(list),
             )
