@@ -211,9 +211,6 @@ pub(crate) fn default_bindings() -> Vec<(&'static str, &'static str)> {
         ("ToggleCodePanel", "secondary-shift-e"),
         // Save the editor's active file. ⌘S is free — the terminal has no save.
         ("EditorSave", "secondary-s"),
-        // LSP navigation in the editor panel, on the VS Code chords.
-        ("EditorGotoDefinition", "f12"),
-        ("EditorFindReferences", "shift-f12"),
         // No default chord — reachable from the command palette ("SSH: Manage
         // Profiles…") and bindable in Settings.
         ("OpenSshProfiles", ""),
@@ -515,8 +512,6 @@ fn make_binding(action: &str, keystroke: &str) -> Option<KeyBinding> {
         "ToggleSftp" => KeyBinding::new(keystroke, ToggleSftp, None),
         "ToggleCodePanel" => KeyBinding::new(keystroke, ToggleCodePanel, None),
         "EditorSave" => KeyBinding::new(keystroke, EditorSave, None),
-        "EditorGotoDefinition" => KeyBinding::new(keystroke, EditorGotoDefinition, None),
-        "EditorFindReferences" => KeyBinding::new(keystroke, EditorFindReferences, None),
         "OpenSshProfiles" => KeyBinding::new(keystroke, OpenSshProfiles, None),
         "RestartSshSession" => KeyBinding::new(keystroke, RestartSshSession, None),
         "Quit" => KeyBinding::new(keystroke, Quit, None),

@@ -80,10 +80,6 @@ actions!(
         ToggleCodePanel,
         // Save the editor panel's active file (⌘S).
         EditorSave,
-        // LSP jump to the definition of the symbol at the editor cursor (F12).
-        EditorGotoDefinition,
-        // LSP list references to the symbol at the editor cursor (⇧F12).
-        EditorFindReferences,
         // Open the SSH profile manager/editor full-window page (WS6, FR-P1).
         OpenSshProfiles,
         // Reconnect a dead native-SSH pane in place (WS6, FR-E4).

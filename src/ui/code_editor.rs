@@ -11,6 +11,14 @@
 //! unsaved-close confirmation, and the overlay chrome itself (the file-tree
 //! column comes from `ui::file_tree`).
 //!
+//! Deliberately *not* an IDE: there is no language-server integration, and
+//! adding one is not a wanted feature. Opening a `.rs` file silently spawning
+//! rust-analyzer — a background process indexing the whole workspace for
+//! hundreds of megabytes of RAM — is not something a terminal emulator should
+//! do to its user. Highlighting comes from tree-sitter grammars compiled into
+//! gpui-component (see [`language_for_path`]), which is static, in-process,
+//! and costs nothing beyond parsing the open buffer.
+//!
 //! Layout: overlaying the body (like Settings and the diff overlay) rather
 //! than docking a side column means toggling never resizes the terminal — no
 //! PTY resize, no reflow — and the editor gets the full body width. The tab
@@ -23,8 +31,8 @@ use std::time::SystemTime;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, Entity, Focusable as _, MouseButton, PromptLevel, SharedString,
-    Subscription, Window, div, px,
+    AnyElement, Context, Entity, Focusable as _, PromptLevel, SharedString, Subscription, Window,
+    div, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState, TabSize};
@@ -60,13 +68,6 @@ pub(crate) struct OpenFile {
     pub(crate) preview: bool,
     /// Soft-wrap state (mirrored here — the input's own flag isn't readable).
     pub(crate) wrap: bool,
-    /// The language server serving this file (spawned per workspace root),
-    /// with the LSP `languageId` used for document sync. `None` when no
-    /// server is configured/available for the language.
-    lsp: Option<(std::rc::Rc<crate::ui::lsp::LspClient>, &'static str)>,
-    /// Debounced full-document `didChange`; replaced (cancelling the old
-    /// timer) on every keystroke.
-    change_task: Option<gpui::Task<()>>,
     _sub: Subscription,
     /// Repaints the app when the input notifies (cursor moves, scrolls…) so
     /// the status bar's Ln/Col stays live.
@@ -87,17 +88,15 @@ impl OpenFile {
 /// Per-tab code-panel state, hung on [`Tab::code`](crate::ui::app::Tab) with
 /// the same lifecycle contract as the diff overlay: only the active tab's
 /// panel renders, switching away hides it, closing the tab drops it. The
-/// shared caches (directory listings, gitignore matchers, language servers,
-/// filesystem watchers) live on [`Tty7App`] — this holds only what is truly
-/// this tab's: its open files and its tree view state.
+/// shared caches (directory listings, gitignore matchers, filesystem
+/// watchers) live on [`Tty7App`] — this holds only what is truly this tab's:
+/// its open files and its tree view state.
 pub(crate) struct TabCode {
     /// Whether the overlay is currently shown for this tab. The open-file set
     /// survives hiding (Esc) — only closing the tab drops it.
     pub(crate) visible: bool,
     pub(crate) files: Vec<OpenFile>,
     pub(crate) active: usize,
-    /// Find-references results, shown as a drawer under the editor.
-    pub(crate) references: Option<Vec<ReferenceItem>>,
     /// File-tree roots: this tab's pane cwds resolved to repo roots.
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) expanded: std::collections::HashSet<PathBuf>,
@@ -116,7 +115,6 @@ impl TabCode {
             visible: false,
             files: Vec::new(),
             active: 0,
-            references: None,
             roots: Vec::new(),
             expanded: std::collections::HashSet::new(),
             selected: None,
@@ -137,18 +135,6 @@ pub(crate) struct EditorPanelState {
     /// Feeds changed paths from the watcher thread into the UI-side reload
     /// loop spawned in [`EditorPanelState::new`].
     events_tx: smol::channel::Sender<PathBuf>,
-    /// Language-server registry (one client per server × workspace root).
-    pub(crate) lsp: crate::ui::lsp::LspRegistry,
-}
-
-/// One row in the find-references drawer.
-pub(crate) struct ReferenceItem {
-    pub path: PathBuf,
-    /// 0-based target position.
-    pub line: u32,
-    pub character: u32,
-    /// The referenced line's text, for the row preview.
-    pub preview: SharedString,
 }
 
 impl EditorPanelState {
@@ -177,7 +163,6 @@ impl EditorPanelState {
         Self {
             watcher: None,
             events_tx: tx,
-            lsp: crate::ui::lsp::LspRegistry::new(window, cx),
         }
     }
 }
@@ -409,36 +394,15 @@ impl Tty7App {
                 .replaceable(true)
                 .folding(true)
                 .soft_wrap(false)
-                .default_value(text.clone())
+                .default_value(text)
         });
-        // Language server: spawn (or reuse) the server for this language at
-        // the file's workspace root, open the document, and install the
-        // completion / hover / definition providers on the input.
-        let root = crate::ui::file_tree::repo_root_for(&path)
-            .or_else(|| path.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| PathBuf::from("/"));
-        let lsp = self.editor.lsp.client_for(language, &root);
-        if let Some((client, language_id)) = &lsp {
-            client.did_open(&path, language_id, &text);
-            let provider = std::rc::Rc::new(crate::ui::lsp::FileLsp {
-                client: client.clone(),
-                path: path.clone(),
-            });
-            input.update(cx, |st, _| {
-                st.lsp.completion_provider = Some(provider.clone());
-                st.lsp.hover_provider = Some(provider.clone());
-                st.lsp.definition_provider = Some(provider);
-            });
-        }
         // Dirty tracking: `set_value` suppresses events, so every Change here
-        // is a real user edit. Each edit also (re)arms the debounced LSP
-        // didChange sync. Files may be open in any tab, not just the active
-        // one, so the lookup scans all tabs.
+        // is a real user edit. Files may be open in any tab, not just the
+        // active one, so the lookup scans all tabs.
         let sub = cx.subscribe_in(&input, window, {
             let path = path.clone();
-            move |this: &mut Tty7App, _input, ev, window, cx| {
+            move |this: &mut Tty7App, _input, ev, _window, cx| {
                 if matches!(ev, InputEvent::Change) {
-                    let path = path.clone();
                     let Some(f) = this
                         .tabs
                         .iter_mut()
@@ -450,16 +414,6 @@ impl Tty7App {
                     };
                     if !f.dirty {
                         f.dirty = true;
-                    }
-                    if f.lsp.is_some() {
-                        f.change_task = Some(cx.spawn_in(window, async move |app, cx| {
-                            cx.background_executor()
-                                .timer(std::time::Duration::from_millis(150))
-                                .await;
-                            let _ = app.update(cx, |app, cx| {
-                                app.editor_sync_lsp_document(&path, cx);
-                            });
-                        }));
                     }
                     cx.notify();
                 }
@@ -482,8 +436,6 @@ impl Tty7App {
                 conflict: false,
                 preview: false,
                 wrap: false,
-                lsp,
-                change_task: None,
                 _sub: sub,
                 _observe: observe,
             },
@@ -581,13 +533,6 @@ impl Tty7App {
                 f.dirty = false;
                 f.conflict = false;
                 f.disk_mtime = std::fs::metadata(&f.path).and_then(|m| m.modified()).ok();
-                if let Some((client, _)) = &f.lsp {
-                    // Make sure the server saw the final text before the save
-                    // notification (the debounced didChange may still be
-                    // pending), so on-save diagnostics match the disk state.
-                    client.did_change(&f.path, &text);
-                    client.did_save(&f.path);
-                }
                 cx.notify();
             }
             Err(e) => {
@@ -677,169 +622,12 @@ impl Tty7App {
         if ix >= code.files.len() {
             return;
         }
-        let f = code.files.remove(ix);
-        if let Some((client, _)) = &f.lsp {
-            client.did_close(&f.path);
-        }
+        code.files.remove(ix);
         if code.active >= ix && code.active > 0 {
             code.active -= 1;
         }
         self.editor_rebuild_watcher();
         cx.notify();
-    }
-
-    /// Every open buffer for `path`, across all tabs (a file can be open in
-    /// more than one tab's panel; each has its own buffer).
-    fn editor_files_for_path<'a>(&'a self, path: &'a Path) -> impl Iterator<Item = &'a OpenFile> {
-        self.tabs
-            .iter()
-            .filter_map(|t| t.code.as_deref())
-            .flat_map(|c| c.files.iter())
-            .filter(move |f| f.path == *path)
-    }
-
-    /// Push the buffer's current text to the language server (the debounced
-    /// tail of a typing burst).
-    pub(crate) fn editor_sync_lsp_document(&mut self, path: &Path, cx: &mut Context<Self>) {
-        for f in self.editor_files_for_path(path) {
-            if let Some((client, _)) = &f.lsp {
-                client.did_change(&f.path, &f.input.read(cx).text().to_string());
-                break; // one didChange per path — the server sees one document
-            }
-        }
-    }
-
-    /// Apply `publishDiagnostics` for `path` to its open buffers (any tab).
-    pub(crate) fn editor_apply_diagnostics(
-        &mut self,
-        path: &Path,
-        diags: Vec<lsp_types::Diagnostic>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let inputs: Vec<Entity<InputState>> = self
-            .editor_files_for_path(path)
-            .map(|f| f.input.clone())
-            .collect();
-        for input in inputs {
-            input.update(cx, |st, cx| {
-                let text = st.text().clone();
-                if let Some(set) = st.diagnostics_mut() {
-                    set.reset(&text);
-                    set.extend(diags.iter().cloned());
-                    cx.notify();
-                }
-            });
-        }
-    }
-
-    /// `EditorGotoDefinition` (F12): resolve the definition at the cursor and
-    /// jump — opening the target file first when it lives elsewhere (the
-    /// in-buffer ⌘-click path can't cross files; this one can).
-    pub(crate) fn editor_goto_definition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(f) = self.tab_code().and_then(|c| c.active_file()) else {
-            return;
-        };
-        let Some((client, _)) = &f.lsp else { return };
-        let st = f.input.read(cx);
-        let (text, offset) = (st.text().clone(), st.cursor());
-        let Some(params) = crate::ui::lsp::LspClient::position_params(&f.path, &text, offset)
-        else {
-            return;
-        };
-        let rx = client.request("textDocument/definition", params);
-        cx.spawn_in(window, async move |app, cx| {
-            let Ok(v) = rx.recv().await else { return };
-            let links = crate::ui::lsp::normalize_definitions(v);
-            let Some(link) = links.first() else { return };
-            let Some(target) = crate::ui::lsp::path_for_uri(link.target_uri.as_str()) else {
-                return;
-            };
-            let pos = link.target_selection_range.start;
-            let _ = app.update_in(cx, |app, window, cx| {
-                app.editor_jump_to(&target, pos, window, cx);
-            });
-        })
-        .detach();
-    }
-
-    /// `EditorFindReferences` (⇧F12): list every reference to the symbol at
-    /// the cursor in a drawer under the editor.
-    pub(crate) fn editor_find_references(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(f) = self.tab_code().and_then(|c| c.active_file()) else {
-            return;
-        };
-        let Some((client, _)) = &f.lsp else { return };
-        let st = f.input.read(cx);
-        let (text, offset) = (st.text().clone(), st.cursor());
-        let Some(mut params) = crate::ui::lsp::LspClient::position_params(&f.path, &text, offset)
-        else {
-            return;
-        };
-        params["context"] = serde_json::json!({ "includeDeclaration": true });
-        let rx = client.request("textDocument/references", params);
-        cx.spawn_in(window, async move |app, cx| {
-            let Ok(v) = rx.recv().await else { return };
-            let locations: Vec<lsp_types::Location> = serde_json::from_value(v).unwrap_or_default();
-            // Read each referenced line once per file for the row previews. On
-            // the background executor: `spawn_in` runs on the *main* thread, and
-            // a couple of hundred `read_to_string`s there would stall a frame.
-            let items: Vec<ReferenceItem> = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut items: Vec<ReferenceItem> = Vec::new();
-                    let mut file_lines: std::collections::HashMap<PathBuf, Vec<String>> =
-                        std::collections::HashMap::new();
-                    for loc in locations.into_iter().take(200) {
-                        let Some(path) = crate::ui::lsp::path_for_uri(loc.uri.as_str()) else {
-                            continue;
-                        };
-                        let lines = file_lines.entry(path.clone()).or_insert_with(|| {
-                            std::fs::read_to_string(&path)
-                                .map(|t| t.lines().map(|l| l.to_string()).collect())
-                                .unwrap_or_default()
-                        });
-                        let line = loc.range.start.line;
-                        let preview = lines
-                            .get(line as usize)
-                            .map(|l| l.trim().to_string())
-                            .unwrap_or_default();
-                        items.push(ReferenceItem {
-                            path,
-                            line,
-                            character: loc.range.start.character,
-                            preview: preview.into(),
-                        });
-                    }
-                    items
-                })
-                .await;
-            let _ = app.update(cx, |app, cx| {
-                if let Some(code) = app.tab_code_mut() {
-                    code.references = Some(items);
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Open `path` (if needed) and place the cursor at an LSP position.
-    pub(crate) fn editor_jump_to(
-        &mut self,
-        path: &Path,
-        pos: lsp_types::Position,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_file_in_editor(path, window, cx);
-        if let Some(f) = self.tab_code().and_then(|c| c.active_file())
-            && f.path == *path
-        {
-            f.input.clone().update(cx, |st, cx| {
-                st.set_cursor_position(pos, window, cx);
-            });
-        }
     }
 
     /// A watched file changed on disk. Clean buffers reload silently; dirty
@@ -909,9 +697,6 @@ impl Tty7App {
         f.disk_mtime = std::fs::metadata(&f.path).and_then(|m| m.modified()).ok();
         f.dirty = false;
         f.conflict = false;
-        if let Some((client, _)) = &f.lsp {
-            client.did_change(&f.path, &text);
-        }
         let input = f.input.clone();
         input.update(cx, |input, cx| input.set_value(text, window, cx));
         cx.notify();
@@ -968,7 +753,6 @@ impl Tty7App {
             .and_then(|c| c.active_file())
             .filter(|f| f.conflict)
             .map(|_| self.render_editor_conflict_banner(cx));
-        let references = self.render_editor_references(cx);
 
         let editor_col = v_flex()
             .flex_1()
@@ -976,8 +760,7 @@ impl Tty7App {
             .h_full()
             .child(self.render_editor_header(cx))
             .when_some(conflict_banner, |this, b| this.child(b))
-            .child(div().flex_1().min_h_0().child(body))
-            .when_some(references, |this, drawer| this.child(drawer));
+            .child(div().flex_1().min_h_0().child(body));
 
         Some(
             v_flex()
@@ -1082,8 +865,7 @@ impl Tty7App {
     }
 
     /// The Zed-style status bar along the panel bottom: repo-relative path on
-    /// the left; preview/wrap toggles, cursor position, and the language
-    /// server's presence on the right.
+    /// the left; preview/wrap toggles and the cursor position on the right.
     fn render_code_status_bar(&self, _window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let code = self.tab_code();
         let muted = cx.theme().muted_foreground;
@@ -1116,9 +898,6 @@ impl Tty7App {
         let wrap: Option<bool> = active.map(|f| f.wrap);
         let is_markdown = active.is_some_and(|f| language_for_path(&f.path) == "markdown");
         let preview = active.is_some_and(|f| f.preview);
-        let lsp_name: Option<SharedString> = active
-            .and_then(|f| f.lsp.as_ref())
-            .map(|(client, _)| format!("{} ✓", client.name()).into());
 
         h_flex()
             .flex_none()
@@ -1174,7 +953,6 @@ impl Tty7App {
                 )
             })
             .when_some(cursor, |this, t| this.child(div().child(t)))
-            .when_some(lsp_name, |this, t| this.child(div().child(t)))
     }
 
     /// Empty state: the panel is open with nothing loaded.
@@ -1195,93 +973,6 @@ impl Tty7App {
                     .text_color(cx.theme().muted_foreground)
                     .child("Open a file from the file tree"),
             )
-    }
-
-    /// The find-references drawer (⇧F12 results) under the editor body.
-    fn render_editor_references(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let refs = self.tab_code()?.references.as_ref()?;
-        let muted = cx.theme().muted_foreground;
-        let rows = refs.iter().enumerate().map(|(ix, r)| {
-            let name = r
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let (path, line, character) = (r.path.clone(), r.line, r.character);
-            h_flex()
-                .id(("editor-ref", ix))
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py_0p5()
-                .text_sm()
-                .cursor_pointer()
-                .hover(|s| s.bg(cx.theme().accent.opacity(0.5)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
-                        this.editor_jump_to(
-                            &path,
-                            lsp_types::Position::new(line, character),
-                            window,
-                            cx,
-                        );
-                    }),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(muted)
-                        .child(format!("{name}:{}", r.line + 1)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_ellipsis()
-                        .child(r.preview.clone()),
-                )
-        });
-        Some(
-            v_flex()
-                .flex_none()
-                .max_h(gpui::relative(0.4))
-                .border_t_1()
-                .border_color(cx.theme().border)
-                .child(
-                    h_flex()
-                        .items_center()
-                        .px_2()
-                        .py_1()
-                        .text_sm()
-                        .child(div().flex_1().child(format!("{} references", refs.len())))
-                        .child(
-                            crate::ui::tab_strip::chrome_tile(
-                                Button::new("editor-refs-close").icon(IconName::Close),
-                                false,
-                                cx,
-                            )
-                            .xsmall()
-                            .on_click(cx.listener(
-                                |this, _, _w, cx| {
-                                    if let Some(code) = this.tab_code_mut() {
-                                        code.references = None;
-                                    }
-                                    cx.notify();
-                                },
-                            )),
-                        ),
-                )
-                .child(
-                    v_flex()
-                        .id("editor-refs-list")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .children(rows),
-                )
-                .into_any_element(),
-        )
     }
 
     /// Banner shown when the file changed on disk while the buffer is dirty.

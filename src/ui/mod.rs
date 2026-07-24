@@ -14,7 +14,6 @@ pub mod forwards;
 pub mod hints;
 pub mod home;
 pub mod keymap;
-pub mod lsp;
 pub mod palette;
 pub mod pane;
 pub mod perf;
