@@ -3557,11 +3557,22 @@ impl Tty7App {
                     .child("Themes"),
             )
             .child(
-                Button::new("theme-panel-close")
-                    .icon(IconName::Close)
-                    .ghost()
-                    .small()
-                    .on_click(cx.listener(|this, _, _w, cx| this.close_theme_panel(cx))),
+                // The panel is docked to the window's top edge, so this `×` sits
+                // inside the settings overlay's stand-in title-bar strip — an
+                // absolute `WindowControlArea::Drag` band across the top 40px
+                // (see `root` below). On Windows that band is `HTCAPTION`, and
+                // unless something on top registers a mouse-blocking hitbox the
+                // OS takes the press as a window-drag and the button's `on_click`
+                // never fires. `occlude()` stops hit-testing here, the same way
+                // the tab-strip chips and the page's own `×` do. No-op elsewhere;
+                // the rest of the header still drags the window.
+                div().occlude().child(
+                    Button::new("theme-panel-close")
+                        .icon(IconName::Close)
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _, _w, cx| this.close_theme_panel(cx))),
+                ),
             );
 
         let subtitle = div()
