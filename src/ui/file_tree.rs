@@ -13,10 +13,17 @@
 //! SFTP panel covers the remote case). Listings are cached per directory and
 //! invalidated by `notify` events, so a huge repo only ever pays for the
 //! directories actually expanded.
+//!
+//! Every `read_dir` runs on the background executor: render only ever reads the
+//! cache, and a miss turns into a queued load whose answer lands with a
+//! `cx.notify()` a frame or more later. A directory the user just expanded is
+//! therefore empty for one paint, which is what the cache miss costs and what
+//! every other editor does — far better than stalling the frame on a cold
+//! `.gitignore` chain or, for the search box, on a 2000-directory walk.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
@@ -36,6 +43,11 @@ const INDENT: f32 = 14.0;
 /// Debounce for watcher-driven refreshes (same rationale as the config
 /// hot-reload: coalesce a save burst into one reload).
 const REFRESH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Debounce for the Files-tab search box. Each query walks up to `MAX_DIRS`
+/// directories, so only the pause after the last keystroke should pay for a
+/// walk — typing "src" otherwise buys three of them.
+const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// One directory entry in a cached listing.
 #[derive(Clone)]
@@ -90,109 +102,19 @@ impl TreeEdit {
     }
 }
 
-/// App-global file-tree infrastructure, held on [`Tty7App`]. The per-tab view
-/// state (roots, expansion, selection) lives in
-/// [`TabCode`](crate::ui::code_editor::TabCode); everything here is path-keyed
-/// cache or chrome shared by every tab's panel — one panel shows at a time.
-pub(crate) struct FileTreeState {
-    /// Lazily-loaded listing per directory; invalidated by watcher events.
-    children: HashMap<PathBuf, Vec<TreeEntry>>,
-    /// Compiled `.gitignore` per directory (`None` = the dir has none).
-    /// Invalidated when a `.gitignore` changes.
-    gitignore: HashMap<PathBuf, Option<Rc<Gitignore>>>,
-    pub(crate) show_hidden: bool,
-    pub(crate) editing: Option<TreeEdit>,
-    editing_subs: Vec<Subscription>,
-    /// One recursive watcher over the union of every tab's roots; rebuilt
-    /// when any root set changes. Events invalidate the path-keyed caches
-    /// above, which are tab-agnostic.
-    watcher: Option<notify::RecommendedWatcher>,
-    events_tx: smol::channel::Sender<PathBuf>,
-    pub(crate) focus_handle: FocusHandle,
+/// The filesystem half of the tree, moved onto the background executor so a
+/// paint never blocks on `read_dir`. It owns everything a listing needs —
+/// the `.gitignore` matchers included — because the UI thread's copies sit
+/// behind `&mut FileTreeState`, which no background task can hold. Seeded from
+/// [`FileTreeState::gitignore`] so most loads re-use matchers already compiled,
+/// and handed back on landing so the ones it compiled itself are re-used next
+/// time. `Arc`, not `Rc`, for exactly that trip across threads.
+struct TreeLoader {
+    gitignore: HashMap<PathBuf, Option<Arc<Gitignore>>>,
+    show_hidden: bool,
 }
 
-impl FileTreeState {
-    pub(crate) fn new(window: &mut Window, cx: &mut Context<Tty7App>) -> Self {
-        let (tx, rx) = smol::channel::unbounded::<PathBuf>();
-        cx.spawn_in(window, async move |app, cx| {
-            while let Ok(first) = rx.recv().await {
-                cx.background_executor().timer(REFRESH_DEBOUNCE).await;
-                let mut changed: HashSet<PathBuf> = HashSet::from([first]);
-                while let Ok(more) = rx.try_recv() {
-                    changed.insert(more);
-                }
-                let ok = app.update(cx, |app, cx| {
-                    app.file_tree_apply_fs_events(&changed, cx);
-                });
-                if ok.is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
-        Self {
-            children: HashMap::new(),
-            gitignore: HashMap::new(),
-            show_hidden: false,
-            editing: None,
-            editing_subs: Vec::new(),
-            watcher: None,
-            events_tx: tx,
-            focus_handle: cx.focus_handle(),
-        }
-    }
-
-    /// (Re)attach the recursive watcher to `roots` (the union across tabs).
-    fn rebuild_watcher(&mut self, roots: &HashSet<PathBuf>) {
-        use notify::{RecursiveMode, Watcher};
-        self.watcher = None;
-        if roots.is_empty() {
-            return;
-        }
-        let tx = self.events_tx.clone();
-        let handler = move |res: notify::Result<notify::Event>| {
-            let Ok(event) = res else { return };
-            for p in event.paths {
-                let _ = tx.try_send(p);
-            }
-        };
-        let mut watcher = match notify::recommended_watcher(handler) {
-            Ok(w) => w,
-            Err(e) => {
-                log::warn!("file tree: watcher unavailable: {e}");
-                return;
-            }
-        };
-        for root in roots {
-            if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
-                log::warn!("file tree: failed to watch {}: {e}", root.display());
-            }
-        }
-        self.watcher = Some(watcher);
-    }
-
-    /// Load any expanded directory whose listing isn't cached yet. Called once
-    /// per render pass so `visible_rows` can stay `&self`.
-    fn ensure_loaded(&mut self, roots: &[PathBuf], expanded: &HashSet<PathBuf>) {
-        // Roots always list; expanded dirs list on demand. Collect first: the
-        // borrow checker won't let us mutate `children` while iterating it.
-        let mut todo: Vec<(PathBuf, PathBuf)> = Vec::new(); // (dir, its root)
-        for root in roots {
-            if !self.children.contains_key(root) {
-                todo.push((root.clone(), root.clone()));
-            }
-            for dir in expanded {
-                if dir.starts_with(root) && !self.children.contains_key(dir) {
-                    todo.push((dir.clone(), root.clone()));
-                }
-            }
-        }
-        for (dir, root) in todo {
-            let listing = self.list_dir(&dir, &root);
-            self.children.insert(dir, listing);
-        }
-    }
-
+impl TreeLoader {
     /// Read one directory into sorted entries, tagging gitignored ones.
     fn list_dir(&mut self, dir: &Path, root: &Path) -> Vec<TreeEntry> {
         let Ok(read) = std::fs::read_dir(dir) else {
@@ -236,7 +158,7 @@ impl FileTreeState {
                     let file = dir.join(".gitignore");
                     file.is_file().then(|| {
                         let (gi, _err) = Gitignore::new(&file);
-                        Rc::new(gi)
+                        Arc::new(gi)
                     })
                 })
                 .clone();
@@ -260,14 +182,19 @@ impl FileTreeState {
     /// directories entirely — `.git`, `target`, `node_modules` are where the file
     /// count explodes and never where you're searching — and stops at `LIMIT`
     /// hits so a query like "e" can't walk a whole monorepo.
-    fn search_rows(&mut self, roots: &[PathBuf], query: &str) -> Vec<TreeRow> {
+    ///
+    /// Deliberately listing every directory itself rather than consulting the
+    /// UI thread's cache: a breadth-first walk visits each directory once, so
+    /// the cache would only ever save the handful the user has expanded, and
+    /// sharing it would mean sending thousands of listings back to be stored.
+    fn search(&mut self, roots: &[PathBuf], query: &str) -> Vec<TreeEntry> {
         const LIMIT: usize = 200;
         /// Directories visited even if nothing matches, so a typo can't turn into
         /// a full-disk crawl.
         const MAX_DIRS: usize = 2000;
 
         let needle = query.to_lowercase();
-        let mut out: Vec<TreeRow> = Vec::new();
+        let mut out: Vec<TreeEntry> = Vec::new();
         let mut visited = 0usize;
         for root in roots {
             // A deque, not a `Vec` + `remove(0)`: the breadth-first frontier of a
@@ -279,12 +206,7 @@ impl FileTreeState {
                     break;
                 }
                 visited += 1;
-                if !self.children.contains_key(&dir) {
-                    let listed = self.list_dir(&dir, root);
-                    self.children.insert(dir.clone(), listed);
-                }
-                let entries = self.children.get(&dir).cloned().unwrap_or_default();
-                for e in entries {
+                for e in self.list_dir(&dir, root) {
                     if e.ignored && !self.show_hidden {
                         continue;
                     }
@@ -295,14 +217,7 @@ impl FileTreeState {
                         queue.push_back(e.path.clone());
                     }
                     if e.name.to_lowercase().contains(&needle) {
-                        out.push(TreeRow {
-                            entry: e,
-                            // Flat: a match's own indentation would be meaningless
-                            // without its ancestors on screen.
-                            depth: 0,
-                            is_root: false,
-                            expanded: false,
-                        });
+                        out.push(e);
                         if out.len() >= LIMIT {
                             break;
                         }
@@ -311,6 +226,312 @@ impl FileTreeState {
             }
         }
         out
+    }
+}
+
+/// Which directories have a background listing out, and which of those were
+/// invalidated while it flew. Two jobs: render re-asks for the same missing
+/// directory every frame until the answer lands, so `in_flight` keeps that from
+/// spawning a load per frame; and a watcher event landing mid-load would
+/// otherwise let the pre-change listing win the race, so `stale` makes the
+/// answer drop itself and the next render ask again.
+#[derive(Default)]
+struct Loads {
+    in_flight: HashSet<PathBuf>,
+    stale: HashSet<PathBuf>,
+}
+
+impl Loads {
+    /// `true` when the caller should spawn — nothing is out for `dir` yet.
+    fn begin(&mut self, dir: &Path) -> bool {
+        self.in_flight.insert(dir.to_path_buf())
+    }
+
+    /// Record that a filesystem change superseded whatever is in flight for
+    /// `dir` (a no-op when nothing is).
+    fn invalidate(&mut self, dir: &Path) {
+        if self.in_flight.contains(dir) {
+            self.stale.insert(dir.to_path_buf());
+        }
+    }
+
+    /// Every in-flight answer is now stale — used when the whole cache goes.
+    fn invalidate_all(&mut self) {
+        self.stale.extend(self.in_flight.iter().cloned());
+    }
+
+    /// Retire the load for `dir`: `true` when its answer is still current and
+    /// may be cached, `false` when it must be thrown away.
+    fn finish(&mut self, dir: &Path) -> bool {
+        self.in_flight.remove(dir);
+        !self.stale.remove(dir)
+    }
+}
+
+/// The Files-tab search box's off-thread state: the query the newest walk
+/// covers, the generation that identifies it, and the hits last accepted.
+#[derive(Default)]
+struct SearchState {
+    /// Bumped per walk so a slow one can't overwrite a newer one's answer —
+    /// same guard as `right_panel`'s process poll.
+    generation: u64,
+    /// The query the in-flight (or last completed) walk covers. Render compares
+    /// against the live input, so a repaint mid-walk doesn't queue a second one.
+    pending: String,
+    /// The dotfile setting that walk ran under. The walk bakes it in — hidden
+    /// and ignored entries never enter the hits — so flipping the eye toggle
+    /// has to re-walk, even though the query never moved.
+    hidden: bool,
+    hits: Vec<TreeEntry>,
+}
+
+impl SearchState {
+    /// Point the search at `query`, returning the generation a fresh walk
+    /// should carry — `None` when the current one already covers it. An empty
+    /// query drops the hits so the next one can't flash the previous one's
+    /// results before its own land.
+    fn retarget(&mut self, query: &str, show_hidden: bool) -> Option<u64> {
+        if self.pending == query && self.hidden == show_hidden {
+            return None;
+        }
+        self.generation += 1;
+        self.pending = query.to_string();
+        self.hidden = show_hidden;
+        if query.is_empty() {
+            self.hits.clear();
+            return None;
+        }
+        Some(self.generation)
+    }
+
+    /// Take a landed walk's hits unless a newer query superseded it.
+    fn accept(&mut self, generation: u64, hits: Vec<TreeEntry>) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.hits = hits;
+        true
+    }
+
+    /// Forget both the in-flight walk and what it covered, so the next render
+    /// starts a new one for the same query. For when the ground moved under it
+    /// (the ignore rules changed, or the tree got new roots) rather than the
+    /// query changing.
+    fn restart(&mut self) {
+        self.generation += 1;
+        self.pending.clear();
+    }
+}
+
+/// App-global file-tree infrastructure, held on [`Tty7App`]. The per-tab view
+/// state (roots, expansion, selection) lives in
+/// [`TabCode`](crate::ui::code_editor::TabCode); everything here is path-keyed
+/// cache or chrome shared by every tab's panel — one panel shows at a time.
+pub(crate) struct FileTreeState {
+    /// Lazily-loaded listing per directory; invalidated by watcher events. The
+    /// only thing render reads — a miss is a queued load, never a `read_dir`.
+    children: HashMap<PathBuf, Vec<TreeEntry>>,
+    /// Compiled `.gitignore` per directory (`None` = the dir has none).
+    /// Invalidated when a `.gitignore` changes.
+    gitignore: HashMap<PathBuf, Option<Arc<Gitignore>>>,
+    loads: Loads,
+    search: SearchState,
+    pub(crate) show_hidden: bool,
+    pub(crate) editing: Option<TreeEdit>,
+    editing_subs: Vec<Subscription>,
+    /// One recursive watcher over the union of every tab's roots; rebuilt
+    /// when any root set changes. Events invalidate the path-keyed caches
+    /// above, which are tab-agnostic.
+    watcher: Option<notify::RecommendedWatcher>,
+    /// What `watcher` currently spans. The union can move without the active
+    /// tab's roots moving — closing a tab drops roots from it — so the rebuild
+    /// check compares this rather than trusting the per-tab comparison.
+    watched: HashSet<PathBuf>,
+    events_tx: smol::channel::Sender<PathBuf>,
+    pub(crate) focus_handle: FocusHandle,
+}
+
+impl FileTreeState {
+    pub(crate) fn new(window: &mut Window, cx: &mut Context<Tty7App>) -> Self {
+        let (tx, rx) = smol::channel::unbounded::<PathBuf>();
+        cx.spawn_in(window, async move |app, cx| {
+            while let Ok(first) = rx.recv().await {
+                cx.background_executor().timer(REFRESH_DEBOUNCE).await;
+                let mut changed: HashSet<PathBuf> = HashSet::from([first]);
+                while let Ok(more) = rx.try_recv() {
+                    changed.insert(more);
+                }
+                let ok = app.update(cx, |app, cx| {
+                    app.file_tree_apply_fs_events(&changed, cx);
+                });
+                if ok.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        Self {
+            children: HashMap::new(),
+            gitignore: HashMap::new(),
+            loads: Loads::default(),
+            search: SearchState::default(),
+            show_hidden: false,
+            editing: None,
+            editing_subs: Vec::new(),
+            watcher: None,
+            watched: HashSet::new(),
+            events_tx: tx,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    /// (Re)attach the recursive watcher to `roots` (the union across tabs).
+    fn rebuild_watcher(&mut self, roots: &HashSet<PathBuf>) {
+        use notify::{RecursiveMode, Watcher};
+        self.watcher = None;
+        // Recorded before the watches go on, not after: a root that fails to
+        // watch is logged once, not retried on every render.
+        self.watched = roots.clone();
+        if roots.is_empty() {
+            return;
+        }
+        let tx = self.events_tx.clone();
+        let handler = move |res: notify::Result<notify::Event>| {
+            let Ok(event) = res else { return };
+            for p in event.paths {
+                let _ = tx.try_send(p);
+            }
+        };
+        let mut watcher = match notify::recommended_watcher(handler) {
+            Ok(w) => w,
+            Err(e) => {
+                log::warn!("file tree: watcher unavailable: {e}");
+                return;
+            }
+        };
+        for root in roots {
+            if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
+                log::warn!("file tree: failed to watch {}: {e}", root.display());
+            }
+        }
+        self.watcher = Some(watcher);
+    }
+
+    /// A background worker seeded with the matchers compiled so far.
+    fn loader(&self) -> TreeLoader {
+        TreeLoader {
+            gitignore: self.gitignore.clone(),
+            show_hidden: self.show_hidden,
+        }
+    }
+
+    /// Ask for a listing of every root and expanded directory that isn't cached
+    /// yet. Called from render, so it must stay map lookups: the `read_dir`
+    /// runs on the background executor and the answer arrives with a
+    /// `cx.notify()`, which is why a just-expanded directory fills in on the
+    /// next frame rather than this one.
+    fn request_loads(
+        &mut self,
+        roots: &[PathBuf],
+        expanded: &HashSet<PathBuf>,
+        cx: &mut Context<Tty7App>,
+    ) {
+        // Roots always list; expanded dirs list on demand.
+        for root in roots {
+            self.request_load(root.clone(), root.clone(), cx);
+            for dir in expanded {
+                if dir.starts_with(root) {
+                    self.request_load(dir.clone(), root.clone(), cx);
+                }
+            }
+        }
+    }
+
+    /// Spawn one directory listing, unless it's already cached or already out.
+    fn request_load(&mut self, dir: PathBuf, root: PathBuf, cx: &mut Context<Tty7App>) {
+        if self.children.contains_key(&dir) || !self.loads.begin(&dir) {
+            return;
+        }
+        let mut loader = self.loader();
+        cx.spawn(async move |app, cx| {
+            let (entries, gitignore) = cx
+                .background_executor()
+                .spawn({
+                    let dir = dir.clone();
+                    async move {
+                        let entries = loader.list_dir(&dir, &root);
+                        (entries, loader.gitignore)
+                    }
+                })
+                .await;
+            let _ = app.update(cx, |app, cx| {
+                if app.file_tree.loads.finish(&dir) {
+                    // The matchers ride along with the listing they justified:
+                    // dropping a stale answer drops them too, since a changed
+                    // `.gitignore` is one of the things that staled it.
+                    app.file_tree.gitignore.extend(gitignore);
+                    app.file_tree.children.insert(dir, entries);
+                }
+                // Notify either way — a dropped answer needs a paint to
+                // re-request the load that replaces it.
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Point the search at `query` (empty = not searching), starting a
+    /// debounced background walk when it isn't the one already in flight.
+    /// Called from render, so the steady state is one string comparison.
+    fn sync_search(&mut self, query: &str, roots: &[PathBuf], cx: &mut Context<Tty7App>) {
+        let Some(generation) = self.search.retarget(query, self.show_hidden) else {
+            return;
+        };
+        let mut loader = self.loader();
+        let (query, roots) = (query.to_string(), roots.to_vec());
+        cx.spawn(async move |app, cx| {
+            cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+            // Another keystroke during the wait retargeted the search: bow out
+            // before touching the disk at all, which is the point of the wait.
+            let current = app
+                .update(cx, |app, _| app.file_tree.search.generation == generation)
+                .unwrap_or(false);
+            if !current {
+                return;
+            }
+            // The walk's own matchers stay with the walk: it visits up to
+            // `MAX_DIRS` directories, and folding all of those into the cache
+            // would make every later `loader()` clone a map sized by the search
+            // rather than by what's on screen.
+            let hits = cx
+                .background_executor()
+                .spawn(async move { loader.search(&roots, &query) })
+                .await;
+            let _ = app.update(cx, |app, cx| {
+                if app.file_tree.search.accept(generation, hits) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The hits of the last accepted walk, as flat rows. Until one lands this
+    /// is empty (or, mid-retype, the previous query's — better than blanking
+    /// the list for every keystroke).
+    fn search_rows(&self) -> Vec<TreeRow> {
+        self.search
+            .hits
+            .iter()
+            .map(|e| TreeRow {
+                entry: e.clone(),
+                // Flat: a match's own indentation would be meaningless without
+                // its ancestors on screen.
+                depth: 0,
+                is_root: false,
+                expanded: false,
+            })
+            .collect()
     }
 
     /// Flatten `roots` + `expanded` directories into display order (both come
@@ -372,6 +593,17 @@ impl FileTreeState {
     /// Drop cached listings after a filesystem change under `dir`.
     fn invalidate_dir(&mut self, dir: &Path) {
         self.children.remove(dir);
+        self.loads.invalidate(dir);
+    }
+
+    /// Drop every listing and every compiled matcher — for the changes no
+    /// smaller invalidation covers: a `.gitignore` edit (its patterns reach any
+    /// depth below it) or a new root set.
+    fn invalidate_all(&mut self) {
+        self.children.clear();
+        self.gitignore.clear();
+        self.loads.invalidate_all();
+        self.search.restart();
     }
 }
 
@@ -438,22 +670,29 @@ impl Tty7App {
         let Some(code) = self.tab_code_mut_or_init() else {
             return;
         };
+        // Dropping the caches is only correct work when the root set actually
+        // moved, and doing it unconditionally would spin: render calls this
+        // whenever the roots are empty, so a tab that can't produce any (no
+        // panes, no `HOME`) would clear the caches and re-notify every frame.
         if roots != code.roots {
             code.roots = roots;
+            // Refresh listings but keep expansion state; the caches are shared
+            // (path-keyed), so a stale entry only costs a relist.
+            self.file_tree.invalidate_all();
+            cx.notify();
         }
-        // Refresh listings but keep expansion state; the caches are shared
-        // (path-keyed), so a stale entry only costs a relist.
-        self.file_tree.children.clear();
-        self.file_tree.gitignore.clear();
-        // One watcher over every tab's roots.
+        // One watcher over every tab's roots — which can move while this tab's
+        // stay put (closing a tab takes its roots out of the union), so this
+        // compares the union itself rather than riding on the check above.
         let union: HashSet<PathBuf> = self
             .tabs
             .iter()
             .filter_map(|t| t.code.as_deref())
             .flat_map(|c| c.roots.iter().cloned())
             .collect();
-        self.file_tree.rebuild_watcher(&union);
-        cx.notify();
+        if union != self.file_tree.watched {
+            self.file_tree.rebuild_watcher(&union);
+        }
     }
 
     /// Watcher callback (debounced): drop affected listing caches so the next
@@ -470,8 +709,7 @@ impl Tty7App {
             .iter()
             .any(|p| p.file_name().is_some_and(|n| n == ".gitignore"));
         if gitignore_touched {
-            self.file_tree.gitignore.clear();
-            self.file_tree.children.clear();
+            self.file_tree.invalidate_all();
         } else {
             for p in paths {
                 if let Some(parent) = p.parent() {
@@ -481,6 +719,17 @@ impl Tty7App {
                 // listing if cached.
                 self.file_tree.invalidate_dir(p);
             }
+            // Deliberately *not* restarting the search here. Its results are
+            // their own walk rather than a view over the listings just dropped,
+            // so they do go stale — but restarting on every event batch starves
+            // the walk outright: this callback fires roughly every
+            // `REFRESH_DEBOUNCE`, and a restart bumps the generation that the
+            // walk re-checks after waiting `SEARCH_DEBOUNCE`, so under any
+            // sustained churn (a build writing into `target/`, which the
+            // watcher reports because it knows nothing about gitignore) every
+            // walk bows out before it ever reads a directory and the list stays
+            // empty forever. A snapshot that's a few seconds old until the next
+            // keystroke is the better failure.
         }
         cx.notify();
     }
@@ -862,11 +1111,14 @@ impl Tty7App {
             None => (Vec::new(), std::collections::HashSet::new()),
         };
         let query = self.file_search.read(cx).value().trim().to_lowercase();
+        // Both branches only read caches; whatever is missing is queued for the
+        // background executor and shows up on the paint after it lands.
+        self.file_tree.sync_search(&query, &roots, cx);
         let rows = if query.is_empty() {
-            self.file_tree.ensure_loaded(&roots, &expanded);
+            self.file_tree.request_loads(&roots, &expanded, cx);
             self.file_tree.visible_rows(&roots, &expanded)
         } else {
-            self.file_tree.search_rows(&roots, &query)
+            self.file_tree.search_rows()
         };
         v_flex()
             .id("right-panel-tree-rows")
@@ -1208,6 +1460,111 @@ mod tests {
         std::fs::create_dir_all(tmp.join("repo/.git")).unwrap();
         assert_eq!(repo_root_for(&nested), Some(tmp.join("repo")));
         assert_eq!(repo_root_for(&tmp), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // A load that a watcher event overtook must not install its answer: the
+    // listing it read predates the change that invalidated it.
+    #[test]
+    fn a_load_invalidated_mid_flight_drops_its_answer() {
+        let dir = PathBuf::from("/x/src");
+        let mut loads = Loads::default();
+        assert!(loads.begin(&dir), "first request spawns");
+        assert!(!loads.begin(&dir), "a repaint must not spawn a second load");
+        loads.invalidate(&dir);
+        assert!(!loads.finish(&dir), "the stale answer is thrown away");
+        assert!(loads.begin(&dir), "and the next paint may ask again");
+        assert!(loads.finish(&dir), "an untouched load installs its answer");
+    }
+
+    // Invalidating a directory with nothing in flight must not poison the load
+    // that comes after it — that would drop every answer following any event.
+    #[test]
+    fn invalidating_an_idle_directory_does_not_stale_the_next_load() {
+        let dir = PathBuf::from("/x/src");
+        let mut loads = Loads::default();
+        loads.invalidate(&dir);
+        assert!(loads.begin(&dir));
+        assert!(loads.finish(&dir));
+    }
+
+    #[test]
+    fn search_retarget_spawns_once_per_query_and_older_walks_lose() {
+        let mut search = SearchState::default();
+        let first = search.retarget("fo", false).expect("a new query walks");
+        assert!(
+            search.retarget("fo", false).is_none(),
+            "a repaint mid-walk must not queue a second one"
+        );
+        let second = search
+            .retarget("foo", false)
+            .expect("a changed query walks");
+        assert_ne!(first, second);
+
+        assert!(
+            !search.accept(first, vec![entry("stale.rs", false)]),
+            "the overtaken walk's hits are dropped"
+        );
+        assert!(search.accept(second, vec![entry("foo.rs", false)]));
+        assert_eq!(search.hits.len(), 1);
+
+        // The eye toggle filters hits inside the walk, so flipping it re-walks
+        // the query that's already on screen.
+        let third = search
+            .retarget("foo", true)
+            .expect("showing dotfiles re-walks");
+        assert_ne!(second, third);
+        assert!(search.retarget("foo", true).is_none());
+
+        // Clearing the box drops the hits so the next query can't flash them,
+        // and a restart re-walks the same query rather than sitting on it.
+        assert!(search.retarget("", true).is_none());
+        assert!(search.hits.is_empty());
+        search.retarget("foo", true).expect("typing again walks");
+        search.restart();
+        assert!(search.retarget("foo", true).is_some(), "restart re-walks");
+    }
+
+    // The gitignore chain moved onto the background loader with the matchers
+    // behind `Arc`; the semantics it has to keep are deepest-match-wins,
+    // whitelist un-ignore, and `.git` ignored whatever the patterns say.
+    #[test]
+    fn loader_tags_ignored_entries_down_the_gitignore_chain() {
+        let tmp = std::env::temp_dir().join(format!("tty7-tree-ignore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join(".git")).unwrap();
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join(".gitignore"), "*.log\nbuild/\n").unwrap();
+        // The deeper file un-ignores one of the parent's patterns.
+        std::fs::write(tmp.join("src/.gitignore"), "!keep.log\n").unwrap();
+        std::fs::write(tmp.join("drop.log"), "").unwrap();
+        std::fs::write(tmp.join("src/keep.log"), "").unwrap();
+        std::fs::write(tmp.join("src/main.rs"), "").unwrap();
+
+        let mut loader = TreeLoader {
+            gitignore: HashMap::new(),
+            show_hidden: false,
+        };
+        let ignored = |entries: &[TreeEntry], name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+                .ignored
+        };
+        let top = loader.list_dir(&tmp, &tmp);
+        assert!(ignored(&top, "drop.log"));
+        assert!(ignored(&top, ".git"));
+        assert!(!ignored(&top, "src"));
+        let nested = loader.list_dir(&tmp.join("src"), &tmp);
+        assert!(!ignored(&nested, "keep.log"), "whitelist un-ignores");
+        assert!(!ignored(&nested, "main.rs"));
+        // The matchers it compiled ride back to the UI thread's cache.
+        assert_eq!(loader.gitignore.len(), 2);
+
+        let hits = loader.search(std::slice::from_ref(&tmp), "log");
+        let names: Vec<&str> = hits.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["keep.log"], "ignored hits stay out of search");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
