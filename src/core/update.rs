@@ -14,7 +14,7 @@ use tty7_core::daemon::install::AssetFetcher as _;
 use crate::core::config::{Config, UpdateChannel};
 use crate::ui::i18n::{L10nKey, t, t_fmt};
 
-const REPO: &str = "l0ng-ai/tty7";
+const REPO: &str = "ayamir/tty7";
 
 /// The rolling prerelease the Nightly channel follows. Force-moved to a new
 /// commit every night, which is exactly why it cannot double as a version.
@@ -24,13 +24,13 @@ const NIGHTLY_TAG: &str = "nightly";
 /// inferred. See `resolve_version`.
 const NIGHTLY_MANIFEST: &str = "nightly.json";
 
-pub const RELEASES_URL: &str = "https://github.com/l0ng-ai/tty7/releases/latest";
+pub const RELEASES_URL: &str = "https://github.com/ayamir/tty7/releases/latest";
 
 /// The nightly release's own page. Unlike Stable's, this URL is stable across
 /// nights — the tag stays put even as the commit under it moves. Spelled out
 /// rather than built from `NIGHTLY_TAG`, which `concat!` cannot take; the tail
 /// is asserted against it in `each_channel_reads_its_own_feed` instead.
-pub const NIGHTLY_RELEASE_URL: &str = "https://github.com/l0ng-ai/tty7/releases/tag/nightly";
+pub const NIGHTLY_RELEASE_URL: &str = "https://github.com/ayamir/tty7/releases/tag/nightly";
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -2284,18 +2284,32 @@ fn prepare_macos_update(
     let dir = staging.path().to_path_buf();
     let archive = write_staged_asset(&dir, asset_name, archive)?;
     let checksums = write_staged_asset(&dir, "checksums.txt", checksums)?;
-    run_updater(
-        &updater,
-        [
-            PathBuf::from("verify"),
-            current.clone(),
-            archive.clone(),
-            checksums.clone(),
-            PathBuf::from(asset_name),
-            dir.clone(),
-            PathBuf::from(version),
-        ],
-    )?;
+    let verify_args = vec![
+        PathBuf::from("verify"),
+        current.clone(),
+        archive.clone(),
+        checksums.clone(),
+        PathBuf::from(asset_name),
+        dir.clone(),
+        PathBuf::from(version),
+    ];
+    if let Err(error) = run_updater(&updater, verify_args.clone()) {
+        // 26.8.x shipped an updater that read codesign's designated
+        // requirement from stderr, although macOS writes it to stdout. The
+        // old helper has already checked the archive digest and extracted the
+        // new bundle by the time this specific error is returned. Retry with
+        // the helper from that verified bundle so users can cross the release
+        // that contains the fix without downloading it manually.
+        if !is_legacy_macos_requirement_error(&error) {
+            return Err(error);
+        }
+        let staged_updater = dir.join("unpacked/tty7.app/Contents/MacOS/tty7-updater");
+        if !staged_updater.is_file() {
+            return Err(error);
+        }
+        run_updater(&staged_updater, verify_args)
+            .context("retrying macOS update verification with the staged updater")?;
+    }
     let log =
         crate::core::config::config_path("update.log").unwrap_or_else(|| dir.join("update.log"));
     if let Some(parent) = log.parent() {
@@ -2319,6 +2333,13 @@ fn prepare_macos_update(
         needs_elevation: false,
         expected_sha256: None,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn is_legacy_macos_requirement_error(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .contains("codesign did not report a designated requirement")
 }
 
 /// Stages a downloaded AppImage beside the installed one and has the bundled
@@ -2900,6 +2921,17 @@ mod tests {
             name: name.to_string(),
             browser_download_url: format!("https://example.test/{name}"),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retries_an_old_macos_updater_only_for_the_known_requirement_stream_bug() {
+        assert!(is_legacy_macos_requirement_error(&anyhow::anyhow!(
+            "tty7-updater verification failed: codesign did not report a designated requirement"
+        )));
+        assert!(!is_legacy_macos_requirement_error(&anyhow::anyhow!(
+            "tty7-updater verification failed: failed sha256 verification"
+        )));
     }
 
     #[test]
