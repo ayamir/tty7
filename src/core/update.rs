@@ -2307,7 +2307,15 @@ fn prepare_macos_update(
         if !staged_updater.is_file() {
             return Err(error);
         }
-        run_updater(&staged_updater, verify_args)
+        // The legacy helper may have created `dir/unpacked` before it found
+        // the stream-format error. Give the retry a fresh stage so the fixed
+        // helper can extract the archive instead of failing with EEXIST.
+        let retry_stage = dir.join("retry");
+        std::fs::create_dir(&retry_stage)
+            .context("creating the macOS updater retry staging directory")?;
+        let mut retry_args = verify_args;
+        retry_args[5] = retry_stage;
+        run_updater(&staged_updater, retry_args)
             .context("retrying macOS update verification with the staged updater")?;
     }
     let log =
