@@ -296,7 +296,13 @@ mod macos {
         [stdout, stderr]
             .into_iter()
             .flat_map(str::lines)
-            .find_map(|line| line.strip_prefix("designated => ").map(str::to_string))
+            .find_map(|line| {
+                line.trim_start()
+                    .strip_prefix("# ")
+                    .unwrap_or_else(|| line.trim_start())
+                    .strip_prefix("designated => ")
+                    .map(str::to_string)
+            })
     }
 
     fn signing_requirement(app: &Path) -> Result<String, String> {
@@ -527,6 +533,20 @@ mod macos {
 
             assert_eq!(designated_requirement(line, "Executable=/x"), want);
             assert_eq!(designated_requirement("Executable=/x", line), want);
+            assert_eq!(
+                designated_requirement(
+                    "# designated => identifier \"com.example.app\" and anchor apple",
+                    ""
+                ),
+                want
+            );
+            assert_eq!(
+                designated_requirement(
+                    "Executable=/x",
+                    "# designated => identifier \"com.example.app\" and anchor apple"
+                ),
+                want
+            );
             assert_eq!(designated_requirement("Executable=/x", ""), None);
             assert_eq!(designated_requirement("", ""), None);
         }
