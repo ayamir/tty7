@@ -23,12 +23,16 @@ pub enum CLIAgent {
     Qwen,
     OhMyPi,
     Kimi,
+    // Keep new variants at the end: daemon messages serialize this enum and
+    // moving an existing discriminant would break mixed-version clients.
+    TraeCode,
 }
 
 impl CLIAgent {
-    pub const ALL: [CLIAgent; 19] = [
+    pub const ALL: [CLIAgent; 20] = [
         CLIAgent::Claude,
         CLIAgent::Codex,
+        CLIAgent::TraeCode,
         CLIAgent::Gemini,
         CLIAgent::Aider,
         CLIAgent::Amp,
@@ -52,6 +56,7 @@ impl CLIAgent {
         match self {
             CLIAgent::Claude => &["claude", "claude-code"],
             CLIAgent::Codex => &["codex", "codex-cli"],
+            CLIAgent::TraeCode => &["traecli", "traex"],
             CLIAgent::Gemini => &["gemini", "gemini-cli"],
             CLIAgent::Aider => &["aider", "aider-chat"],
             CLIAgent::Amp => &["amp"],
@@ -85,6 +90,7 @@ impl CLIAgent {
         match self {
             CLIAgent::Claude => "claude",
             CLIAgent::Codex => "codex",
+            CLIAgent::TraeCode => "traecli",
             CLIAgent::Gemini => "gemini",
             CLIAgent::Aider => "aider",
             CLIAgent::Amp => "amp",
@@ -114,6 +120,7 @@ impl CLIAgent {
         match self {
             CLIAgent::Claude => "Claude Code",
             CLIAgent::Codex => "Codex",
+            CLIAgent::TraeCode => "TraeCode",
             CLIAgent::Gemini => "Gemini",
             CLIAgent::Aider => "Aider",
             CLIAgent::Amp => "Amp",
@@ -146,6 +153,7 @@ impl CLIAgent {
         match self {
             CLIAgent::Claude => Some(format!("claude{flags} --resume {session_id}")),
             CLIAgent::Codex => Some(format!("codex resume {session_id}{flags}")),
+            CLIAgent::TraeCode => Some(format!("traecli resume {session_id}{flags}")),
             CLIAgent::Gemini => Some(format!("gemini{flags} --resume {session_id}")),
             CLIAgent::OpenCode => Some(format!("opencode{flags} --session {session_id}")),
             CLIAgent::Amp => Some(format!("amp threads continue {session_id}{flags}")),
@@ -189,6 +197,7 @@ impl CLIAgent {
         let flags = self.session_command_flags(session_id, launch_argv)?;
         match self {
             CLIAgent::Codex => Some(format!("codex fork {session_id}{flags}")),
+            CLIAgent::TraeCode => Some(format!("traecli fork {session_id}{flags}")),
             CLIAgent::Claude => Some(format!(
                 "claude{flags} --resume {session_id} --fork-session"
             )),
@@ -213,6 +222,7 @@ impl CLIAgent {
         match self {
             CLIAgent::Claude
             | CLIAgent::Codex
+            | CLIAgent::TraeCode
             | CLIAgent::Grok
             | CLIAgent::OpenCode
             | CLIAgent::OhMyPi
@@ -260,7 +270,9 @@ impl CLIAgent {
         let named = argv.iter().position(|t| names_self(t))?;
         let mut tail: Vec<&str> = argv[named + 1..].iter().map(String::as_str).collect();
 
-        if self == CLIAgent::Codex && matches!(tail.first(), Some(&"resume") | Some(&"fork")) {
+        if matches!(self, CLIAgent::Codex | CLIAgent::TraeCode)
+            && matches!(tail.first(), Some(&"resume") | Some(&"fork"))
+        {
             tail.remove(0);
             if tail.first().is_some_and(|t| !t.starts_with('-')) {
                 tail.remove(0);
@@ -339,6 +351,7 @@ impl CLIAgent {
             CLIAgent::Antigravity => &["--conversation", "--continue", "-c"],
             CLIAgent::OpenCode => &["--session", "-s", "--continue", "-c", "--fork"],
             CLIAgent::Codex => &["--last"],
+            CLIAgent::TraeCode => &["--last", "--resume", "--session-id"],
             CLIAgent::Pi => &[
                 "--session",
                 "--session-id",
@@ -422,6 +435,9 @@ impl CLIAgent {
         match self {
             CLIAgent::Claude => 0xD97757,
             CLIAgent::Codex => 0x000000,
+            // The brand mark carries its own green foreground on a black
+            // field, so the surrounding tab avatar needs to stay black too.
+            CLIAgent::TraeCode => 0x000000,
             CLIAgent::Gemini => 0x4285F4,
             CLIAgent::Aider => 0x14B014,
             CLIAgent::Amp => 0xF34E3F,
@@ -448,6 +464,7 @@ impl CLIAgent {
         match self {
             CLIAgent::Claude => "icons/agents/claude.svg",
             CLIAgent::Codex => "icons/agents/codex.svg",
+            CLIAgent::TraeCode => "icons/agents/traecli.svg",
             CLIAgent::Gemini => "icons/agents/gemini.svg",
             CLIAgent::Amp => "icons/agents/amp.svg",
             CLIAgent::OpenCode => "icons/agents/opencode.svg",
@@ -770,6 +787,14 @@ mod tests {
         assert_eq!(
             CLIAgent::detect_from_argv(&argv(&["/opt/homebrew/bin/codex", "--model", "o3"])),
             Some(CLIAgent::Codex)
+        );
+        assert_eq!(
+            CLIAgent::detect_from_argv(&argv(&["/Users/me/.local/bin/traecli"])),
+            Some(CLIAgent::TraeCode)
+        );
+        assert_eq!(
+            CLIAgent::detect_from_argv(&argv(&["traex"])),
+            Some(CLIAgent::TraeCode)
         );
         assert_eq!(
             CLIAgent::detect_from_argv(&argv(&["/usr/local/bin/gemini"])),
@@ -1193,6 +1218,12 @@ mod tests {
             Some("codex resume th_read.9")
         );
         assert_eq!(
+            CLIAgent::TraeCode
+                .resume_command("019c-123", None)
+                .as_deref(),
+            Some("traecli resume 019c-123")
+        );
+        assert_eq!(
             CLIAgent::Pi
                 .resume_command("0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17", None)
                 .as_deref(),
@@ -1521,6 +1552,10 @@ mod tests {
         assert_eq!(
             CLIAgent::Codex.fork_command("abc-123", None).as_deref(),
             Some("codex fork abc-123")
+        );
+        assert_eq!(
+            CLIAgent::TraeCode.fork_command("019c-123", None).as_deref(),
+            Some("traecli fork 019c-123")
         );
         assert_eq!(
             CLIAgent::Claude.fork_command("abc-123", None).as_deref(),

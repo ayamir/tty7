@@ -1301,7 +1301,14 @@ impl Tty7App {
                         gpui::svg()
                             .path(agent.icon_path())
                             .size(px(size * 0.54))
-                            .text_color(gpui::white()),
+                            // SVG assets are rendered as a single-colour mask.
+                            // TraeCode's black field comes from the avatar, and
+                            // its brand mark uses the official green.
+                            .text_color(if agent == crate::core::cli_agent::CLIAgent::TraeCode {
+                                gpui::rgb(0x32F08C)
+                            } else {
+                                gpui::rgb(0xFFFFFF)
+                            }),
                     )
                     .when_some(dot, |b, dot| b.child(dot))
                     .tooltip(move |window, cx| {

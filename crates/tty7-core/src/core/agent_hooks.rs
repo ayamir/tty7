@@ -246,6 +246,7 @@ fn ancestor_pids(procs: &[crate::daemon::winproc::Proc]) -> Vec<u32> {
 pub enum HookAgent {
     Claude,
     Codex,
+    TraeCode,
     Copilot,
     OpenCode,
     Pi,
@@ -259,9 +260,10 @@ pub enum HookAgent {
 }
 
 impl HookAgent {
-    pub const ALL: [HookAgent; 12] = [
+    pub const ALL: [HookAgent; 13] = [
         HookAgent::Claude,
         HookAgent::Codex,
+        HookAgent::TraeCode,
         HookAgent::Copilot,
         HookAgent::OpenCode,
         HookAgent::Pi,
@@ -283,6 +285,7 @@ impl HookAgent {
         match agent {
             CLIAgent::Claude => Some(HookAgent::Claude),
             CLIAgent::Codex => Some(HookAgent::Codex),
+            CLIAgent::TraeCode => Some(HookAgent::TraeCode),
             CLIAgent::Copilot => Some(HookAgent::Copilot),
             CLIAgent::OpenCode => Some(HookAgent::OpenCode),
             CLIAgent::Pi => Some(HookAgent::Pi),
@@ -310,6 +313,7 @@ impl HookAgent {
         match self {
             HookAgent::Claude => Some(CLAUDE_HOOK_EVENTS),
             HookAgent::Codex => Some(CODEX_HOOK_EVENTS),
+            HookAgent::TraeCode => Some(TRAE_CODE_HOOK_EVENTS),
             HookAgent::Gemini => Some(GEMINI_HOOK_EVENTS),
             HookAgent::Droid => Some(DROID_HOOK_EVENTS),
             HookAgent::Qwen => Some(QWEN_HOOK_EVENTS),
@@ -337,6 +341,7 @@ impl HookAgent {
         match self {
             HookAgent::Claude => "claude",
             HookAgent::Codex => "codex",
+            HookAgent::TraeCode => "traecli",
             HookAgent::Copilot => "copilot",
             HookAgent::OpenCode => "opencode",
             HookAgent::Pi => "pi",
@@ -354,6 +359,7 @@ impl HookAgent {
         match self {
             HookAgent::Claude => "Claude Code",
             HookAgent::Codex => "Codex",
+            HookAgent::TraeCode => "TraeCode",
             HookAgent::Copilot => "Copilot CLI",
             HookAgent::OpenCode => "OpenCode",
             HookAgent::Pi => "Pi",
@@ -375,6 +381,7 @@ impl HookAgent {
         match self {
             HookAgent::Claude => target.claude_settings_path(),
             HookAgent::Codex => target.under_home(&[".codex", "hooks.json"]),
+            HookAgent::TraeCode => target.traecli_hooks_path(),
             HookAgent::Copilot => target.under_home(&[".copilot", "hooks", OWNED_FILE_STEM_JSON]),
             HookAgent::OpenCode => target.under(
                 &target.xdg_config_dir(),
@@ -485,6 +492,18 @@ impl<'a> HookTarget<'a> {
             return PathBuf::from(dir).join("config.toml");
         }
         self.under_home(&[".kimi-code", "config.toml"])
+    }
+
+    fn traecli_hooks_path(&self) -> PathBuf {
+        if self.is_local() {
+            if let Some(dir) = std::env::var_os("TRAECLI_HOME").filter(|d| !d.is_empty()) {
+                return PathBuf::from(dir).join("hooks.json");
+            }
+            if let Some(dir) = std::env::var_os("TRAE_HOME").filter(|d| !d.is_empty()) {
+                return PathBuf::from(dir).join("cli").join("hooks.json");
+            }
+        }
+        self.under_home(&[".trae", "cli", "hooks.json"])
     }
 
     fn hook_command(&self, agent: HookAgent, event: &str) -> String {
@@ -695,6 +714,15 @@ const CODEX_HOOK_EVENTS: &[(&str, &str)] = &[
     ("SessionStart", "session-start"),
     ("UserPromptSubmit", "prompt-submit"),
     ("Stop", "stop"),
+];
+
+const TRAE_CODE_HOOK_EVENTS: &[(&str, &str)] = &[
+    ("SessionStart", "session-start"),
+    ("UserPromptSubmit", "prompt-submit"),
+    ("PermissionRequest", "permission-request"),
+    ("PostToolUse", "tool-complete"),
+    ("Stop", "stop"),
+    ("SessionEnd", "session-end"),
 ];
 
 /// Gemini names the turn boundaries after the agent rather than the user, and
@@ -1106,6 +1134,7 @@ fn owned_file_content(target: &HookTarget, agent: HookAgent) -> Option<String> {
         HookAgent::Goose => goose_hooks_json(target),
         HookAgent::Claude
         | HookAgent::Codex
+        | HookAgent::TraeCode
         | HookAgent::Gemini
         | HookAgent::Droid
         | HookAgent::Qwen
@@ -1538,6 +1567,7 @@ mod tests {
         let mut events: Vec<&str> = CLAUDE_HOOK_EVENTS
             .iter()
             .chain(CODEX_HOOK_EVENTS)
+            .chain(TRAE_CODE_HOOK_EVENTS)
             .chain(GEMINI_HOOK_EVENTS)
             .chain(DROID_HOOK_EVENTS)
             .chain(QWEN_HOOK_EVENTS)
@@ -1571,6 +1601,7 @@ mod tests {
             (HookAgent::Gemini, "/home/me/.gemini/settings.json"),
             (HookAgent::Droid, "/home/me/.factory/settings.json"),
             (HookAgent::Qwen, "/home/me/.qwen/settings.json"),
+            (HookAgent::TraeCode, "/home/me/.trae/cli/hooks.json"),
             (
                 HookAgent::Goose,
                 "/home/me/.agents/plugins/tty7/hooks/hooks.json",
@@ -1862,6 +1893,7 @@ mod tests {
         for (agent, expected) in [
             (HookAgent::Claude, "/home/me/.claude/settings.json"),
             (HookAgent::Codex, "/home/me/.codex/hooks.json"),
+            (HookAgent::TraeCode, "/home/me/.trae/cli/hooks.json"),
             (HookAgent::Copilot, "/home/me/.copilot/hooks/tty7.json"),
             (
                 HookAgent::OpenCode,
