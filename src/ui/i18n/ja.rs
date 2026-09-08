@@ -747,6 +747,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         }
         L10nKey::SettingsAgentClaudeCode => "Claude Code",
         L10nKey::SettingsAgentCodex => "Codex",
+        L10nKey::SettingsAgentTraeCode => "TraeCode",
         L10nKey::SettingsAgentCopilotCli => "Copilot CLI",
         L10nKey::SettingsAgentOpencode => "OpenCode",
         L10nKey::SettingsAgentPi => "Pi",
@@ -786,6 +787,9 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         }
         L10nKey::SettingsSearchCodexKeywords => {
             "エージェント 統合 フック インストール openai codex agent integration hooks install"
+        }
+        L10nKey::SettingsSearchTraeCodeKeywords => {
+            "エージェント 統合 フック インストール trae code traecli traex agent integration hooks install"
         }
         L10nKey::SettingsSearchCommandLineToolKeywords => {
             "cli tty7 パス シェル コマンド インストール シンボリックリンク ターミナル iterm エージェント スクリプト command line tool"

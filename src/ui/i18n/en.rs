@@ -738,6 +738,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsAgentClaudeCode => "Claude Code",
         L10nKey::SettingsAgentCodex => "Codex",
+        L10nKey::SettingsAgentTraeCode => "TraeCode",
         L10nKey::SettingsAgentCopilotCli => "Copilot CLI",
         L10nKey::SettingsAgentOpencode => "OpenCode",
         L10nKey::SettingsAgentPi => "Pi",
@@ -768,6 +769,9 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "agent integration hooks install uninstall status rich session working waiting tab bar sidebar badge claude"
         }
         L10nKey::SettingsSearchCodexKeywords => "agent integration hooks install openai codex",
+        L10nKey::SettingsSearchTraeCodeKeywords => {
+            "agent integration hooks install trae code traecli traex"
+        }
         L10nKey::SettingsSearchCommandLineToolKeywords => {
             "command line tool cli tty7 path shell command install symlink terminal iterm agent script"
         }

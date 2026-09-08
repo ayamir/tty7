@@ -656,6 +656,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsAppHttpProxyInvalid => "不是有效的代理地址，该值未保存。",
         L10nKey::SettingsAgentClaudeCode => "Claude Code",
         L10nKey::SettingsAgentCodex => "Codex",
+        L10nKey::SettingsAgentTraeCode => "TraeCode",
         L10nKey::SettingsAgentCopilotCli => "Copilot CLI",
         L10nKey::SettingsAgentOpencode => "OpenCode",
         L10nKey::SettingsAgentPi => "Pi",
@@ -693,6 +694,9 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         }
         L10nKey::SettingsSearchCodexKeywords => {
             "Codex agent 集成 hook 安装 OpenAI codex agent integration hooks install"
+        }
+        L10nKey::SettingsSearchTraeCodeKeywords => {
+            "TraeCode traecli traex agent 集成 hook 安装 agent integration hooks install"
         }
         L10nKey::SettingsSearchCommandLineToolKeywords => {
             "命令行工具 cli tty7 路径 shell 命令 安装 符号链接 terminal command line tool"

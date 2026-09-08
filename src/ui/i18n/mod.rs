@@ -570,6 +570,7 @@ l10n_keys! {
     SettingsAppHttpProxyInvalid,
     SettingsAgentClaudeCode,
     SettingsAgentCodex,
+    SettingsAgentTraeCode,
     SettingsAgentCopilotCli,
     SettingsAgentOpencode,
     SettingsAgentPi,
@@ -593,6 +594,7 @@ l10n_keys! {
     SettingsSearchBoldFontKeywords,
     SettingsSearchClaudeCodeKeywords,
     SettingsSearchCodexKeywords,
+    SettingsSearchTraeCodeKeywords,
     SettingsSearchCommandLineToolKeywords,
     SettingsSearchCommandLineToolTitle,
     SettingsSearchCopilotCliKeywords,
@@ -1532,6 +1534,7 @@ mod tests {
             // Product names.
             L10nKey::SettingsAgentClaudeCode,
             L10nKey::SettingsAgentCodex,
+            L10nKey::SettingsAgentTraeCode,
             L10nKey::SettingsAgentCopilotCli,
             L10nKey::SettingsAgentDroid,
             L10nKey::SettingsAgentGemini,

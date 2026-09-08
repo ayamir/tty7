@@ -603,6 +603,11 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: Agents,
+            title: SettingsAgentTraeCode,
+            keywords: SettingsSearchTraeCodeKeywords,
+        },
+        SearchEntry {
+            section: Agents,
             title: SettingsAgentCopilotCli,
             keywords: SettingsSearchCopilotCliKeywords,
         },
