@@ -563,6 +563,15 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::KeybindForkSessionDown => "向下 Fork 会话",
         L10nKey::KeybindForkSessionUp => "向上 Fork 会话",
         L10nKey::SettingsAboutDesc1 => "终端工作台：常驻会话、远程工作、agent。",
+        L10nKey::SettingsDefaultTerminal => "默认终端",
+        L10nKey::SettingsDefaultTerminalDesc => {
+            "将 tty7 设为 Unix 可执行文件、SSH 链接和 man 页面链接的 macOS 默认终端。tty7 仍可打开文件夹和脚本，但不会替换 Finder 的文件夹处理程序。自行指定终端的应用可能不会遵循此设置。"
+        }
+        L10nKey::SettingsDefaultTerminalSet => "设为默认终端",
+        L10nKey::SettingsDefaultTerminalSetSuccess => {
+            "tty7 已成为受支持终端文件和链接的默认处理程序。"
+        }
+        L10nKey::SettingsDefaultTerminalSetFailed => "无法将 tty7 设为默认终端：{error}",
         L10nKey::SettingsVersion => "版本",
         L10nKey::SettingsUpdates => "更新",
         L10nKey::SettingsUpdateAndRelaunch => "更新并重新启动",

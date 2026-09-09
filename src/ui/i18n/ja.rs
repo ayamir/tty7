@@ -642,6 +642,17 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsAboutDesc1 => {
             "ターミナルワークベンチ: 常駐セッション、リモート作業、エージェント"
         }
+        L10nKey::SettingsDefaultTerminal => "デフォルトのターミナル",
+        L10nKey::SettingsDefaultTerminalDesc => {
+            "tty7 を Unix 実行ファイル、SSH リンク、man ページリンク用の macOS のデフォルトターミナルにします。tty7 はフォルダとスクリプトも開けますが、Finder のフォルダハンドラは置き換えません。独自のターミナルを指定するアプリはこの設定を無視することがあります。"
+        }
+        L10nKey::SettingsDefaultTerminalSet => "デフォルトのターミナルに設定",
+        L10nKey::SettingsDefaultTerminalSetSuccess => {
+            "tty7 を対応するターミナルファイルとリンクのデフォルトハンドラに設定しました。"
+        }
+        L10nKey::SettingsDefaultTerminalSetFailed => {
+            "tty7 をデフォルトのターミナルに設定できませんでした: {error}"
+        }
         L10nKey::SettingsVersion => "バージョン",
         L10nKey::SettingsUpdates => "アップデート",
         L10nKey::SettingsUpdateAndRelaunch => "更新して再起動",

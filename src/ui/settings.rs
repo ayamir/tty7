@@ -7033,6 +7033,40 @@ impl Tty7App {
                     .text_color(muted_fg)
                     .child(t(L10nKey::SettingsAboutDesc1)),
             )
+            .when(cfg!(target_os = "macos"), |this| {
+                this.child(self.section_rule(cx)).child(
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(foreground)
+                                .child(t(L10nKey::SettingsDefaultTerminal)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .child(t(L10nKey::SettingsDefaultTerminalDesc)),
+                        )
+                        .child(
+                            Button::new("set-default-terminal")
+                                .label(t(L10nKey::SettingsDefaultTerminalSet))
+                                .small()
+                                .on_click(cx.listener(|_, _, window, cx| {
+                                    let message = match crate::core::default_terminal::set_as_default_terminal() {
+                                        Ok(()) => t(L10nKey::SettingsDefaultTerminalSetSuccess).to_string(),
+                                        Err(error) => t_fmt(
+                                            L10nKey::SettingsDefaultTerminalSetFailed,
+                                            &[("error", &error)],
+                                        ),
+                                    };
+                                    window.push_notification(message, cx);
+                                })),
+                        ),
+                )
+            })
             .child(self.section_rule(cx))
             .child(self.section_header(t(L10nKey::SettingsUpdates), cx))
             .child(

@@ -635,6 +635,17 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsAboutDesc1 => {
             "A terminal workbench: persistent sessions, remote work, agents."
         }
+        L10nKey::SettingsDefaultTerminal => "Default terminal",
+        L10nKey::SettingsDefaultTerminalDesc => {
+            "Make tty7 the macOS default terminal for Unix executables, SSH links, and man-page links. tty7 can also open folders and scripts, but does not replace Finder's folder handler. Apps that choose their own terminal may ignore this setting."
+        }
+        L10nKey::SettingsDefaultTerminalSet => "Set as Default Terminal",
+        L10nKey::SettingsDefaultTerminalSetSuccess => {
+            "tty7 is now the default handler for supported terminal files and links."
+        }
+        L10nKey::SettingsDefaultTerminalSetFailed => {
+            "Could not set tty7 as the default terminal: {error}"
+        }
         L10nKey::SettingsVersion => "Version",
         L10nKey::SettingsUpdates => "Updates",
         L10nKey::SettingsUpdateAndRelaunch => "Update and relaunch",

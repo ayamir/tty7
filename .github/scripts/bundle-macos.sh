@@ -72,6 +72,39 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
+    <!-- LaunchServices has no global default-terminal setting. These declare
+         the specific document types tty7 can open, and Settings lets users
+         select tty7 as their handler for them. -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key><string>Folder</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key><array><string>public.directory</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>Shell Script</string>
+            <key>CFBundleTypeRole</key><string>Shell</string>
+            <key>LSItemContentTypes</key><array><string>public.shell-script</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>Unix Executable</string>
+            <key>CFBundleTypeRole</key><string>Shell</string>
+            <key>LSItemContentTypes</key><array><string>public.unix-executable</string></array>
+        </dict>
+    </array>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key><string>SSH</string>
+            <key>CFBundleURLSchemes</key><array><string>ssh</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleURLName</key><string>Man Page</string>
+            <key>CFBundleURLSchemes</key><array><string>x-man-page</string></array>
+        </dict>
+    </array>
     <!-- tty7 is a terminal workbench: panes are forked from the bundled
          executable, so macOS attributes a child process's protected-resource
          requests to tty7.app. Without these usage strings a program you run in

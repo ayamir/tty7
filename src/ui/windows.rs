@@ -306,6 +306,59 @@ pub fn open_from_cli(cx: &mut App, path: Option<std::path::PathBuf>) {
     });
 }
 
+/// Runs a local command in the most recently active local workspace, creating
+/// or restoring one with `cwd` if every open window is remote or absent.
+pub fn run_local_command(cx: &mut App, cwd: std::path::PathBuf, command: String) {
+    let workspace = WindowRegistry::most_recent_local(cx);
+    let Some(workspace) = workspace else {
+        // A cold window creates one terminal already. Start it in the requested
+        // directory and write the command there instead of adding a second tab.
+        let restore = restore_target(cx, Some(&cwd));
+        open_at(cx, restore.map(|(id, _)| id), Some(cwd));
+        let Some(workspace) = WindowRegistry::most_recent_local(cx) else {
+            return;
+        };
+        run_command_in_active_terminal(cx, workspace, command);
+        return;
+    };
+    run_local_command_in(cx, workspace, cwd, command);
+}
+
+fn run_command_in_active_terminal(cx: &mut App, workspace: WorkspaceId, command: String) {
+    let Some(handle) = WindowRegistry::window_for(cx, workspace) else {
+        return;
+    };
+    let Some(app) = WindowRegistry::app_for(cx, workspace).and_then(|app| app.upgrade()) else {
+        return;
+    };
+    cx.activate(true);
+    let _ = handle.update(cx, move |_, window, cx| {
+        app.update(cx, |app, cx| {
+            app.run_in_active_terminal(&command, window, cx)
+        });
+        window.activate_window();
+    });
+}
+
+fn run_local_command_in(
+    cx: &mut App,
+    workspace: WorkspaceId,
+    cwd: std::path::PathBuf,
+    command: String,
+) {
+    let Some(handle) = WindowRegistry::window_for(cx, workspace) else {
+        return;
+    };
+    let Some(app) = WindowRegistry::app_for(cx, workspace).and_then(|app| app.upgrade()) else {
+        return;
+    };
+    cx.activate(true);
+    let _ = handle.update(cx, move |_, window, cx| {
+        app.update(cx, |app, cx| app.new_tab_running(cwd, command, window, cx));
+        window.activate_window();
+    });
+}
+
 /// What a launch reopens: the workspace, and how many other open windows the
 /// restore left detached. Their panes are still running — the count exists so
 /// the launch can say so instead of letting them be forgotten (#597).

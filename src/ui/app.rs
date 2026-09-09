@@ -3450,6 +3450,31 @@ impl Tty7App {
         self.new_tab_with_cwd(Some(cwd), None, window, cx);
     }
 
+    /// Opens a new local shell in `cwd`, then types a command only after the
+    /// pane exists. LaunchServices uses this for a script/executable selected
+    /// in Finder and for `x-man-page:` requests.
+    pub(crate) fn new_tab_running(
+        &mut self,
+        cwd: std::path::PathBuf,
+        command: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_tab_with_cwd(Some(cwd), None, window, cx);
+        if let Some(terminal) = self.focused_leaf(window, cx) {
+            terminal.read(cx).run_command_line(&command);
+        }
+    }
+
+    /// Uses the terminal that a newly-created window already opened. This keeps
+    /// a cold LaunchServices request to one tab rather than creating the
+    /// window's default shell and then a second shell for the requested item.
+    pub(crate) fn run_in_active_terminal(&self, command: &str, window: &Window, cx: &App) {
+        if let Some(terminal) = self.focused_leaf(window, cx) {
+            terminal.read(cx).run_command_line(command);
+        }
+    }
+
     pub(crate) fn new_tab_with_shell(
         &mut self,
         shell: Option<ShellSpec>,

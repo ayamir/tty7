@@ -441,6 +441,71 @@ fn set_dock_icon_for_bare_binary() {
     }
 }
 
+/// Delivers Finder document opens and LaunchServices URL opens after gpui has
+/// created the application. The native callback queues requests; UI state is
+/// then changed on gpui's application loop.
+fn handle_external_opens(urls: Vec<String>, cx: &mut App) {
+    use crate::core::default_terminal::{ExternalOpen, parse_open_url};
+
+    for raw in urls {
+        let request = match parse_open_url(&raw) {
+            Ok(request) => request,
+            Err(error) => {
+                log::warn!("ignored external open request {raw:?}: {error}");
+                continue;
+            }
+        };
+        match request {
+            ExternalOpen::Folder(path) => crate::ui::windows::open_from_cli(cx, Some(path)),
+            ExternalOpen::Runnable(path) => {
+                let Some(parent) = path.parent().map(std::path::Path::to_path_buf) else {
+                    log::warn!(
+                        "ignored runnable without a parent directory: {}",
+                        path.display()
+                    );
+                    continue;
+                };
+                let command =
+                    crate::core::shell_quote::quote_for_shell(&path.to_string_lossy(), None);
+                crate::ui::windows::run_local_command(cx, parent, command);
+            }
+            ExternalOpen::Ssh(ssh) => {
+                let workspace = crate::ui::windows::WindowRegistry::most_recent_local(cx)
+                    .or_else(|| crate::ui::windows::WindowRegistry::most_recent(cx))
+                    .or_else(|| {
+                        // `open_at` registers synchronously, so the SSH link
+                        // that launched a cold tty7 is not discarded.
+                        crate::ui::windows::open_at(cx, None, None);
+                        crate::ui::windows::WindowRegistry::most_recent(cx)
+                    });
+                let Some(workspace) = workspace else {
+                    continue;
+                };
+                let Some(handle) = crate::ui::windows::WindowRegistry::window_for(cx, workspace)
+                else {
+                    continue;
+                };
+                let Some(app) = crate::ui::windows::WindowRegistry::app_for(cx, workspace)
+                    .and_then(|app| app.upgrade())
+                else {
+                    continue;
+                };
+                let _ = handle.update(cx, move |_, window, cx| {
+                    app.update(cx, |app, cx| app.quick_connect(ssh, window, cx));
+                    window.activate_window();
+                });
+            }
+            ExternalOpen::ManPage(page) => {
+                let command = format!(
+                    "man {}",
+                    crate::core::shell_quote::quote_for_shell(&page, None)
+                );
+                crate::ui::windows::run_local_command(cx, std::env::temp_dir(), command);
+            }
+        }
+    }
+}
+
 fn main() {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     {
@@ -583,46 +648,61 @@ fn main() {
         log::error!("failed to ensure daemon is running: {e}");
     }
 
-    gpui_platform::application()
+    // `Application`, not the in-loop `App`, owns the native delegate. Register
+    // before `run` so macOS can deliver Finder and URL events from launch.
+    let (external_open_tx, external_open_rx) = smol::channel::unbounded();
+    let application = gpui_platform::application()
         .with_assets(Assets)
         // The window-close path decides whether this process survives: with
         // the tray icon on, closing the last window retires to the tray, and
         // without it the close handler quits explicitly. The platform default
         // would quit on the last window unconditionally, which is exactly the
         // orphaned-daemon trap the tray is meant to prevent.
-        .with_quit_mode(QuitMode::Explicit)
-        .run(move |cx| {
-            gpui_component::init(cx);
-            register_bundled_fonts(cx);
-            cx.activate(true);
-            #[cfg(target_os = "macos")]
-            set_dock_icon_for_bare_binary();
-            crate::ui::i18n::set_locale(&gui_language);
-            // The load above is reused rather than re-read: reading the same
-            // file twice at launch would report the same failure twice.
-            cx.set_global(config);
-            crate::ui::theme::refresh_system_appearance(cx);
-            crate::core::session::WorkspaceStore::init(cx);
-            crate::ui::windows::WindowRegistry::init(cx);
-            crate::ui::presets::load_registry(cx);
-            crate::ui::theme::apply_cursor_hide_mode(cx);
-            spawn_config_watcher(cx);
-            crate::core::update::spawn_check(cx);
-            cx.background_executor()
-                .spawn(async {
-                    crate::core::agent_hooks::refresh_hooks_at_launch();
-                })
-                .detach();
-            keymap::init(cx);
-            crate::ui::local_link::LocalLink::install(cx);
-
-            let reopen = crate::ui::windows::restore_target(cx, open_path.as_deref());
-            crate::ui::windows::open_at(cx, reopen.map(|(id, _)| id), open_path);
-            crate::ui::windows::announce_detached_at_launch(cx, reopen);
-            if config_outcome.failed() {
-                notify_config_load_failed(cx, config_outcome, true);
+        .with_quit_mode(QuitMode::Explicit);
+    application.on_open_urls(move |urls| {
+        let _ = external_open_tx.try_send(urls);
+    });
+    application.run(move |cx| {
+        // gpui invokes this callback without an `App` context. Bridge it
+        // back onto the application loop instead of touching UI state on
+        // AppKit's delegate call stack.
+        cx.spawn(async move |cx| {
+            while let Ok(urls) = external_open_rx.recv().await {
+                let _ = cx.update(|cx| handle_external_opens(urls, cx));
             }
-        });
+        })
+        .detach();
+        gpui_component::init(cx);
+        register_bundled_fonts(cx);
+        cx.activate(true);
+        #[cfg(target_os = "macos")]
+        set_dock_icon_for_bare_binary();
+        crate::ui::i18n::set_locale(&gui_language);
+        // The load above is reused rather than re-read: reading the same
+        // file twice at launch would report the same failure twice.
+        cx.set_global(config);
+        crate::ui::theme::refresh_system_appearance(cx);
+        crate::core::session::WorkspaceStore::init(cx);
+        crate::ui::windows::WindowRegistry::init(cx);
+        crate::ui::presets::load_registry(cx);
+        crate::ui::theme::apply_cursor_hide_mode(cx);
+        spawn_config_watcher(cx);
+        crate::core::update::spawn_check(cx);
+        cx.background_executor()
+            .spawn(async {
+                crate::core::agent_hooks::refresh_hooks_at_launch();
+            })
+            .detach();
+        keymap::init(cx);
+        crate::ui::local_link::LocalLink::install(cx);
+
+        let reopen = crate::ui::windows::restore_target(cx, open_path.as_deref());
+        crate::ui::windows::open_at(cx, reopen.map(|(id, _)| id), open_path);
+        crate::ui::windows::announce_detached_at_launch(cx, reopen);
+        if config_outcome.failed() {
+            notify_config_load_failed(cx, config_outcome, true);
+        }
+    });
 }
 
 /// The watcher tick, from a reloaded file to the keys the app dispatches on.
