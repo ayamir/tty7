@@ -896,14 +896,19 @@ struct WsState {
     /// Leaving it standing after the run ends is what makes a *first* failure
     /// wait the cap: the count would still be carrying an outage that is over.
     rehydrate_attempts: u32,
-    /// A folder the launch asked for, waiting for this window's layout.
+    /// Tabs a launch or a LaunchServices open asked for, waiting for this
+    /// window's layout.
     ///
     /// Held here rather than opened straight away because a window with a tab
     /// in it is one `Adopt::IfEmpty` will not adopt into: the pull would land,
     /// decline the layout, and push the single tab back as the whole workspace.
     /// Parking it also means a pull that has to be retried still gets the
     /// folder opened, on whichever attempt finally lands.
-    then_open: Option<std::path::PathBuf>,
+    ///
+    /// A list because more than one can be waiting: a launch parks the folder
+    /// it was given, and the `x-man-page:` or script Finder sent to the same
+    /// cold start parks its own tab behind it.
+    then_open: Vec<ParkedOpen>,
     /// A name the user typed for a workspace this window is about to create.
     ///
     /// It has to travel with the create rather than follow it as a rename: the
@@ -938,7 +943,7 @@ impl Default for WsState {
             owed_over: Vec::new(),
             not_rebuilt: Vec::new(),
             rehydrate_attempts: 0,
-            then_open: None,
+            then_open: Vec::new(),
             chosen_name: None,
             said_why_empty: false,
         }
@@ -1606,21 +1611,98 @@ pub(crate) fn hydrate_window_then_open(
         .windows
         .entry(client_ws)
         .or_default()
-        .then_open = Some(path);
+        .then_open
+        .push(ParkedOpen::Folder(path));
     hydrate(cx, client_ws, Adopt::IfEmpty);
 }
 
-/// Opens the folder a launch parked here, now that the layout it waited for is
+/// Parks a tab request while this window's layout is still on its way, and
+/// says whether it did. A caller told `false` has a settled window and should
+/// open the tab itself; one told `true` has handed the request to the pull,
+/// which opens it once the layout is up.
+///
+/// Inserting into a window mid-pull is the failure `then_open` exists to
+/// avoid: `Adopt::IfEmpty` declines a window that has a tab, and pushes that
+/// one tab back as the whole workspace.
+pub(crate) fn park_command_while_pulling(
+    cx: &mut App,
+    client_ws: WorkspaceId,
+    cwd: &std::path::Path,
+    command: &str,
+) -> bool {
+    if !layout_is_pending(cx, client_ws) {
+        return false;
+    }
+    let parked = parked_for(cx, client_ws);
+    // Opening a window for this request parks its folder on the way past, in
+    // `for_workspace_at`. The command belongs in that tab, not in a second one
+    // beside it running the same shell.
+    match parked
+        .iter_mut()
+        .find(|open| matches!(open, ParkedOpen::Folder(folder) if folder == cwd))
+    {
+        Some(open) => {
+            *open = ParkedOpen::Command {
+                cwd: cwd.to_path_buf(),
+                command: command.to_owned(),
+            }
+        }
+        None => parked.push(ParkedOpen::Command {
+            cwd: cwd.to_path_buf(),
+            command: command.to_owned(),
+        }),
+    }
+    true
+}
+
+/// [`park_command_while_pulling`] for an `ssh://` link, which opens a tab of
+/// its own and so races the same pull.
+pub(crate) fn park_ssh_while_pulling(
+    cx: &mut App,
+    client_ws: WorkspaceId,
+    ssh: &tty7_core::core::ssh_profile::QuickConnect,
+) -> bool {
+    if !layout_is_pending(cx, client_ws) {
+        return false;
+    }
+    parked_for(cx, client_ws).push(ParkedOpen::Ssh(ssh.clone()));
+    true
+}
+
+/// Whether this window's layout is still on its way: a pull is out, one is
+/// owed a retry, or tabs are already waiting on one.
+fn layout_is_pending(cx: &mut App, client_ws: WorkspaceId) -> bool {
+    cx.default_global::<TreeSync>()
+        .windows
+        .get(&client_ws)
+        .is_some_and(|state| {
+            matches!(state.sync, SyncPhase::Unprimed { priming: true, .. })
+                || state.rehydrate.is_some()
+                || !state.then_open.is_empty()
+        })
+}
+
+fn parked_for(cx: &mut App, client_ws: WorkspaceId) -> &mut Vec<ParkedOpen> {
+    &mut cx
+        .default_global::<TreeSync>()
+        .windows
+        .entry(client_ws)
+        .or_default()
+        .then_open
+}
+
+/// Opens the tabs a launch parked here, now that the layout they waited for is
 /// up. Does nothing for the windows — every other one — that parked nothing.
 fn open_parked_path(cx: &mut App, client_ws: WorkspaceId) {
-    let Some(path) = cx
+    let parked = cx
         .default_global::<TreeSync>()
         .windows
         .get_mut(&client_ws)
-        .and_then(|state| state.then_open.take())
-    else {
+        .map(|state| std::mem::take(&mut state.then_open))
+        .unwrap_or_default();
+    if parked.is_empty() {
         return;
-    };
+    }
     let Some(handle) = crate::ui::windows::WindowRegistry::window_for(cx, client_ws) else {
         return;
     };
@@ -1630,8 +1712,32 @@ fn open_parked_path(cx: &mut App, client_ws: WorkspaceId) {
         return;
     };
     let _ = handle.update(cx, move |_, window, cx| {
-        app.update(cx, |app, cx| app.new_tab_at(path, window, cx));
+        app.update(cx, |app, cx| {
+            for open in parked {
+                match open {
+                    ParkedOpen::Folder(cwd) => app.new_tab_at(cwd, window, cx),
+                    ParkedOpen::Command { cwd, command } => {
+                        app.new_tab_running(cwd, command, window, cx)
+                    }
+                    ParkedOpen::Ssh(ssh) => app.quick_connect(ssh, window, cx),
+                }
+            }
+        });
     });
+}
+
+/// A tab parked until its window's layout lands.
+enum ParkedOpen {
+    /// What a launch and an Explorer double-click ask for.
+    Folder(std::path::PathBuf),
+    /// A shell in `cwd` with `command` typed into it, from a script or an
+    /// `x-man-page:` link Finder handed over.
+    Command {
+        cwd: std::path::PathBuf,
+        command: String,
+    },
+    /// An `ssh://` link.
+    Ssh(tty7_core::core::ssh_profile::QuickConnect),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -2930,32 +3036,59 @@ mod tests {
             );
             crate::ui::windows::WindowRegistry::init(cx);
 
-            hydrate_window_then_open(cx, ws, path.clone());
-            assert_eq!(
+            let parked = |cx: &mut gpui::App| -> Vec<std::path::PathBuf> {
                 cx.default_global::<TreeSync>().windows[&ws]
                     .then_open
-                    .as_ref(),
-                Some(&path),
+                    .iter()
+                    .map(|open| match open {
+                        ParkedOpen::Folder(cwd) => cwd.clone(),
+                        ParkedOpen::Command { cwd, .. } => cwd.clone(),
+                        ParkedOpen::Ssh(_) => std::path::PathBuf::from("<ssh>"),
+                    })
+                    .collect()
+            };
+
+            hydrate_window_then_open(cx, ws, path.clone());
+            assert_eq!(
+                parked(cx),
+                vec![path.clone()],
                 "the request must be parked, not opened over a layout still in flight"
             );
 
             hydrate_with(cx, ws, Adopt::IfEmpty, Vec::new());
             assert_eq!(
-                cx.default_global::<TreeSync>().windows[&ws]
-                    .then_open
-                    .as_ref(),
-                Some(&path),
+                parked(cx),
+                vec![path.clone()],
                 "a retry must still owe the folder"
             );
 
-            // With no window to put it in there is nothing to open, and the
-            // request must not survive to surface in some unrelated window.
+            // The command for the folder this window was opened for lands in
+            // that parked tab rather than adding a second one beside it.
+            assert!(park_command_while_pulling(cx, ws, &path, "./build.sh"));
+            assert_eq!(parked(cx), vec![path.clone()]);
+            assert!(matches!(
+                &cx.default_global::<TreeSync>().windows[&ws].then_open[0],
+                ParkedOpen::Command { command, .. } if command == "./build.sh"
+            ));
+
+            // A LaunchServices open for somewhere else queues behind it rather
+            // than replacing it.
+            let script = std::path::PathBuf::from("/tmp/from-finder");
+            assert!(park_command_while_pulling(cx, ws, &script, "./deploy.sh"));
+            assert_eq!(parked(cx), vec![path.clone(), script]);
+
+            // With no window to put them in there is nothing to open, and the
+            // requests must not survive to surface in some unrelated window.
             open_parked_path(cx, ws);
-            assert!(
-                cx.default_global::<TreeSync>().windows[&ws]
-                    .then_open
-                    .is_none()
-            );
+            assert!(parked(cx).is_empty());
+
+            // A window whose layout has settled is opened into directly.
+            cx.default_global::<TreeSync>()
+                .windows
+                .get_mut(&ws)
+                .unwrap()
+                .sync = SyncPhase::Primed(WsMirror::default());
+            assert!(!park_command_while_pulling(cx, ws, &path, "./build.sh"));
         });
     }
 

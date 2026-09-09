@@ -68,8 +68,11 @@ serde_json.workspace = true
 tempfile = "3"
 # LaunchServices sends files and custom URL schemes through gpui's unified
 # open-URL callback. `url` keeps the decoding and SSH authority parsing here
-# standards-compliant rather than treating percent escapes as literal paths.
+# standards-compliant rather than treating percent escapes as literal paths,
+# and `percent-encoding` — already in the tree under `url` — spells the
+# userinfo and man-page names back out.
 url = "2"
+percent-encoding = "2"
 
 # SSH profile ids in the connection manager UI (`ui::ssh_connect`,
 # `ui::settings`, the command palette). The profiles themselves — and the

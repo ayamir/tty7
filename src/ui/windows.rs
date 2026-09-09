@@ -306,22 +306,44 @@ pub fn open_from_cli(cx: &mut App, path: Option<std::path::PathBuf>) {
     });
 }
 
-/// Runs a local command in the most recently active local workspace, creating
-/// or restoring one with `cwd` if every open window is remote or absent.
+/// Runs a local command in a new tab of the most recently active local
+/// workspace, restoring or creating one if every open window is remote or
+/// absent. Takes the same route as [`open_from_cli`], for the same reason: a
+/// window whose layout is still being pulled has to be opened into by the
+/// pull, not underneath it.
 pub fn run_local_command(cx: &mut App, cwd: std::path::PathBuf, command: String) {
-    let workspace = WindowRegistry::most_recent_local(cx);
-    let Some(workspace) = workspace else {
-        // A cold window creates one terminal already. Start it in the requested
-        // directory and write the command there instead of adding a second tab.
-        let restore = restore_target(cx, Some(&cwd));
-        open_at(cx, restore.map(|(id, _)| id), Some(cwd));
-        let Some(workspace) = WindowRegistry::most_recent_local(cx) else {
-            return;
-        };
-        run_command_in_active_terminal(cx, workspace, command);
+    let Some(workspace) = WindowRegistry::most_recent_local(cx) else {
+        open_missing_cli_window_with(cx, Some(cwd), |cx, restore, cwd| {
+            let Some(cwd) = cwd else { return };
+            open_at(cx, restore, Some(cwd.clone()));
+            let Some(workspace) = WindowRegistry::most_recent_local(cx) else {
+                return;
+            };
+            // A window that is pulling its layout parked the folder itself, in
+            // `for_workspace_at`; the command has to travel with it. One that
+            // is not opened its first terminal in `cwd` already, so the command
+            // goes straight there rather than into a second tab.
+            if crate::ui::tree_sync::park_command_while_pulling(cx, workspace, &cwd, &command) {
+                activate(cx, workspace);
+            } else {
+                run_command_in_active_terminal(cx, workspace, command);
+            }
+        });
         return;
     };
+    if crate::ui::tree_sync::park_command_while_pulling(cx, workspace, &cwd, &command) {
+        activate(cx, workspace);
+        return;
+    }
     run_local_command_in(cx, workspace, cwd, command);
+}
+
+fn activate(cx: &mut App, workspace: WorkspaceId) {
+    let Some(handle) = WindowRegistry::window_for(cx, workspace) else {
+        return;
+    };
+    cx.activate(true);
+    let _ = handle.update(cx, |_, window, _| window.activate_window());
 }
 
 fn run_command_in_active_terminal(cx: &mut App, workspace: WorkspaceId, command: String) {
@@ -355,6 +377,40 @@ fn run_local_command_in(
     cx.activate(true);
     let _ = handle.update(cx, move |_, window, cx| {
         app.update(cx, |app, cx| app.new_tab_running(cwd, command, window, cx));
+        window.activate_window();
+    });
+}
+
+/// Opens an `ssh://` link in the most recently active window, restoring or
+/// creating one if none is up. Goes through the same restore as every other
+/// windowless entry point, so a tray-resident tty7 comes back to the workspace
+/// it retired with instead of claiming a fresh one.
+pub fn quick_connect_from_url(cx: &mut App, ssh: tty7_core::core::ssh_profile::QuickConnect) {
+    // An SSH link opens a tab, which any window can hold.
+    let workspace = WindowRegistry::most_recent_local(cx)
+        .or_else(|| WindowRegistry::most_recent(cx))
+        .or_else(|| {
+            open_missing_cli_window_with(cx, None, open_at);
+            WindowRegistry::most_recent(cx)
+        });
+    let Some(workspace) = workspace else {
+        return;
+    };
+    // A window still pulling its layout would take this tab as the whole
+    // workspace and push it back over what it is about to restore.
+    if crate::ui::tree_sync::park_ssh_while_pulling(cx, workspace, &ssh) {
+        activate(cx, workspace);
+        return;
+    }
+    let Some(handle) = WindowRegistry::window_for(cx, workspace) else {
+        return;
+    };
+    let Some(app) = WindowRegistry::app_for(cx, workspace).and_then(|app| app.upgrade()) else {
+        return;
+    };
+    cx.activate(true);
+    let _ = handle.update(cx, move |_, window, cx| {
+        app.update(cx, |app, cx| app.quick_connect(ssh, window, cx));
         window.activate_window();
     });
 }

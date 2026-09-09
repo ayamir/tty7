@@ -469,37 +469,13 @@ fn handle_external_opens(urls: Vec<String>, cx: &mut App) {
                     crate::core::shell_quote::quote_for_shell(&path.to_string_lossy(), None);
                 crate::ui::windows::run_local_command(cx, parent, command);
             }
-            ExternalOpen::Ssh(ssh) => {
-                let workspace = crate::ui::windows::WindowRegistry::most_recent_local(cx)
-                    .or_else(|| crate::ui::windows::WindowRegistry::most_recent(cx))
-                    .or_else(|| {
-                        // `open_at` registers synchronously, so the SSH link
-                        // that launched a cold tty7 is not discarded.
-                        crate::ui::windows::open_at(cx, None, None);
-                        crate::ui::windows::WindowRegistry::most_recent(cx)
-                    });
-                let Some(workspace) = workspace else {
-                    continue;
-                };
-                let Some(handle) = crate::ui::windows::WindowRegistry::window_for(cx, workspace)
-                else {
-                    continue;
-                };
-                let Some(app) = crate::ui::windows::WindowRegistry::app_for(cx, workspace)
-                    .and_then(|app| app.upgrade())
-                else {
-                    continue;
-                };
-                let _ = handle.update(cx, move |_, window, cx| {
-                    app.update(cx, |app, cx| app.quick_connect(ssh, window, cx));
-                    window.activate_window();
-                });
-            }
-            ExternalOpen::ManPage(page) => {
-                let command = format!(
-                    "man {}",
-                    crate::core::shell_quote::quote_for_shell(&page, None)
-                );
+            ExternalOpen::Ssh(ssh) => crate::ui::windows::quick_connect_from_url(cx, ssh),
+            ExternalOpen::ManPage { section, page } => {
+                let mut command = String::from("man");
+                for argument in section.iter().chain(std::iter::once(&page)) {
+                    command.push(' ');
+                    command.push_str(&crate::core::shell_quote::quote_for_shell(argument, None));
+                }
                 crate::ui::windows::run_local_command(cx, std::env::temp_dir(), command);
             }
         }

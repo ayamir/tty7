@@ -3453,6 +3453,11 @@ impl Tty7App {
     /// Opens a new local shell in `cwd`, then types a command only after the
     /// pane exists. LaunchServices uses this for a script/executable selected
     /// in Finder and for `x-man-page:` requests.
+    ///
+    /// A tab that did not open takes the command with it. `new_tab_with_cwd`
+    /// returns early when the spawn fails or the workspace cannot host a local
+    /// shell, and writing anyway would type the command into whatever pane was
+    /// focused before — a shell the user is mid-line in, or an agent.
     pub(crate) fn new_tab_running(
         &mut self,
         cwd: std::path::PathBuf,
@@ -3460,7 +3465,12 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let before = self.tabs.len();
         self.new_tab_with_cwd(Some(cwd), None, window, cx);
+        if self.tabs.len() == before {
+            log::warn!("no tab opened for {command:?}; not writing it to another pane");
+            return;
+        }
         if let Some(terminal) = self.focused_leaf(window, cx) {
             terminal.read(cx).run_command_line(&command);
         }
